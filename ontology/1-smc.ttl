@@ -1,0 +1,46 @@
+@prefix smc:  <https://sparql-mcp.dev/ns#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# ── Ontology declaration ──────────────────────────────────────────────────────
+
+<https://sparql-mcp.dev/ns#>
+    a owl:Ontology ;
+    rdfs:label "sparql-mcp core ontology" ;
+    rdfs:comment "Project isolation vocabulary for the sparql-mcp knowledge base." .
+
+# ── smc:Project ───────────────────────────────────────────────────────────────
+
+smc:Project
+    a owl:Class ;
+    rdfs:label "Project" ;
+    rdfs:comment "A named context with its own SPARQL named graph for data isolation." .
+
+smc:projectId
+    a owl:DatatypeProperty ;
+    rdfs:domain smc:Project ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "project ID" ;
+    rdfs:comment "Short slug identifier, e.g. '<slug>'." .
+
+smc:label
+    a owl:DatatypeProperty ;
+    rdfs:domain smc:Project ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "label" ;
+    rdfs:comment "Human-readable project name." .
+
+smc:namedGraph
+    a owl:ObjectProperty ;
+    rdfs:domain smc:Project ;
+    rdfs:label  "named graph" ;
+    rdfs:comment "The named graph IRI that holds this project's data, e.g. <urn:project:<slug>>." .
+
+smc:created
+    a owl:DatatypeProperty ;
+    rdfs:domain smc:Project ;
+    rdfs:range  xsd:dateTime ;
+    rdfs:label  "created" ;
+    rdfs:comment "ISO 8601 creation timestamp." .

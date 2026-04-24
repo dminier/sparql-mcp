@@ -1,0 +1,23 @@
+{
+  "name": "kb-workbench",
+  "version": "0.1.0",
+  "description": "Semantic knowledge workbench: SPARQL as source of truth, Obsidian as human projection. Ingest code / docs / web / recordings, steward the ontology, audit the graph, render notes + canvas.",
+  "author": {
+    "name": "sparql-mcp contributors"
+  },
+  "homepage": "https://github.com/OWNER/sparql-mcp",
+  "license": "MIT",
+  "keywords": [
+    "sparql",
+    "rdf",
+    "ontology",
+    "obsidian",
+    "knowledge-graph",
+    "mcp",
+    "archimate",
+    "oxigraph"
+  ],
+  "claudeCode": {
+    "minVersion": "1.0.0"
+  }
+}

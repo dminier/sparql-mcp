@@ -1,0 +1,13 @@
+# sparql-mcp server configuration
+
+[core]
+store    = "./store"
+ontology = "./ontology"
+docs     = "./front/docs"
+
+[project]
+active = "default"
+
+[plugins]
+# Activate third-party plugins here. Plugin code lives under crates/ or
+# as an external dependency implementing the ToolPlugin trait.

@@ -1,0 +1,11 @@
+services:
+  sparql-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./store:/app/store
+      - ./ontology:/app/ontology
+    environment:
+      RUST_LOG: info
+    restart: unless-stopped

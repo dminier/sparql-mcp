@@ -1,0 +1,33 @@
+[package]
+name = "sparql-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Generic semantic knowledge-management MCP server — SPARQL 1.1 over Oxigraph."
+
+[[bin]]
+name = "sparql-mcp"
+path = "src/main.rs"
+
+[dependencies]
+oxigraph = "0.5"
+rmcp = { version = "1.5", default-features = false, features = [
+    "client",
+    "server",
+    "macros",
+    "transport-child-process",
+    "transport-io",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+
+[dev-dependencies]
+tempfile = "3"

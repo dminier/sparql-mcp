@@ -1,0 +1,19 @@
+# Build / runtime artefacts
+/target
+/store
+Cargo.lock.bak
+*.swp
+.env
+.env.*
+
+# Python (optional tooling)
+.venv/
+__pycache__/
+*.pyc
+
+# Generated outputs — regenerate on demand, never commit
+/output/
+/front/
+/backups/
+/imports/
+/ontology/snapshots/

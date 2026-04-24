@@ -1,0 +1,17 @@
+{
+  "name": "sparql-mcp",
+  "owner": {
+    "name": "sparql-mcp contributors",
+    "url": "https://github.com/OWNER/sparql-mcp"
+  },
+  "plugins": [
+    {
+      "name": "kb-workbench",
+      "source": "./kb-workbench",
+      "description": "Semantic knowledge workbench for AI agents — SPARQL as source of truth, Obsidian as human face.",
+      "version": "0.1.0",
+      "category": "knowledge-management",
+      "keywords": ["sparql", "rdf", "oxigraph", "knowledge-base", "ontology", "obsidian", "mcp"]
+    }
+  ]
+}
