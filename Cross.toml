@@ -1,2 +1,12 @@
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+pre-build = [
+  "apt-get update && apt-get install --assume-yes --no-install-recommends g++-10-aarch64-linux-gnu"
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+  "CC_aarch64_unknown_linux_gnu",
+  "CXX_aarch64_unknown_linux_gnu",
+  "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+]
