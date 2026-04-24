@@ -106,7 +106,8 @@ else
     tar -xzf "$ARCHIVE"
 fi
 
-DLBIN="$DLDIR/sparql-mcp"
+EXTRACTED_DIR="$DLDIR/sparql-mcp-${OS}-${ARCH}"
+DLBIN="$EXTRACTED_DIR/sparql-mcp"
 if [ ! -f "$DLBIN" ]; then
     echo "error: 'sparql-mcp' binary not found after extraction" >&2
     exit 1
