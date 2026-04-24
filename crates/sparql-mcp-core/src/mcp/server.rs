@@ -18,7 +18,9 @@ use rmcp::service::{RequestContext, RoleServer, RunningService};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
-use crate::application::tools::{doc, export, ontology, project, recording, sparql};
+#[cfg(feature = "recording")]
+use crate::application::tools::recording;
+use crate::application::tools::{doc, export, ontology, project, sparql};
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -73,7 +75,7 @@ impl SparqlMcpServer {
 
     // ── Core tool dispatch ────────────────────────────────────────────────────
 
-    fn dispatch_core(
+    pub(crate) fn dispatch_core(
         &self,
         name: &str,
         args: &JsonObject,
@@ -90,10 +92,13 @@ impl SparqlMcpServer {
             "project_list" => project::project_list(&self.store),
             "project_switch" => project::project_switch(&self.store, args),
             "write_doc" => doc::write_doc(&self.doc_store, args),
+            #[cfg(feature = "recording")]
             "import_recording_navigations" => {
                 recording::import_recording_navigations(&self.store, args)
             }
+            #[cfg(feature = "recording")]
             "import_recording_network" => recording::import_recording_network(&self.store, args),
+            #[cfg(feature = "recording")]
             "materialize_recording" => recording::materialize_recording(&self.store, args),
             _ => return None,
         };
@@ -124,22 +129,7 @@ impl ServerHandler for SparqlMcpServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools: Vec<Tool> = vec![
-            sparql::tool_query_sparql_def(),
-            sparql::tool_update_sparql_def(),
-            ontology::tool_load_ontology_def(),
-            ontology::tool_load_ontology_file_def(),
-            export::tool_export_graph_def(),
-            export::tool_list_graphs_def(),
-            export::tool_stats_def(),
-            project::tool_project_create_def(),
-            project::tool_project_list_def(),
-            project::tool_project_switch_def(),
-            doc::tool_write_doc_def(),
-            recording::tool_import_navigations_def(),
-            recording::tool_import_network_def(),
-            recording::tool_materialize_recording_def(),
-        ];
+        let mut tools: Vec<Tool> = core_tool_defs();
 
         let _ctx = self.plugin_ctx();
         for plugin in self.plugins.iter() {
@@ -262,4 +252,73 @@ fn list_ttl_resources(dir: &std::path::Path) -> anyhow::Result<Vec<Resource>> {
     }
     resources.sort_by(|a, b| a.raw.name.cmp(&b.raw.name));
     Ok(resources)
+}
+
+/// All MCP tool definitions served by the core (no plugins).
+///
+/// Kept next to `SparqlMcpServer::dispatch_core` so the two lists stay in
+/// sync — a unit test cross-checks that every declared tool has a dispatch
+/// arm.
+pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
+    #[allow(unused_mut)]
+    let mut defs = vec![
+        crate::application::tools::sparql::tool_query_sparql_def(),
+        crate::application::tools::sparql::tool_update_sparql_def(),
+        crate::application::tools::ontology::tool_load_ontology_def(),
+        crate::application::tools::ontology::tool_load_ontology_file_def(),
+        crate::application::tools::export::tool_export_graph_def(),
+        crate::application::tools::export::tool_list_graphs_def(),
+        crate::application::tools::export::tool_stats_def(),
+        crate::application::tools::project::tool_project_create_def(),
+        crate::application::tools::project::tool_project_list_def(),
+        crate::application::tools::project::tool_project_switch_def(),
+        crate::application::tools::doc::tool_write_doc_def(),
+    ];
+    #[cfg(feature = "recording")]
+    {
+        defs.push(crate::application::tools::recording::tool_import_navigations_def());
+        defs.push(crate::application::tools::recording::tool_import_network_def());
+        defs.push(crate::application::tools::recording::tool_materialize_recording_def());
+    }
+    defs
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::domain::SparqlStore;
+    use crate::infrastructure::{FsDocStore, OxigraphAdapter};
+    use rmcp::object;
+    use std::sync::Arc;
+
+    fn build_server() -> SparqlMcpServer {
+        let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+        let doc_store = Arc::new(FsDocStore::new(std::env::temp_dir().join("smcp-disp")));
+        SparqlMcpServer::new(
+            store,
+            doc_store,
+            std::path::PathBuf::from("./ontology"),
+            "urn:project:default".into(),
+        )
+    }
+
+    #[test]
+    fn every_declared_tool_has_a_dispatch_arm() {
+        let server = build_server();
+        let empty = object!({});
+        let missing: Vec<String> = core_tool_defs()
+            .iter()
+            .filter_map(|t| {
+                let name = t.name.as_ref();
+                match server.dispatch_core(name, &empty) {
+                    Some(_) => None,
+                    None => Some(name.to_string()),
+                }
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these tools are listed by list_tools but have no dispatch_core arm: {missing:?}"
+        );
+    }
 }

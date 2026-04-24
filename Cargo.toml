@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sparql-mcp-core"]
+members = ["crates/sparql-mcp-core", "examples/hello-plugin"]
 resolver = "2"
 
 [workspace.package]

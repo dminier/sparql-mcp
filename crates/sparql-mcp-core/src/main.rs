@@ -136,13 +136,16 @@ fn select_mcp(cfg: &Config, args: &McpArgs) -> Result<McpServer> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // STDIO transport speaks JSON-RPC on stdout — logs MUST go to stderr.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "sparql_mcp=info".into()),
         )
         .init();
+    run(Cli::parse()).await
+}
 
-    let cli = Cli::parse();
-
+async fn run(cli: Cli) -> Result<()> {
     // `install` has no config / store dependencies — short-circuit.
     if let Cmd::Install {
         ref name,
