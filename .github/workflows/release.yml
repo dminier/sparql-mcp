@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: amd64
+            ext: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: arm64
+            ext: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os: darwin
+            arch: amd64
+            ext: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: darwin
+            arch: arm64
+            ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: amd64
+            ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross (Linux arm64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="sparql-mcp-${{ matrix.os }}-${{ matrix.arch }}"
+          STAGE="$(mktemp -d)/$NAME"
+          mkdir -p "$STAGE"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp target/${{ matrix.target }}/release/sparql-mcp.exe "$STAGE/"
+          else
+            cp target/${{ matrix.target }}/release/sparql-mcp "$STAGE/"
+            # Strip to shrink binary; ignore failures on macOS for arm64.
+            strip "$STAGE/sparql-mcp" || true
+          fi
+          cp sparql-mcp.toml LICENSE README.md "$STAGE/"
+          cp -r ontology "$STAGE/"
+          cd "$(dirname "$STAGE")"
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            7z a -tzip "${GITHUB_WORKSPACE//\\//}/${NAME}.zip" "$NAME" >/dev/null
+          else
+            tar -C . -czf "$GITHUB_WORKSPACE/${NAME}.tar.gz" "$NAME"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparql-mcp-${{ matrix.os }}-${{ matrix.arch }}
+          path: sparql-mcp-${{ matrix.os }}-${{ matrix.arch }}.*
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS
+        run: |
+          cd dist
+          sha256sum sparql-mcp-*.* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            dist/sparql-mcp-*.*
+            dist/SHA256SUMS
+          generate_release_notes: true

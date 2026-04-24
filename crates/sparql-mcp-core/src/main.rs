@@ -89,6 +89,19 @@ enum Cmd {
     },
     /// Run as an MCP stdio server.
     Serve,
+    /// Register this binary as an MCP server in detected agent configs
+    /// (Claude Code, Codex CLI, Gemini CLI).
+    Install {
+        /// MCP server identifier to write into each config.
+        #[arg(long, default_value = "sparql-mcp")]
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Show what would be changed without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -129,6 +142,21 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // `install` has no config / store dependencies — short-circuit.
+    if let Cmd::Install {
+        ref name,
+        yes,
+        dry_run,
+    } = cli.cmd
+    {
+        return sparql_mcp::install::run(sparql_mcp::install::InstallOpts {
+            name: name.clone(),
+            yes,
+            dry_run,
+        });
+    }
+
     let mut cfg = Config::load(&cli.config)?;
     let merged = cfg.merge_mcp_json(&cli.mcp_json)?;
     if merged > 0 {
@@ -307,6 +335,7 @@ async fn main() -> Result<()> {
             let srv = SparqlMcpServer::new(store, doc_store, ontology_path, cli.active_graph);
             srv.serve_stdio().await?;
         }
+        Cmd::Install { .. } => unreachable!("handled above"),
     }
 
     Ok(())

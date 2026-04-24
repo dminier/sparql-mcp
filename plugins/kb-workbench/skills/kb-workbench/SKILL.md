@@ -18,7 +18,7 @@ description: |
   Triggers (FR): "interroge la base", "charge dans le graphe", "ingère ce
   doc", "génère le vault", "audit du graphe", "propose des classes
   candidates", "qu'est-ce qu'il y a dans la KB sur X", "repère les
-  prédicats inconnus", "snapshot du graphe", "lance le bridge sparql".
+  prédicats inconnus", "snapshot du graphe".
 
   Load this skill whenever a task touches a SPARQL graph, an ontology, the
   Obsidian vault, or needs to ingest external information into the
@@ -152,23 +152,19 @@ convention, the graph degenerates into an unreadable cloud. Every
 render-to-Obsidian operation must emit frontmatter derived from facets,
 MOC wikilinks, and refresh MOC files with Dataview blocks.
 
-## 6. Shared-server transport
+## 6. Transport
 
-`sparql-mcp` is a STDIO MCP server; its oxigraph store takes an exclusive
-rocksdb lock. Multiple Claude sessions each spawning their own STDIO
-process would deadlock on the lock. To share the server:
-
-```bash
-# Start once per machine (survives shell exits with --bg):
-bash .claude/skills/kb-workbench/scripts/start_sparql_http.sh --bg
-```
-
-`.mcp.json` points every Claude session at the shared SSE endpoint
-(`http://127.0.0.1:7733/sse`). Any number of sessions connect concurrently.
-
-If the MCP server is unreachable anyway, fall back to the on-disk store
-via `scripts/sparql_boilerplate.py` (see `references/sparql-first.md` §
+`sparql-mcp` is a STDIO MCP server: every Claude session spawns its own
+child process. No daemon, no ports. If the server can't be spawned (e.g.
+broken install), fall back to the on-disk store via
+`scripts/sparql_boilerplate.py` (see `references/sparql-first.md` §
 "Offline fallback").
+
+The oxigraph store takes an exclusive rocksdb lock per directory, so only
+one agent at a time can mutate the same store. For parallel multi-project
+work, either give each project a distinct `[core] store` path in its
+`sparql-mcp.toml`, or enable `per_project_store = true` (roadmap v0.2)
+to auto-open a store per project slug under `$SPARQL_MCP_HOME`.
 
 ## File map
 
@@ -185,8 +181,6 @@ via `scripts/sparql_boilerplate.py` (see `references/sparql-first.md` §
 │   ├── audit-framework.md            ← rules-YAML spec, severity taxonomy
 │   └── sparql-patterns.md            ← PrefixRegistry, canonical SELECTs
 └── scripts/
-    ├── start_sparql_http.sh          ← launch shared SSE bridge
-    ├── stop_sparql_http.sh           ← stop the bridge
     ├── sparql_boilerplate.py         ← execute_query, prefix map, TTL fallback
     ├── kb_ingest.py                  ← unified ingestion dispatcher
     ├── kb_audit.py                   ← rules-driven integrity checker

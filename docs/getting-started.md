@@ -1,78 +1,84 @@
 # Getting started
 
-This guide walks you from `git clone` to your first SPARQL query executed by
-an AI agent.
+From zero to first SPARQL query executed by an AI agent.
 
-## 1. Prerequisites
+## 1. Install the binary
 
-- Rust toolchain (stable, 1.78+): <https://rustup.rs>
-- Claude Code (or any MCP-compatible client)
-- Optional: Obsidian (for the human-facing projection of the graph)
-
-## 2. Build
+### One-liner (macOS / Linux)
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/dminier/sparql-mcp/main/install.sh | bash
+```
+
+### From source
+
+```bash
+git clone https://github.com/dminier/sparql-mcp
+cd sparql-mcp
 cargo build --release
+cp target/release/sparql-mcp ~/.local/bin/
 ```
 
-Binary lands at `./target/release/sparql-mcp`.
+## 2. Register the MCP server in your agent
 
-## 3. Run
-
-Two transports are supported:
-
-### STDIO (one client per process)
+The binary ships a self-install subcommand that patches the config of
+every detected agent (Claude Code, Codex CLI, Gemini CLI):
 
 ```bash
-./target/release/sparql-mcp serve --config sparql-mcp.toml
+sparql-mcp install          # interactive
+sparql-mcp install -y       # non-interactive
+sparql-mcp install --dry-run
 ```
 
-Suitable for a single Claude Code session — add an entry to the project's
-`.mcp.json`:
+It writes a STDIO entry like:
 
 ```json
 {
   "mcpServers": {
     "sparql-mcp": {
       "type": "stdio",
-      "command": "./target/release/sparql-mcp",
-      "args": ["serve", "--config", "sparql-mcp.toml"]
+      "command": "/home/you/.local/bin/sparql-mcp",
+      "args": ["serve"]
     }
   }
 }
 ```
 
-### Shared SSE bridge (recommended for multi-client setups)
+Each session your agent opens spawns its own `sparql-mcp serve` child —
+there is no daemon to keep running.
 
-RocksDB (the Oxigraph backend) holds an exclusive lock on the store, so two
-STDIO clients cannot share the same store directory. The plugin ships a
-one-shot bridge that runs a single `sparql-mcp` process and re-exposes it
-over SSE so every client can connect:
+## 3. Pick a data directory
 
-```bash
-bash plugins/kb-workbench/skills/kb-workbench/scripts/start_sparql_http.sh --bg
+By default the server opens `./store/` (RocksDB) and `./ontology/` in the
+process's current working directory. Override per-project:
+
+```toml
+# sparql-mcp.toml (placed at the project root)
+[core]
+store    = "./store"
+ontology = "./ontology"
+docs     = "./front/docs"
 ```
 
-Then in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "sparql-mcp": {
-      "type": "sse",
-      "url": "http://127.0.0.1:7733/sse"
-    }
-  }
-}
-```
+Or globally via CLI flags: `sparql-mcp serve --store ~/kb/store --ontology ~/kb/ontology`.
 
 ## 4. Load the core ontology
 
-Once the server is up, an agent running the `kb-workbench` skill will load
-`ontology/1-smc.ttl` automatically on first use. Or you can do it manually
-from any SPARQL client by calling the `load_ontology_file` tool.
+Once the server starts, ask the agent: *"load the core ontology"*. The
+`kb-workbench` skill calls `load_ontology_file` on `ontology/1-smc.ttl`.
+
+Or from the CLI:
+
+```bash
+sparql-mcp reload-ontology
+```
 
 ## 5. First query
+
+From the agent: *"show me the 25 first triples of the meta graph"*.
+
+Or directly against the store (requires the server not to be running, due
+to the RocksDB exclusive lock):
 
 ```sparql
 PREFIX smc: <https://sparql-mcp.dev/ns#>
@@ -83,7 +89,6 @@ LIMIT 25
 
 ## 6. Writing a domain plugin
 
-To extend `sparql-mcp` with domain-specific MCP tools, implement the
-`ToolPlugin` trait from the `sparql-mcp` crate in your own crate and register
-it in `sparql-mcp.toml`. See `crates/sparql-mcp-core/src/plugin/mod.rs` for
-the contract.
+Implement the `ToolPlugin` trait from the `sparql-mcp` crate in your own
+crate and register it in `sparql-mcp.toml`. See
+`crates/sparql-mcp-core/src/plugin/mod.rs` for the contract.

@@ -2,7 +2,7 @@
   "name": "sparql-mcp",
   "owner": {
     "name": "sparql-mcp contributors",
-    "url": "https://github.com/OWNER/sparql-mcp"
+    "url": "https://github.com/dminier/sparql-mcp"
   },
   "plugins": [
     {

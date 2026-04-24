@@ -3,6 +3,7 @@ pub mod cbm;
 pub mod config;
 pub mod domain;
 pub mod infrastructure;
+pub mod install;
 pub mod mcp;
 pub mod model;
 pub mod plugin;

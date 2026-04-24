@@ -1,78 +1,78 @@
 # sparql-mcp
 
-[![CI](https://github.com/OWNER/sparql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/sparql-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/dminier/sparql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dminier/sparql-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-**A generic semantic knowledge base for AI agents.** `sparql-mcp` is a small,
-well-packaged MCP server wrapping an [Oxigraph](https://github.com/oxigraph/oxigraph)
-SPARQL 1.1 store, shipped together with a Claude Code plugin and a skill that
-teach agents the single contract:
+**A generic semantic knowledge base for AI coding agents.**
+`sparql-mcp` is a single-binary MCP server wrapping an
+[Oxigraph](https://github.com/oxigraph/oxigraph) SPARQL 1.1 store, plus a
+Claude Code plugin and skill that teach agents the single contract:
 
 > **SPARQL is the source of truth. Obsidian is its human face.**
 
-Point any number of agents at the same store, let them ingest code, documents,
-browser recordings, and web pages into project-scoped named graphs, then
-project the graph to Obsidian notes + canvases for humans.
+Install once on your workstation, use it across every project you touch.
+
+## Quick start
+
+### One-line install (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dminier/sparql-mcp/main/install.sh | bash
+```
+
+The installer downloads the right static binary for your platform, drops it
+into `~/.local/bin/sparql-mcp`, verifies its SHA-256 checksum, then runs
+`sparql-mcp install -y` which auto-patches each detected agent's MCP config
+(Claude Code, Codex CLI, Gemini CLI).
+
+Flags: `--dir=<path>` (install location), `--skip-config` (don't patch
+agents). Environment: `SPARQL_MCP_VERSION=v0.1.0` to pin a release.
+
+### Windows (PowerShell)
+
+```powershell
+# 1. Download the archive for your platform from the latest release:
+#    https://github.com/dminier/sparql-mcp/releases/latest
+# 2. Extract sparql-mcp.exe somewhere on PATH
+# 3. Register MCP entries:
+sparql-mcp.exe install -y
+```
+
+### Manual / from source
+
+```bash
+git clone https://github.com/dminier/sparql-mcp
+cd sparql-mcp
+cargo build --release
+./target/release/sparql-mcp install -y     # patch agent configs
+```
+
+After install, restart your coding agent. `sparql-mcp` is now a STDIO MCP
+server the agent spawns on demand — nothing to keep running.
+
+## Why a single-binary STDIO server
+
+- **Zero dependencies** — no Docker, no daemon, no background process.
+- **One install, every project** — the binary lives in `~/.local/bin`; every
+  agent session spawns its own child process and talks to it over stdin/stdout.
+- **Multi-project** (roadmap v0.2) — flip `per_project_store = true` in the
+  config and each project opens its own RocksDB store, so several agents can
+  work on different projects in parallel without contending for the same
+  database lock.
 
 ## What's in this repo
 
 ```
 sparql-mcp/
-├── crates/sparql-mcp-core/        # Rust: the MCP server + Oxigraph core
-├── plugins/kb-workbench/          # Claude Code plugin (marketplace-installable)
-├── .claude/skills/kb-workbench/   # The skill itself (symlinked from the plugin)
+├── crates/sparql-mcp-core/        # Rust: MCP server + Oxigraph core
+├── plugins/kb-workbench/          # Claude Code plugin (skill only)
+├── .claude/skills/kb-workbench/   # Symlink to the skill
 ├── ontology/1-smc.ttl             # Core RDF vocabulary (smc:)
-├── sparql-mcp.toml                # Sample server config
-├── Dockerfile / docker-compose.yml
-└── Makefile
+├── sparql-mcp.toml                # Sample config
+├── server.json                    # MCP registry manifest
+├── install.sh                     # One-line installer
+└── docs/getting-started.md
 ```
-
-Three artefacts, one workspace:
-
-| Artefact | Role |
-|---|---|
-| **Cargo crate** `sparql-mcp` (`crates/sparql-mcp-core`) | The server binary, usable standalone over STDIO or SSE |
-| **Claude Code plugin** `kb-workbench` | Installs the skill + SSE bridge script |
-| **Skill** `kb-workbench` | Teaches agents how to ingest / audit / render the KB |
-
-Domain-specific layers (bug-bounty, enterprise-architecture, research
-notebooks, …) live in **downstream** repos and depend on this one.
-
-## Quick start
-
-```bash
-# 1. Build
-cargo build --release
-
-# 2. Serve (STDIO by default — Claude Code spawns it automatically via .mcp.json)
-./target/release/sparql-mcp serve --config sparql-mcp.toml
-
-# 3. Or: shared SSE bridge (one process, many agents — recommended on Linux)
-bash plugins/kb-workbench/skills/kb-workbench/scripts/start_sparql_http.sh --bg
-# → http://127.0.0.1:7733/sse
-```
-
-Minimal `.mcp.json` for Claude Code:
-
-```json
-{
-  "mcpServers": {
-    "sparql-mcp": {
-      "type": "sse",
-      "url": "http://127.0.0.1:7733/sse"
-    }
-  }
-}
-```
-
-## Install the plugin
-
-```text
-/plugin marketplace add OWNER/sparql-mcp
-/plugin install kb-workbench@sparql-mcp
-```
-
-Replace `OWNER` with the GitHub org / user hosting the fork.
 
 ## MCP tools exposed
 
@@ -86,15 +86,29 @@ Replace `OWNER` with the GitHub org / user hosting the fork.
 | `write_doc` | Persist agent-generated markdown to the configured docs root |
 | `stats`, `list_graphs` | Introspection |
 
-Named graph convention: `<urn:project:<slug>>`, with metadata on `<urn:meta>`.
+Named graph convention: `<urn:project:<slug>>`.
 
-## Core SPARQL prefixes
+## CLI
 
-```turtle
-PREFIX smc: <https://sparql-mcp.dev/ns#>
+```
+sparql-mcp serve                # run as MCP STDIO server (default for agents)
+sparql-mcp install              # register MCP entries in detected agent configs
+sparql-mcp stats                # triple / graph counts
+sparql-mcp reload-ontology      # re-parse ontology/ into the store
+sparql-mcp load-file --path …   # load Turtle / NTriples / RDF-XML
+sparql-mcp code-import --db …   # ingest a codebase-memory-mcp SQLite graph
 ```
 
-Downstream domain plugins declare their own prefixes on top.
+## Install the Claude Code plugin (skill)
+
+The MCP server itself is installed as a binary (above). The `kb-workbench`
+plugin adds the matching Claude Code **skill** — the workflow that teaches
+an agent how to ingest / audit / render a knowledge base:
+
+```text
+/plugin marketplace add dminier/sparql-mcp
+/plugin install kb-workbench@sparql-mcp
+```
 
 ## Development
 
@@ -104,14 +118,6 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-
-## Contributing
-
-Issues and PRs welcome. Please:
-
-- Keep the core generic — domain logic belongs in a separate plugin crate.
-- English only in code, comments, identifiers, and commits.
-- Add tests next to the code they exercise.
 
 ## License
 

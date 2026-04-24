@@ -66,6 +66,10 @@ pub struct Defaults {
     pub mcp_server: Option<String>,
     pub store: Option<PathBuf>,
     pub ontology: Option<PathBuf>,
+    /// v0.2 scaffold — when `true`, each project opens its own store under
+    /// `$SPARQL_MCP_HOME/projects/<slug>/store/`. Not yet wired end-to-end.
+    #[serde(default)]
+    pub per_project_store: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

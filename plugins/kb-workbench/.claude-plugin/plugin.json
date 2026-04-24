@@ -5,7 +5,7 @@
   "author": {
     "name": "sparql-mcp contributors"
   },
-  "homepage": "https://github.com/OWNER/sparql-mcp",
+  "homepage": "https://github.com/dminier/sparql-mcp",
   "license": "MIT",
   "keywords": [
     "sparql",

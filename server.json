@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dminier/sparql-mcp",
+  "title": "sparql-mcp",
+  "description": "Generic semantic knowledge-base MCP server — SPARQL 1.1 over Oxigraph. Ingest code / docs / recordings into project-scoped named graphs, audit the graph, project to Obsidian. STDIO, single static binary, workstation-wide multi-project.",
+  "repository": {
+    "url": "https://github.com/dminier/sparql-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/dminier/sparql-mcp/releases/latest/download/sparql-mcp-darwin-arm64.tar.gz",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/dminier/sparql-mcp/releases/latest/download/sparql-mcp-darwin-amd64.tar.gz",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/dminier/sparql-mcp/releases/latest/download/sparql-mcp-linux-amd64.tar.gz",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/dminier/sparql-mcp/releases/latest/download/sparql-mcp-linux-arm64.tar.gz",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/dminier/sparql-mcp/releases/latest/download/sparql-mcp-windows-amd64.zip",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}
