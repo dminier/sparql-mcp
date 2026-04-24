@@ -57,7 +57,7 @@ jobs:
 
       - name: Install cross (Linux arm64)
         if: matrix.cross
-        run: cargo install cross --locked
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross
 
       - name: Build
         shell: bash
