@@ -126,6 +126,24 @@ chmod 755 "$DEST"
 VERSION_STR=$("$DEST" --version 2>&1 || echo "unknown")
 echo "Installed: $DEST ($VERSION_STR)"
 
+# Seed the per-user ontology directory from the extracted archive. Agents
+# launched from any cwd will find the core ontology at its XDG location.
+DATA_HOME="${SPARQL_MCP_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/sparql-mcp}"
+SRC_ONT=""
+for candidate in "$DLDIR/sparql-mcp-${OS}-${ARCH}/ontology" "$DLDIR/ontology"; do
+    if [ -d "$candidate" ]; then SRC_ONT="$candidate"; break; fi
+done
+if [ -n "$SRC_ONT" ]; then
+    mkdir -p "$DATA_HOME/ontology"
+    for f in "$SRC_ONT"/*.ttl; do
+        [ -f "$f" ] || continue
+        dst="$DATA_HOME/ontology/$(basename "$f")"
+        # Never clobber user edits.
+        if [ ! -e "$dst" ]; then cp "$f" "$dst"; fi
+    done
+    echo "Ontology: $DATA_HOME/ontology"
+fi
+
 if [ "$SKIP_CONFIG" = false ]; then
     echo ""
     echo "Configuring detected coding agents..."

@@ -7,3 +7,4 @@ pub mod install;
 pub mod mcp;
 pub mod model;
 pub mod plugin;
+pub mod xdg;

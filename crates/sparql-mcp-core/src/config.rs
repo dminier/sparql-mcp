@@ -92,6 +92,11 @@ impl Config {
             .with_context(|| format!("reading config file {}", path.display()))?;
         let cfg: Self = toml::from_str(&text)
             .with_context(|| format!("parsing config file {}", path.display()))?;
+        if cfg.defaults.per_project_store {
+            tracing::warn!(
+                "per_project_store = true: scaffold only (v0.2 feature), flag has no effect yet"
+            );
+        }
         Ok(cfg)
     }
 

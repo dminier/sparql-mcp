@@ -31,8 +31,19 @@ pub struct OxigraphAdapter {
 impl OxigraphAdapter {
     /// Open (or create) a persistent RocksDB-backed store at `path`.
     pub fn open(path: &Path) -> Result<Self> {
-        let store = Store::open(path)
-            .with_context(|| format!("opening Oxigraph store at {}", path.display()))?;
+        // RocksDB's `Store::open` only creates the leaf directory, not its
+        // ancestors — required when the user first runs against a fresh
+        // XDG data home like ~/.local/share/sparql-mcp/store.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating store parent directory {}", parent.display()))?;
+        }
+        let store = Store::open(path).with_context(|| {
+            format!(
+                "opening Oxigraph store at {} (another process may hold the RocksDB lock)",
+                path.display()
+            )
+        })?;
         Ok(Self { store })
     }
 

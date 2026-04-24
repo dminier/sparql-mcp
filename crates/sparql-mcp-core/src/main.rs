@@ -170,12 +170,12 @@ async fn main() -> Result<()> {
     let store_path = cli
         .store
         .or_else(|| cfg.defaults.store.clone())
-        .unwrap_or_else(|| PathBuf::from("./store"));
+        .unwrap_or_else(sparql_mcp::xdg::store_dir);
     let ontology_path = cli
         .ontology
         .or_else(|| cfg.defaults.ontology.clone())
-        .unwrap_or_else(|| PathBuf::from("./ontology"));
-    let docs_path = cli.docs.unwrap_or_else(|| PathBuf::from("./front/docs"));
+        .unwrap_or_else(sparql_mcp::xdg::ontology_dir);
+    let docs_path = cli.docs.unwrap_or_else(sparql_mcp::xdg::docs_dir);
 
     // Handle code-import --output-ttl before opening the store (avoids lock contention).
     if let Cmd::CodeImport {

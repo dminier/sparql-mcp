@@ -78,7 +78,9 @@ pub fn run(opts: InstallOpts) -> Result<()> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn detect(home: &Path) -> Vec<Agent> {
@@ -144,12 +146,9 @@ fn patch(agent: &Agent, name: &str, bin: &str) -> Result<bool> {
         return Ok(false);
     }
     if existed {
-        fs::copy(
-            &agent.config_path,
-            agent.config_path.with_extension("json.bak"),
-        )
-        .or_else(|_| fs::copy(&agent.config_path, append_bak(&agent.config_path)))
-        .ok();
+        // Always append .bak (never replace the real extension — a .toml
+        // renamed to .json.bak would mislead anyone trying to restore it).
+        fs::copy(&agent.config_path, append_bak(&agent.config_path)).ok();
     }
     fs::write(&agent.config_path, after)?;
     Ok(true)
