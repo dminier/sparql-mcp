@@ -25,12 +25,12 @@ jobs:
             os: linux
             arch: amd64
             ext: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            os: linux
-            arch: arm64
-            ext: tar.gz
-            cross: true
+          # - target: aarch64-unknown-linux-gnu
+          #   runner: ubuntu-latest
+          #   os: linux
+          #   arch: arm64
+          #   ext: tar.gz
+          #   cross: true
           # - target: x86_64-apple-darwin
           #   runner: macos-13
           #   os: darwin
@@ -64,9 +64,9 @@ jobs:
       - name: Build
         shell: bash
         env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-10
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++-10
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc-10
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-12
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++-12
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc-12
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
