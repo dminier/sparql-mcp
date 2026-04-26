@@ -71,6 +71,12 @@ enum Cmd {
         /// List projects available in the DB and exit.
         #[arg(long)]
         list_projects: bool,
+        /// Attach each File node's full source as cbm:sourceCode literal.
+        #[arg(long)]
+        with_source: bool,
+        /// Skip source files larger than this (bytes, default 500_000).
+        #[arg(long, default_value_t = 500_000)]
+        max_source_bytes: usize,
     },
     /// Load an RDF file (Turtle/NTriples/RDF-XML) directly into the store.
     LoadFile {
@@ -187,11 +193,16 @@ async fn run(cli: Cli) -> Result<()> {
         ref graph,
         output_ttl: Some(ref out_path),
         list_projects: _,
+        with_source,
+        max_source_bytes,
     } = cli.cmd
     {
         let kg = cbm_db::load_graph(db, cbm_project.as_deref())?;
         tracing::info!(project = %kg.project.name, nodes = kg.nodes.len(), edges = kg.edges.len(), "loaded CBM graph");
-        let turtle = cbm_turtle::graph_to_turtle(&kg);
+        let turtle = cbm_turtle::graph_to_turtle_with(
+            &kg,
+            cbm_turtle::ExportOptions { with_source, max_source_bytes },
+        );
         let slug: String = kg
             .project
             .name
@@ -251,6 +262,8 @@ async fn run(cli: Cli) -> Result<()> {
             graph,
             output_ttl,
             list_projects,
+            with_source,
+            max_source_bytes,
         } => {
             if list_projects {
                 for p in cbm_db::list_projects(&db)? {
@@ -265,7 +278,10 @@ async fn run(cli: Cli) -> Result<()> {
                 edges = kg.edges.len(),
                 "loaded CBM graph"
             );
-            let turtle = cbm_turtle::graph_to_turtle(&kg);
+            let turtle = cbm_turtle::graph_to_turtle_with(
+                &kg,
+                cbm_turtle::ExportOptions { with_source, max_source_bytes },
+            );
             let slug: String = kg
                 .project
                 .name

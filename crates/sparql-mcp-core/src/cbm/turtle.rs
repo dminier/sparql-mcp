@@ -4,11 +4,35 @@
 //! `SparqlStore::load_rdf()` — no temp file, no subprocess.
 
 use super::model::{Edge, KnowledgeGraph, Node};
+use std::path::Path;
 
 const CBM_ONT: &str = "http://codebase-memory.dev/ontology#";
 const CBM_INST: &str = "http://codebase-memory.dev/instance/";
 
+/// Options controlling the Turtle export. `with_source` slurps every File
+/// node's content (resolved against the CBM project's `root_path`) and emits
+/// `cbm:sourceCode` + `cbm:sourceBytes`. Files larger than `max_source_bytes`
+/// are skipped silently — caller can grep the log for `skipped_big`.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportOptions {
+    pub with_source: bool,
+    pub max_source_bytes: usize,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            with_source: false,
+            max_source_bytes: 500_000,
+        }
+    }
+}
+
 pub fn graph_to_turtle(kg: &KnowledgeGraph) -> String {
+    graph_to_turtle_with(kg, ExportOptions::default())
+}
+
+pub fn graph_to_turtle_with(kg: &KnowledgeGraph, opts: ExportOptions) -> String {
     let slug = project_slug(&kg.project.name);
     let inst_base = format!("{CBM_INST}{slug}#");
 
@@ -20,12 +44,43 @@ pub fn graph_to_turtle(kg: &KnowledgeGraph) -> String {
          @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .\n\n"
     ));
 
+    let root = Path::new(&kg.project.root_path);
+    let mut emitted_src = 0usize;
+    let mut skipped_big = 0usize;
+    let mut skipped_missing = 0usize;
+
     for node in &kg.nodes {
         emit_node(&mut buf, node);
+        if opts.with_source && node.label == "File" && !node.file_path.is_empty() {
+            let abs = root.join(&node.file_path);
+            match std::fs::read(&abs) {
+                Ok(bytes) if bytes.len() <= opts.max_source_bytes => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    buf.push_str(&format!(
+                        "{} cbm:sourceCode \"{}\" ;\n    cbm:sourceBytes \"{}\"^^xsd:integer .\n",
+                        node_ref(node.id),
+                        escape(&text),
+                        bytes.len()
+                    ));
+                    emitted_src += 1;
+                }
+                Ok(_) => skipped_big += 1,
+                Err(_) => skipped_missing += 1,
+            }
+        }
     }
 
     for edge in &kg.edges {
         emit_edge(&mut buf, edge);
+    }
+
+    if opts.with_source {
+        tracing::info!(
+            emitted = emitted_src,
+            skipped_big,
+            skipped_missing,
+            "source bodies attached"
+        );
     }
 
     buf
