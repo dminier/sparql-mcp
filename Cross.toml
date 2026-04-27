@@ -1,7 +1,9 @@
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 pre-build = [
-  "apt-get update && apt-get install --assume-yes --no-install-recommends g++-10-aarch64-linux-gnu"
+  "apt-get update && apt-get install --assume-yes --no-install-recommends software-properties-common ca-certificates gnupg",
+  "add-apt-repository --yes ppa:ubuntu-toolchain-r/test",
+  "apt-get update && apt-get install --assume-yes --no-install-recommends g++-12-aarch64-linux-gnu"
 ]
 
 [target.aarch64-unknown-linux-gnu.env]

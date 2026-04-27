@@ -1,5 +1,6 @@
 //! One submodule per tool group.
 
+pub mod cbm;
 pub mod doc;
 pub mod export;
 pub mod ontology;

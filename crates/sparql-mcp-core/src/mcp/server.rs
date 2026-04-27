@@ -20,7 +20,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
-use crate::application::tools::{doc, export, ontology, project, sparql};
+use crate::application::tools::{cbm, doc, export, ontology, project, sparql};
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -85,6 +85,7 @@ impl SparqlMcpServer {
             "update_sparql" => sparql::update_sparql(&self.store, args),
             "load_ontology" => ontology::load_ontology(&self.store, args),
             "load_ontology_file" => ontology::load_ontology_file(&self.store, args),
+            "cbm_load_graph" => cbm::cbm_load_graph(&self.store, args),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),
@@ -266,6 +267,7 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::sparql::tool_update_sparql_def(),
         crate::application::tools::ontology::tool_load_ontology_def(),
         crate::application::tools::ontology::tool_load_ontology_file_def(),
+        crate::application::tools::cbm::tool_cbm_load_graph_def(),
         crate::application::tools::export::tool_export_graph_def(),
         crate::application::tools::export::tool_list_graphs_def(),
         crate::application::tools::export::tool_stats_def(),
