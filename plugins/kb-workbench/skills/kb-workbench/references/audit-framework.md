@@ -11,15 +11,15 @@ framework runs them.
   name: Orphan ApplicationComponent   # human-readable
   severity: blocker                   # blocker | warning | info
   description: >-
-    ApplicationComponent without hkb:role is unusable — roles drive the
-    triage pipeline.
+    ApplicationComponent without kb:role is unusable — roles drive the review workflow.
+
   query: |
     SELECT ?c WHERE {
       ?c a archimate:ApplicationComponent .
-      FILTER NOT EXISTS { ?c hkb:role ?_ }
+      FILTER NOT EXISTS { ?c kb:role ?_ }
     }
   remediation: >-
-    Set hkb:role to one of: frontend | api | worker | storage.
+    Set kb:role to one of: frontend | api | worker | storage.
 ```
 
 ## Severity taxonomy

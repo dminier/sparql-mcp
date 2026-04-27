@@ -36,11 +36,11 @@ The emitted `candidates-<ts>.ttl` is syntactically valid Turtle that
 # Proposed by ontology_propose.py on 2026-04-23 at 20:00 UTC
 # Used in <urn:project:example-project> (4 triples) but not declared.
 
-hkb:rateLimitWindow
+kb:rateLimitWindow
     a rdf:Property ;
     rdfs:label "Rate limit window" ;
-    rdfs:comment "Proposed — observed as hkb:Endpoint → xsd:duration. Confirm domain/range." ;
-    rdfs:domain hkb:Endpoint ;
+    rdfs:comment "Proposed — observed as kb:Endpoint → xsd:duration. Confirm domain/range." ;
+    rdfs:domain kb:Endpoint ;
     rdfs:range xsd:duration .
 ```
 

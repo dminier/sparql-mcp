@@ -42,7 +42,7 @@ SELECT ?type (COUNT(?s) AS ?n) WHERE {
 SELECT ?s ?type ?firstSeen WHERE {
   GRAPH <urn:project:SLUG> {
     ?s a ?type ;
-       hkb:firstSeen ?firstSeen .
+       kb:firstSeen ?firstSeen .
     FILTER (?firstSeen > (NOW() - "P7D"^^xsd:duration))
   }
 } ORDER BY DESC(?firstSeen) LIMIT 50
@@ -52,7 +52,7 @@ SELECT ?s ?type ?firstSeen WHERE {
 
 ```sparql
 SELECT ?g (COUNT(?s) AS ?n) WHERE {
-  GRAPH ?g { ?s a hkb:Endpoint }
+  GRAPH ?g { ?s a kb:Endpoint }
 } GROUP BY ?g
 ```
 

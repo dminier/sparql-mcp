@@ -1,6 +1,6 @@
 # Ontology design — the 3-layer pattern
 
-When a domain skill (bug-bounty, enterprise-architecture, research-notebook, …)
+When a domain skill (enterprise-architecture, research-notebook, incident-response, …)
 declares its vocabulary, resist the urge to dump everything at the same
 level. Three layers keep the ontology **usable long-term**:
 

@@ -3,8 +3,8 @@ name: kb-workbench
 description: |
   Semantic knowledge workbench backed by sparql-mcp (SPARQL + ontology) and
   Obsidian for human projection. Owns the generic "KB-first" workflow shared
-  by every domain skill in this workspace (e.g. bug-bounty, enterprise-architecture,
-  and any future domain): ingest from code / docs / web / recordings into a
+  by every domain skill in this workspace (e.g. enterprise-architecture, research-notebook,
+  incident-response, and any future domain): ingest from code / docs / web / recordings into a
   project-scoped named graph, maintain the ontology as a living artefact
   (detect unknown terms, propose candidate classes/predicates), audit graph
   integrity with rule-driven SPARQL, and render the result as Obsidian
@@ -29,7 +29,7 @@ description: |
 
 # kb-workbench — the shared semantic backbone
 
-Every domain skill in this workspace (bug-bounty, enterprise-architecture, research-notebook,
+Every domain skill in this workspace (enterprise-architecture, research-notebook, incident-response,
 and any future domain) shares the same core loop:
 
 ```
@@ -47,7 +47,7 @@ Non-negotiable across every domain:
 - **Query the graph first.** Before reading a file, running a shell
   command, or answering a question about any entity the graph might know,
   issue a SPARQL SELECT against `<urn:project:<slug>>`. The filesystem
-  (findings dirs, recon output, architecture notes, vault markdown) is a
+  (issues dirs, capture output, architecture notes, vault markdown) is a
   projection of the graph, not an authority.
 - **Display every SPARQL payload verbatim** in the response. The user
   wants to see the query text and the write payload; don't paraphrase.
@@ -119,7 +119,7 @@ Domain skills declare their invariants as YAML rules:
   query: |
     SELECT ?c WHERE {
       ?c a archimate:ApplicationComponent .
-      FILTER NOT EXISTS { ?c hkb:role ?_ }
+      FILTER NOT EXISTS { ?c kb:role ?_ }
     }
 ```
 
@@ -191,7 +191,7 @@ to auto-open a store per project slug under `$SPARQL_MCP_HOME`.
 
 ## How domain skills use this skill
 
-A domain skill (e.g. `bug-bounty`, `enterprise-architecture`) should:
+A domain skill (e.g. `enterprise-architecture`, `research-notebook`) should:
 
 1. Declare its ontology files under `ontology/*.ttl` (workspace root),
    ordered by dependency depth (1-foundation, 2-domain, 3-bridge).
@@ -213,8 +213,8 @@ A domain skill (e.g. `bug-bounty`, `enterprise-architecture`) should:
 6. Supply a `rules/audit.yaml` for its invariants. Start from the 10
    canonical rules in `references/ontology-design.md` §"Canonical audit
    rules", then layer domain-specific rules on top.
-7. Restate only the rules truly specific to the domain (e.g. bug-bounty
-   rate budgets, UA discipline, dry-run defaults) — defer the KB-first
+7. Restate only the rules truly specific to the domain (e.g.
+   rate budgets, dry-run defaults, domain-specific safety constraints) — defer the KB-first
    doctrine, the ingestion contract, the ontology stewardship + design,
    the audit framework, the Obsidian convention, and the rendering
    primitives to this skill.

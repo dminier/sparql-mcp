@@ -21,7 +21,7 @@ Mapping to RDF:
 - CBM `Function`/`Method`/`Class` → `code:Symbol` with `code:qualifiedName`,
   `code:filePath`, `code:startLine`, `code:complexity`
 - CBM `CALLS` edge → `code:calls` predicate
-- Bridge to domain: `hkb:implementedBy`, `archimate:realizes`
+- Bridge to domain: `kb:implementedBy`, `archimate:realizes`
 
 **Never** grep a file inside an indexed repo; always go through CBM.
 Grep gives you lines; CBM gives you the function boundary.
@@ -34,7 +34,7 @@ Path: `kb_ingest.py doc <file>` →
 1. Extract text (PyMuPDF for PDF, markdown-it for .md, readability for HTML)
 2. Chunk + entity extraction (prompt-driven — agent fills the blanks)
 3. Emit `smc:Document`, `smc:DocumentChunk` + domain-specific entities
-   (`hkb:Asset`, `archimate:Capability`, …) with `prov:wasDerivedFrom`
+   (`kb:Asset`, `archimate:Capability`, …) with `prov:wasDerivedFrom`
    pointing at the source path.
 
 ### 3. `web` — watch signals + external references
@@ -56,7 +56,7 @@ Input: already existing session recordings under
 Path: `kb_ingest.py recording <dir>` →
 - Replay the session JSON
 - Emit `rec:Interaction`, `rec:HttpRequest`, `rec:HttpResponse`
-- Derive `hkb:Endpoint` candidates (method + host + path)
+- Derive `kb:Endpoint` candidates (method + host + path)
 - Attach `prov:wasDerivedFrom` to the recording file.
 
 ## The staging → promotion flow

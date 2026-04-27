@@ -18,8 +18,8 @@ Once both are installed, this skill lets any agent:
 - **project** to Obsidian as notes + canvas, with hand-written regions
   preserved across re-syncs.
 
-Domain plugins (bug-bounty, enterprise-architecture, research-notebook,
-…) defer the KB plumbing to this one and concentrate on their
+Domain plugins (enterprise-architecture, research-notebook,
+incident-response, …) defer the KB plumbing to this one and concentrate on their
 vocabulary and workflow.
 
 ---

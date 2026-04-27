@@ -11,16 +11,16 @@ Each domain skill ships a `render_spec.yaml`:
 # .claude/skills/<domain>/render_spec.yaml
 vault_root: ~/Documents/kb-vault
 entities:
-  - type: hkb:Finding
-    template: templates/finding-card.md
-    folder: programs/{program_slug}/findings
-    slug_predicate: hkb:slug
+  - type: kb:Issue
+    template: templates/issue-card.md
+    folder: projects/{project_slug}/issues
+    slug_predicate: kb:slug
     canvas_pattern: grid
     auto_region:
       start: "<!-- kb:auto-start -->"
       end: "<!-- kb:auto-end -->"
     query: |
-      SELECT ?finding ?slug ?severity ?cvss ?cwe ?summary
+      SELECT ?issue ?slug ?priority ?impact ?category ?summary
       WHERE { ... }
 
   - type: archimate:Capability
@@ -36,13 +36,13 @@ and regenerates the canvas.
 
 ## Folder-note convention
 
-For each entity that has children (a finding with scripts/runs, a
+For each entity that has children (an issue with scripts/runs, a
 capability with applications), generate:
 
 ```
 <folder>/<slug>.md          ← the card, with a link to the folder
 <folder>/<slug>/            ← contents (scripts, runs, attachments)
-    finding_en.md
+    issue_en.md
     scripts/
     runs/
 ```
@@ -74,7 +74,7 @@ Each pattern is a pure-geometry placement function in
 
 ### `grid`
 
-N cards laid out in a grid. Good for homogeneous collections (findings,
+N cards laid out in a grid. Good for homogeneous collections (issues,
 watch signals).
 
 Parameters: `cell_width`, `cell_height`, `cols`, `gap`.

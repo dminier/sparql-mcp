@@ -6,10 +6,10 @@ Any question whose answer could live in the graph is answered by a SPARQL
 query — first, before filesystem/grep/memory.
 
 The graph is the single source of truth for structured knowledge:
-programs, assets, endpoints, findings, capabilities, applications,
-vendors, watch signals, decisions, recordings, probes, observations —
+projects, components, services, issues, capabilities, applications,
+vendors, watch signals, decisions, recordings, observations —
 whatever the domain. The filesystem holds projections (Obsidian notes,
-TTL snapshots, recon dumps); it lags and can be partial.
+TTL snapshots, capture dumps); it lags and can be partial.
 
 ## Order of operations for any read
 
@@ -24,7 +24,7 @@ TTL snapshots, recon dumps); it lags and can be partial.
 3. **TTL backup** — under `backups/<ts>/<slug>.ttl` — is a last resort
    and must be announced as such.
 4. **Filesystem / CBM / grep** are for *source code*, *binary captures*,
-   *recon artefacts*, *vault markdown* that the graph **points to** —
+   *capture artefacts*, *vault markdown* that the graph **points to** —
    never for entity metadata that belongs in the graph.
 
 ## Order of operations for any write
@@ -39,9 +39,9 @@ TTL snapshots, recon dumps); it lags and can be partial.
 
 ## Project isolation
 
-Every program / engagement / domain uses its own **named graph**:
+Every project / domain uses its own **named graph**:
 `<urn:project:<slug>>`. Cross-graph SPARQL is fine for reference
-patterns (e.g. "which assets appear across multiple project scopes?")
+patterns (e.g. "which components appear across multiple projects?")
 but writes go to one graph only.
 
 Metadata about projects themselves (onboarding date, scope, owners) lives
@@ -55,9 +55,8 @@ extend them. Typical set:
 
 ```turtle
 PREFIX smc:       <https://sparql-mcp.dev/ns#>
-PREFIX hkb:       <https://sparql-mcp.dev/ns/hkb#>
+PREFIX kb:        <https://sparql-mcp.dev/ns/kb#>
 PREFIX archimate: <https://purl.org/archimate#>
-PREFIX ywh:       <https://sparql-mcp.dev/ns/ywh#>
 PREFIX rec:       <https://sparql-mcp.dev/ns/rec#>
 PREFIX rdf:       <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs:      <http://www.w3.org/2000/01/rdf-schema#>
