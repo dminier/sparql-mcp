@@ -13,7 +13,11 @@ __pycache__/
 
 # Generated outputs — regenerate on demand, never commit
 /output/
+**/output/
 /front/
 /backups/
 /imports/
 /ontology/snapshots/
+
+# Local agent config / personal skills
+/.claude/
