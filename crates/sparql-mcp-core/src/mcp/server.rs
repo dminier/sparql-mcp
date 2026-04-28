@@ -20,7 +20,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
-use crate::application::tools::{cbm, doc, export, ontology, project, sparql};
+use crate::application::tools::{cbm, doc, export, gdrive, ontology, project, sparql};
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -33,6 +33,8 @@ pub struct SparqlMcpServer {
     ontology_dir: PathBuf,
     active_graph: String,
     plugins: Arc<Vec<Box<dyn ToolPlugin>>>,
+    gdrive_config: Option<crate::config::GDriveConfig>,
+    store_path: std::path::PathBuf,
 }
 
 impl SparqlMcpServer {
@@ -41,6 +43,8 @@ impl SparqlMcpServer {
         doc_store: Arc<dyn DocStore>,
         ontology_dir: PathBuf,
         active_graph: String,
+        gdrive_config: Option<crate::config::GDriveConfig>,
+        store_path: PathBuf,
     ) -> Self {
         Self {
             store,
@@ -48,6 +52,8 @@ impl SparqlMcpServer {
             ontology_dir,
             active_graph,
             plugins: Arc::new(Vec::new()),
+            gdrive_config,
+            store_path,
         }
     }
 
@@ -93,6 +99,7 @@ impl SparqlMcpServer {
             "project_list" => project::project_list(&self.store),
             "project_switch" => project::project_switch(&self.store, args),
             "write_doc" => doc::write_doc(&self.doc_store, args),
+            "get_gdrive_config" => gdrive::get_gdrive_config(&self.gdrive_config, &self.store_path),
             #[cfg(feature = "recording")]
             "import_recording_navigations" => {
                 recording::import_recording_navigations(&self.store, args)
@@ -275,6 +282,7 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::project::tool_project_list_def(),
         crate::application::tools::project::tool_project_switch_def(),
         crate::application::tools::doc::tool_write_doc_def(),
+        crate::application::tools::gdrive::tool_get_gdrive_config_def(),
     ];
     #[cfg(feature = "recording")]
     {
@@ -301,6 +309,8 @@ mod dispatch_tests {
             doc_store,
             std::path::PathBuf::from("./ontology"),
             "urn:project:default".into(),
+            None,
+            std::path::PathBuf::from("/tmp/smcp-test-store"),
         )
     }
 

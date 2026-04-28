@@ -351,7 +351,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve => {
             let doc_store = Arc::new(FsDocStore::new(docs_path));
-            let srv = SparqlMcpServer::new(store, doc_store, ontology_path, cli.active_graph);
+            let srv = SparqlMcpServer::new(
+                store,
+                doc_store,
+                ontology_path,
+                cli.active_graph,
+                cfg.gdrive.clone(),
+                store_path.clone(),
+            );
             srv.serve_stdio().await?;
         }
         Cmd::Install { .. } => unreachable!("handled above"),
