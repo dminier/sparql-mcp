@@ -255,19 +255,48 @@ def resolve_subfolder(root_id, path):
 
 ---
 
-## 6. Configuration rclone (première fois)
+## 6. Setup rclone (première fois) — `kb_gdrive_setup.py`
 
-Si `upload_via = "rclone"` et rclone non configuré :
+Tout le bootstrap est dans un seul script. L'agent l'exécute une fois et il s'occupe de :
+1. installer rclone dans `~/.local/bin/` si absent ;
+2. lancer `rclone authorize drive` (ouvre une URL — l'utilisateur valide une seule fois dans son browser) ;
+3. écrire `~/.config/rclone/rclone.conf` avec le remote `gdrive` ;
+4. tester la connexion (`rclone lsd gdrive:`) ;
+5. créer/résoudre le dossier `sparql-kb` à la racine du Drive ;
+6. patcher `sparql-mcp.toml` avec le `folder_id` correct.
 
+```bash
+# Vérifier l'état (sans rien modifier)
+python3 scripts/kb_gdrive_setup.py --check
+# → {rclone_installed, remote_configured, remote_works, sparql_kb_folder_id}
+
+# Setup complet (interactif côté browser uniquement)
+python3 scripts/kb_gdrive_setup.py
+
+# Re-authentification forcée (token expiré)
+python3 scripts/kb_gdrive_setup.py --force
 ```
-Demandez à l'utilisateur de taper dans le prompt :
-  ! ~/.local/bin/rclone config
 
-Choisir : n (new remote) → nom "gdrive" → type "drive" → laisser client_id vide
-→ authentifier via browser → terminer.
+### Protocole d'appel agent
 
-Ensuite tester :
-  ! ~/.local/bin/rclone lsd gdrive:
+Avant tout `kb sync push` :
+
+```python
+check = subprocess.run(
+    ["python3", "scripts/kb_gdrive_setup.py", "--check"],
+    capture_output=True, text=True
+)
+state = json.loads(check.stdout)
+
+if not state["remote_works"]:
+    # Demander à l'utilisateur de lancer le setup dans son terminal
+    print("Lance dans ton terminal :")
+    print("  ! python3 scripts/kb_gdrive_setup.py")
+    print("Une URL s'ouvrira dans ton browser pour autoriser l'accès.")
+    # Attendre que l'utilisateur revienne, puis re-checker
 ```
 
-rclone est installé dans `~/.local/bin/rclone` (installé par kb_gdrive_sync.py ou manuellement).
+> Le script ne peut pas tourner directement dans la session Claude car
+> `rclone authorize` attend un callback HTTP local. L'utilisateur doit
+> l'invoquer via `! python3 scripts/kb_gdrive_setup.py` (préfixe `!` =
+> exécution dans la session) ou dans un terminal séparé.
