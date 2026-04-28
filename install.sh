@@ -64,15 +64,32 @@ ARCH="$(detect_arch)"
 EXT="tar.gz"
 [ "$OS" = "windows" ] && EXT="zip"
 
-ARCHIVE="sparql-mcp-${OS}-${ARCH}.${EXT}"
-URL="${BASE_URL}/${ARCHIVE}"
-SUMS_URL="${BASE_URL}/SHA256SUMS"
+# On Linux, prefer the fully-static musl build for portability (no glibc
+# version coupling). Fall back to the glibc build if the musl asset is
+# missing — older releases (< v0.0.4) only ship the glibc variant.
+ARCH_CANDIDATES=("$ARCH")
+if [ "$OS" = "linux" ] && [ "$ARCH" = "amd64" ]; then
+    ARCH_CANDIDATES=("amd64-musl" "amd64")
+fi
 
 DLDIR="$(mktemp -d)"
 trap 'rm -rf "$DLDIR"' EXIT
+SUMS_URL="${BASE_URL}/SHA256SUMS"
 
-echo "Downloading $URL"
-if ! curl -fL --proto '=https' --tlsv1.2 -o "$DLDIR/$ARCHIVE" "$URL"; then
+ARCHIVE=""
+URL=""
+for candidate in "${ARCH_CANDIDATES[@]}"; do
+    try_archive="sparql-mcp-${OS}-${candidate}.${EXT}"
+    try_url="${BASE_URL}/${try_archive}"
+    echo "Downloading $try_url"
+    if curl -fL --proto '=https' --tlsv1.2 -o "$DLDIR/$try_archive" "$try_url"; then
+        ARCHIVE="$try_archive"
+        URL="$try_url"
+        ARCH="$candidate"
+        break
+    fi
+done
+if [ -z "$ARCHIVE" ]; then
     echo "error: download failed. See https://github.com/${REPO}/releases" >&2
     exit 1
 fi
