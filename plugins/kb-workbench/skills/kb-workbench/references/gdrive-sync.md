@@ -1,205 +1,273 @@
 # GDrive Sync — agent protocol
 
-Backed by `get_gdrive_config` (sparql-mcp MCP tool) and the `mcp__claude_ai_Google_Drive__*` tools.
+Backed by `get_gdrive_config` (sparql-mcp MCP tool), the `mcp__claude_ai_Google_Drive__*` tools,
+and **`scripts/kb_gdrive_sync.py`** for all file-system operations.
 
-## 0. Pre-flight: read config
+---
 
-Always start any sync operation by calling:
+## ★ RÈGLE D'OR — Une seule archive, jamais fichier par fichier
+
+Ne jamais uploader les graphs TTL individuellement. Le protocole correct est toujours :
 
 ```
-mcp__sparql-mcp__get_gdrive_config()
+exporter tous les graphs → compresser en une archive tar.gz → uploader l'archive
 ```
 
-This returns:
-```json
-{
-  "enabled": true,
-  "folder_id": "<ID of sparql-kb/ in GDrive>",
-  "backup_retain": 5,
-  "sync_on_render": true,
-  "store_path": "/home/user/.local/share/sparql-mcp/store"
-}
+Pourquoi : chaque appel MCP `create_file` encode le contenu en base64 dans le corps JSON.
+Limite pratique : **4 MB raw** (base64 ≈ ×1.33). Au-delà, `rclone` est obligatoire.
+
+Le script `scripts/kb_gdrive_sync.py` détecte automatiquement le bon chemin :
+
+```bash
+python3 scripts/kb_gdrive_sync.py b64check --file <archive>
+# → {"fits_mcp": false, "upload_via": "rclone"}
 ```
 
-If `enabled` is false, abort and inform the user to add `[gdrive]\nenabled = true\nfolder_id = "..."` to `sparql-mcp.toml`.
+---
 
-If `folder_id` is null, run **Bootstrap** (§4) first.
+## Architecture agent ↔ script
+
+```
+Agent (MCP)                          Script (subprocess)
+────────────────────────────────     ────────────────────────────────
+mcp__sparql-mcp__get_gdrive_config   
+mcp__sparql-mcp__list_graphs         
+mcp__sparql-mcp__export_graph × N    
+                                  →  compress  --src /tmp/kb-sync --out <archive>
+                                     b64check  --file <archive>
+                                     b64       --file <archive>   (si fits_mcp)
+                                     upload    --file <archive> --remote gdrive:...  (sinon)
+                                     manifest  --folder-id <id> --graphs ... --archive <name>
+mcp__claude_ai_Google_Drive__create_file   (manifest.json, et archive si fits_mcp)
+```
+
+L'agent gère les appels MCP. Le script gère la compression, la détection de taille,
+rclone et la génération du manifest.
+
+---
+
+## 0. Pre-flight : lire la config
+
+```python
+config = mcp__sparql-mcp__get_gdrive_config()
+# → {enabled, folder_id, backup_retain, store_path}
+```
+
+- `enabled = false` → arrêter, demander à l'utilisateur d'ajouter `[gdrive]` dans `sparql-mcp.toml`.
+- `folder_id = null` → exécuter **Bootstrap** (§4) d'abord.
 
 ---
 
 ## 1. kb sync push
 
-### 1a. Export TTL per graph
+### 1a. Exporter tous les graphs
 
-```
-graphs = mcp__sparql-mcp__list_graphs()
-for each graph_iri in graphs:
-    ttl = mcp__sparql-mcp__export_graph(graph_iri=graph_iri)
-    slug = graph_iri.split(":")[-1]   # e.g. "urn:project:foo" → "foo"
-    ts   = current UTC timestamp in YYYYMMDDTHHMMSSz format
+```python
+graphs = mcp__sparql-mcp__list_graphs()   # → {graphs: [...], count: N}
+ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+mkdir -p /tmp/kb-sync
 
-    # Versioned backup
-    upload_or_overwrite(
-        parent_id = resolve_subfolder(folder_id, "store-backups/ttl/<slug>/"),
-        name      = "<ts>.ttl",
-        content   = ttl
-    )
-
-    # Live snapshot in vault
-    upload_or_overwrite(
-        parent_id = resolve_subfolder(folder_id, "vault/"),
-        name      = "<slug>.ttl",
-        content   = ttl
+for graph_iri in graphs.graphs:
+    slug = graph_iri.replace(":", "_").replace("/", "_")
+    mcp__sparql-mcp__export_graph(
+        graph_iri = graph_iri,
+        path      = f"/tmp/kb-sync/{slug}.ttl"
     )
 ```
 
-### 1b. Archive and upload RocksDB snapshot
+### 1b. Compresser en une archive unique
 
 ```bash
-ts=$(date -u +%Y%m%dT%H%M%SZ)
-tar -czf /tmp/sparql-mcp-rocksdb-$ts.tar.gz -C "$(dirname $STORE_PATH)" "$(basename $STORE_PATH)"
+python3 scripts/kb_gdrive_sync.py compress \
+  --src /tmp/kb-sync \
+  --out /tmp/kb-sync/kb-all-graphs-{ts}.tar.gz
+# → {"archive": "...", "files": 18, "size_mb": 6.1, "upload_via": "rclone"|"mcp"}
 ```
 
-Upload `/tmp/sparql-mcp-rocksdb-$ts.tar.gz` to subfolder `store-backups/rocksdb/` in GDrive.
+### 1c. Uploader l'archive
 
-### 1c. Upload Obsidian vault
-
-For each file in `vault_root` (from `render_spec.yaml`):
-- Search GDrive for the file by name in the appropriate subfolder.
-- If modifiedTime in GDrive < local mtime → upload/overwrite.
-- If not found → create.
-
-Use `mcp__claude_ai_Google_Drive__create_file` for new files,
-`mcp__claude_ai_Google_Drive__create_file` with the existing file id to overwrite.
-
-### 1d. Write sync-manifest.json
-
-Upload to the root `folder_id`:
-
-```json
-{
-  "machine": "<hostname>",
-  "pushed_at": "<ISO-8601 UTC timestamp>",
-  "graphs": ["urn:project:foo", "urn:project:bar"]
-}
+```bash
+# Vérifier la taille
+result = python3 scripts/kb_gdrive_sync.py b64check --file <archive>
 ```
 
-Use `mcp__claude_ai_Google_Drive__create_file` (overwrites if already exists — find existing ID first via `search_files`).
+**Si `fits_mcp = true`** (archive < 4 MB) :
 
-### 1e. Rotate RocksDB snapshots
-
-```
-files = mcp__claude_ai_Google_Drive__search_files(
-    query="'<rocksdb_folder_id>' in parents and name contains '.tar.gz'"
+```bash
+b64 = python3 scripts/kb_gdrive_sync.py b64 --file <archive>
+# Puis :
+mcp__claude_ai_Google_Drive__create_file(
+    title                   = "<archive_name>",
+    mimeType                = "application/gzip",
+    parentId                = resolve_subfolder(folder_id, "store-backups/ttl/"),
+    disableConversionToGoogleType = True,
+    content                 = b64,
 )
-sort files by createdTime ascending
-if len(files) > backup_retain:
-    delete oldest (len(files) - backup_retain) files
 ```
 
-Note: GDrive MCP tools do not expose a delete endpoint. Log a warning listing files to delete manually if over the limit; do not fail the push.
+**Si `fits_mcp = false`** (archive ≥ 4 MB) → utiliser rclone :
+
+```bash
+python3 scripts/kb_gdrive_sync.py upload \
+  --file  <archive> \
+  --remote gdrive:sparql-kb/store-backups/ttl/
+```
+
+> Si rclone n'est pas configuré, le script affiche les instructions (`rclone config`).
+> Demander à l'utilisateur de taper `! rclone config` pour le configurer de façon interactive.
+
+### 1d. Écrire le manifest
+
+```bash
+result = python3 scripts/kb_gdrive_sync.py manifest \
+  --folder-id <folder_id> \
+  --graphs <iri1> <iri2> ... \
+  --archive <archive_name> \
+  --out /tmp/kb-sync/manifest.json
+# → {"b64": "...", "manifest": {...}}
+
+mcp__claude_ai_Google_Drive__create_file(
+    title   = "sync-manifest.json",
+    mimeType = "application/json",
+    parentId = folder_id,
+    disableConversionToGoogleType = True,
+    content  = result["b64"],
+)
+```
+
+### 1e. Rotation des archives (optionnel)
+
+Les outils MCP GDrive n'exposent pas de endpoint de suppression.
+Si `backup_retain` est dépassé, lister les fichiers dans `store-backups/ttl/` et signaler à l'utilisateur les archives à supprimer manuellement.
 
 ---
 
 ## 2. kb sync pull
 
-### 2a. Check manifest
+### 2a. Lire le manifest
 
-```
-manifest = mcp__claude_ai_Google_Drive__search_files(
-    query="name = 'sync-manifest.json' and '<folder_id>' in parents"
+```python
+files = mcp__claude_ai_Google_Drive__search_files(
+    query = "title = 'sync-manifest.json'"
 )
-content = mcp__claude_ai_Google_Drive__read_file_content(file_id=manifest[0].id)
+content = mcp__claude_ai_Google_Drive__read_file_content(file_id=files[0].id)
+manifest = json.loads(content)
 ```
 
-If local store mtime > manifest.pushed_at: warn user and ask confirmation before overwriting.
+Si le store local est plus récent que `manifest.pushed_at` → avertir et demander confirmation.
 
-### 2b. Choose restore mode
+### 2b. Télécharger et extraire l'archive TTL
 
-Ask: "TTL mode (re-import triples) or RocksDB mode (replace store directory)?"
-
-**TTL mode:**
-```
-for each graph in manifest.graphs:
-    slug = graph.split(":")[-1]
-    files = search_files(query="'<ttl_slug_folder_id>' in parents")
-    latest = sort by createdTime desc, take first
-    ttl_content = read_file_content(latest.id)
-    write to /tmp/<slug>.ttl
-    mcp__sparql-mcp__load_ontology_file(path="/tmp/<slug>.ttl", graph_iri=graph)
+```python
+# Chercher l'archive dans store-backups/ttl/
+files = mcp__claude_ai_Google_Drive__search_files(
+    query = f"title = '{manifest.archive}'"
+)
+content = mcp__claude_ai_Google_Drive__download_file_content(file_id=files[0].id)
+# Écrire en binaire → /tmp/kb-sync-restore/<archive_name>
+# Puis :
+tar -xzf /tmp/kb-sync-restore/<archive_name> -C /tmp/kb-sync-restore/
 ```
 
-**RocksDB mode:**
-```
-files = search_files(query="'<rocksdb_folder_id>' in parents and name contains '.tar.gz'")
-latest = sort by createdTime desc, take first
-content = download_file_content(latest.id)    # binary
-write to /tmp/sparql-mcp-restore.tar.gz
-```
+### 2c. Réimporter les graphs
 
-Then (agent asks user to run):
-```bash
-systemctl stop sparql-mcp 2>/dev/null || true
-rm -rf "$STORE_PATH"
-tar -xzf /tmp/sparql-mcp-restore.tar.gz -C "$(dirname $STORE_PATH)"
-```
-
-### 2c. Download vault
-
-```
-vault_files = list all files under store-backups/vault/ recursively
-for each file:
-    content = read_file_content(file.id)
-    write to local vault_root preserving path structure
+```python
+for ttl_file in /tmp/kb-sync-restore/*.ttl:
+    graph_iri = derive_iri_from_filename(ttl_file)  # inverse du slug
+    mcp__sparql-mcp__load_ontology_file(
+        path      = ttl_file,
+        graph_iri = graph_iri
+    )
 ```
 
 ---
 
 ## 3. kb sync status
 
+```bash
+# Local
+python3 scripts/kb_gdrive_sync.py status --manifest /tmp/kb-sync/manifest.json
+
+# GDrive
+files = mcp__claude_ai_Google_Drive__search_files(query="title = 'sync-manifest.json'")
+content = mcp__claude_ai_Google_Drive__read_file_content(file_id=files[0].id)
+manifest = json.loads(content)
+# Comparer pushed_at avec mtime du store local
 ```
-manifest = search + read sync-manifest.json from GDrive
-print: machine, pushed_at, graphs
-compare pushed_at with local store mtime
-report: "in sync" or "local store is N minutes ahead of last push"
-```
+
+Afficher : machine, pushed_at, nombre de graphs, nom de l'archive.
 
 ---
 
-## 4. Bootstrap (first run on new machine / folder_id absent)
+## 4. Bootstrap (premier lancement / folder_id absent)
 
-1. Create the root folder:
-```
-result = mcp__claude_ai_Google_Drive__create_file(
-    name="sparql-kb",
-    mimeType="application/vnd.google-apps.folder"
+```python
+# Vérifier si sparql-kb existe déjà
+existing = mcp__claude_ai_Google_Drive__search_files(
+    query = "title = 'sparql-kb' and mimeType = 'application/vnd.google-apps.folder'"
 )
-folder_id = result.id
+
+if existing.files:
+    folder_id = existing.files[0].id
+else:
+    result = mcp__claude_ai_Google_Drive__create_file(
+        title    = "sparql-kb",
+        mimeType = "application/vnd.google-apps.folder"
+    )
+    folder_id = result.id
 ```
 
-2. Inform user: "Add this to `sparql-mcp.toml`:"
+Informer l'utilisateur d'ajouter dans `sparql-mcp.toml` :
+
 ```toml
 [gdrive]
 enabled   = true
 folder_id = "<folder_id>"
 ```
 
-3. Subfolders are created lazily on first push (search → create if missing).
+Les sous-dossiers (`store-backups/ttl/`) sont créés à la demande lors du premier push.
 
 ---
 
-## 5. Helper: resolve_subfolder
+## 5. Helper : resolve_subfolder
 
-To find or create a nested subfolder path like `store-backups/ttl/foo/`:
+Créer paresseusement un chemin de sous-dossiers dans GDrive :
+
+```python
+def resolve_subfolder(root_id, path):
+    """path = "store-backups/ttl" — crée les segments manquants."""
+    current = root_id
+    for segment in path.split("/"):
+        results = mcp__claude_ai_Google_Drive__search_files(
+            query = f"title = '{segment}' and mimeType = 'application/vnd.google-apps.folder'"
+        )
+        if results.files:
+            current = results.files[0].id
+        else:
+            f = mcp__claude_ai_Google_Drive__create_file(
+                title    = segment,
+                mimeType = "application/vnd.google-apps.folder",
+                parentId = current
+            )
+            current = f.id
+    return current
+```
+
+---
+
+## 6. Configuration rclone (première fois)
+
+Si `upload_via = "rclone"` et rclone non configuré :
 
 ```
-current_id = folder_id
-for each segment in ["store-backups", "ttl", "foo"]:
-    results = search_files(query="name='<segment>' and '<current_id>' in parents and mimeType='application/vnd.google-apps.folder'")
-    if results empty:
-        result = create_file(name=segment, mimeType="application/vnd.google-apps.folder", parent=current_id)
-        current_id = result.id
-    else:
-        current_id = results[0].id
-return current_id
+Demandez à l'utilisateur de taper dans le prompt :
+  ! ~/.local/bin/rclone config
+
+Choisir : n (new remote) → nom "gdrive" → type "drive" → laisser client_id vide
+→ authentifier via browser → terminer.
+
+Ensuite tester :
+  ! ~/.local/bin/rclone lsd gdrive:
 ```
+
+rclone est installé dans `~/.local/bin/rclone` (installé par kb_gdrive_sync.py ou manuellement).
