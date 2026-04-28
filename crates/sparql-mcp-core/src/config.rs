@@ -58,6 +58,10 @@ pub struct Config {
     /// Named MCP servers, keyed by a short identifier used on the CLI.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
+
+    /// Google Drive sync configuration.
+    #[serde(default)]
+    pub gdrive: Option<GDriveConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -72,6 +76,9 @@ pub struct Defaults {
     pub per_project_store: bool,
 }
 
+fn default_backup_retain() -> usize { 5 }
+fn default_true() -> bool { true }
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServer {
     /// Executable to launch (e.g. `npx`, an absolute path, ...).
@@ -80,6 +87,17 @@ pub struct McpServer {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GDriveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub folder_id: Option<String>,
+    #[serde(default = "default_backup_retain")]
+    pub backup_retain: usize,
+    #[serde(default = "default_true")]
+    pub sync_on_render: bool,
 }
 
 impl Config {
@@ -155,5 +173,43 @@ impl Config {
         // reference to its stored form.
         let stored_key = self.mcp.get_key_value(&key).unwrap().0.as_str();
         Ok((stored_key, server))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gdrive_config_deserializes() {
+        let toml = r#"
+[gdrive]
+enabled       = true
+folder_id     = "1AbCdEf_testFolder"
+backup_retain = 3
+sync_on_render = false
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let gd = cfg.gdrive.expect("gdrive section present");
+        assert!(gd.enabled);
+        assert_eq!(gd.folder_id.as_deref(), Some("1AbCdEf_testFolder"));
+        assert_eq!(gd.backup_retain, 3);
+        assert!(!gd.sync_on_render);
+    }
+
+    #[test]
+    fn gdrive_config_defaults_when_absent() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.gdrive.is_none());
+    }
+
+    #[test]
+    fn gdrive_config_default_values() {
+        let toml = "[gdrive]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let gd = cfg.gdrive.unwrap();
+        assert_eq!(gd.backup_retain, 5);
+        assert!(gd.sync_on_render);
+        assert!(gd.folder_id.is_none());
     }
 }
