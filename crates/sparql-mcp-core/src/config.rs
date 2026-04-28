@@ -76,9 +76,6 @@ pub struct Defaults {
     pub per_project_store: bool,
 }
 
-fn default_backup_retain() -> usize { 5 }
-fn default_true() -> bool { true }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServer {
     /// Executable to launch (e.g. `npx`, an absolute path, ...).
@@ -88,6 +85,9 @@ pub struct McpServer {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
+
+fn default_backup_retain() -> usize { 5 }
+fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GDriveConfig {
