@@ -109,3 +109,15 @@ the Markdown.
 Running the render twice with no KB changes produces byte-identical
 output (modulo ordering, which is stable via SPARQL `ORDER BY`). This is
 testable — CI can `obsidian_render.py && git diff --exit-code`.
+
+## Post-render GDrive sync
+
+After every successful render, if `sync_on_render = true` in the GDrive config
+(check via `get_gdrive_config`), immediately trigger **kb sync push** as defined
+in `gdrive-sync.md`.
+
+Report the push outcome in the render summary:
+- Files uploaded to vault/
+- TTL snapshots written
+- RocksDB snapshot size + timestamp
+- Any errors (do not fail the render — log and continue)

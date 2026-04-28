@@ -25,7 +25,16 @@ description: |
   knowledge base — even when the user invokes a domain skill (domain plugins,
   research-notebook) that layers on top. Domain skills defer the KB
   plumbing to this one.
+
 ---
+
+## GDrive sync
+
+Triggered by: `kb sync`, `kb sync push`, `kb sync pull`, `kb sync status`,
+`synchronise la kb`, `push to drive`, `sauvegarde`, `pull from drive`,
+`restaure la kb`, `nouvelle machine`, `restore kb`, `état de la sync`, `dernière sync`.
+
+→ Load `references/gdrive-sync.md` and follow the matching operation (push / pull / status / bootstrap).
 
 # kb-workbench — the shared semantic backbone
 
