@@ -8,6 +8,10 @@ docs     = "./front/docs"
 [project]
 active = "default"
 
+[gdrive]
+enabled   = true
+folder_id = "1504oh7sczjz02Q9Bn6U7Nrws2QrIyX1H"
+
 [plugins]
 # Activate third-party plugins here. Plugin code lives under crates/ or
 # as an external dependency implementing the ToolPlugin trait.
