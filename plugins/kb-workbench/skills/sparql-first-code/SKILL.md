@@ -1,9 +1,15 @@
 ---
 name: sparql-first-code
-description: Use this skill whenever the conversation involves reading, exploring, searching, tracing, or reasoning about source code in any indexed repository. The skill enforces a SPARQL-first workflow — code is ingested into sparql-mcp as a dated named graph (with git or alternative provenance metadata) and then queried via SPARQL instead of grep/Read. Trigger this skill on any code-discovery phrasing ("find function X", "what calls Y", "where is Z handled", "trace the auth flow", "is there dead code", "show me callers of…"), and on explicit user phrases like "IMPORT PLAYWRIGHT", "IMPORT HAR", or "purge le code de plus de N jours". Even when the user asks casually ("just grep for it"), prefer this skill — grep on indexed code wastes context. Only fall back to Grep/Read for non-code files (configs, markdown, JSON dashboards).
+description: Use this skill whenever the conversation involves reading, exploring, searching, tracing, or reasoning about source code in any indexed repository. The skill enforces a SPARQL-first workflow — code is ingested into sparql-mcp as a dated named graph (with git or alternative provenance metadata) and then queried via SPARQL instead of grep/Read. Trigger this skill on any code-discovery phrasing — EN ("find function X", "what calls Y", "where is Z handled", "trace the auth flow", "is there dead code", "show me callers of…", "import playwright", "import HAR") or FR ("trouve la fonction X", "qui appelle Y", "où est géré Z", "trace l'auth", "code mort", "appelants de…", "purge le code de plus de N jours"). Even when the user asks casually ("just grep for it" / "fais juste un grep"), prefer this skill — grep on indexed code wastes context. Only fall back to Grep/Read for non-code files (configs, markdown, JSON dashboards). For project-scoped ontology / Obsidian rendering / GDrive sync, defer to `kb-workbench`. For the global tool hierarchy, see `sparql-first`.
 ---
 
 # sparql-first-code
+
+> **Position dans l'écosystème** : ce skill est focalisé sur l'**ingestion datée
+> de code** (`urn:cbm:<repo>:<date>:<sha>`). Pour le workflow KB-first global
+> (aiguillage SPARQL > codebase-memory > Read), voir `sparql-first`. Pour les
+> projets nommés (`urn:project:<slug>`), l'ontologie domaine, les audits
+> rule-driven et le rendu Obsidian + sync GDrive, voir `kb-workbench`.
 
 ## Why
 

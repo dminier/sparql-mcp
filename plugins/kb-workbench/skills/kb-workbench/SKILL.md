@@ -188,15 +188,30 @@ to auto-open a store per project slug under `$SPARQL_MCP_HOME`.
 │   ├── obsidian-rendering.md         ← note + canvas patterns
 │   ├── obsidian-convention.md        ← tags taxonomy + frontmatter schema + MOC pattern (dense graph)
 │   ├── audit-framework.md            ← rules-YAML spec, severity taxonomy
-│   └── sparql-patterns.md            ← PrefixRegistry, canonical SELECTs
+│   ├── sparql-patterns.md            ← PrefixRegistry, canonical SELECTs
+│   └── gdrive-sync.md                ← agent ↔ script protocol for KB push/pull/status
 └── scripts/
     ├── sparql_boilerplate.py         ← execute_query, prefix map, TTL fallback
     ├── kb_ingest.py                  ← unified ingestion dispatcher
     ├── kb_audit.py                   ← rules-driven integrity checker
     ├── ontology_propose.py           ← unknown-term detector → candidates.ttl
     ├── obsidian_render.py            ← generic note + canvas renderer
-    └── canvas_layout.py              ← grid / layered / vendor-vs-oss layouts
+    ├── canvas_layout.py              ← grid / layered / vendor-vs-oss layouts
+    ├── kb_gdrive_setup.py            ← one-shot rclone+OAuth bootstrap, patches sparql-mcp.toml
+    └── kb_gdrive_sync.py             ← compress / b64check / b64 / upload / manifest / status
 ```
+
+## Related skills
+
+- **`sparql-first`** (global) — high-level tool hierarchy: SPARQL > codebase-memory > Read.
+  This skill `kb-workbench` is the domain-aware counterpart that owns the ingest
+  → audit → render loop and project-scoped graphs.
+
+- **`sparql-first-code`** — owns code-snapshot ingestion with the convention
+  `urn:cbm:<repo>:<date>:<sha>` (dated graphs with git provenance). When a
+  domain skill needs versioned code state in the KB, defer to that skill
+  rather than re-implementing the `code` adapter described in
+  `references/ingestion.md` §1.
 
 ## How domain skills use this skill
 
