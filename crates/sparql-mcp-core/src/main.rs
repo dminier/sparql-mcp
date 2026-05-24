@@ -95,6 +95,8 @@ enum Cmd {
     },
     /// Run as an MCP stdio server.
     Serve,
+    /// Launch the terminal project viewer.
+    Tui,
     /// Register this binary as an MCP server in detected agent configs
     /// (Claude Code, Codex CLI, Gemini CLI).
     Install {
@@ -360,6 +362,9 @@ async fn run(cli: Cli) -> Result<()> {
                 store_path.clone(),
             );
             srv.serve_stdio().await?;
+        }
+        Cmd::Tui => {
+            sparql_mcp::tui::run(store)?;
         }
         Cmd::Install { .. } => unreachable!("handled above"),
     }
