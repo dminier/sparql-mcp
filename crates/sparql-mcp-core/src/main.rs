@@ -212,7 +212,10 @@ async fn run(cli: Cli) -> Result<()> {
         tracing::info!(project = %kg.project.name, nodes = kg.nodes.len(), edges = kg.edges.len(), "loaded CBM graph");
         let turtle = cbm_turtle::graph_to_turtle_with(
             &kg,
-            cbm_turtle::ExportOptions { with_source, max_source_bytes },
+            cbm_turtle::ExportOptions {
+                with_source,
+                max_source_bytes,
+            },
         );
         let slug: String = kg
             .project
@@ -291,7 +294,10 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let turtle = cbm_turtle::graph_to_turtle_with(
                 &kg,
-                cbm_turtle::ExportOptions { with_source, max_source_bytes },
+                cbm_turtle::ExportOptions {
+                    with_source,
+                    max_source_bytes,
+                },
             );
             let slug: String = kg
                 .project

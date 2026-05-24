@@ -46,8 +46,8 @@ pub fn get_gdrive_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use rmcp::model::RawContent;
+    use std::path::PathBuf;
 
     #[test]
     fn returns_config_when_present() {

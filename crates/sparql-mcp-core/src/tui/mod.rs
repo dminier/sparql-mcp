@@ -16,7 +16,9 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use crate::application::stats::{collect_project_stats, collect_store_stats, ProjectStat, StoreStats};
+use crate::application::stats::{
+    collect_project_stats, collect_store_stats, ProjectStat, StoreStats,
+};
 use crate::domain::SparqlStore;
 
 /// Restores the terminal on drop, even if a panic unwinds through `run`.
@@ -82,7 +84,11 @@ fn move_selection(state: &mut TableState, projects: &[ProjectStat], delta: isize
 fn render(f: &mut Frame, stats: &StoreStats, projects: &[ProjectStat], state: &mut TableState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let header = Paragraph::new(Line::from(vec![

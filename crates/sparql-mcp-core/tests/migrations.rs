@@ -30,16 +30,13 @@ fn ask(s: &dyn SparqlStore, q: &str) -> bool {
 #[test]
 fn validate_rejects_non_contiguous_and_duplicates() {
     assert!(validate(&[M1, M2]).is_ok());
-    let gap = [
-        M1,
-        Migration {
-            version: 3,
-            ..M2
-        },
-    ];
+    let gap = [M1, Migration { version: 3, ..M2 }];
     assert!(validate(&gap).is_err(), "gap 1->3 must be rejected");
     let dup = [M1, Migration { name: "x", ..M1 }];
-    assert!(validate(&dup).is_err(), "duplicate version must be rejected");
+    assert!(
+        validate(&dup).is_err(),
+        "duplicate version must be rejected"
+    );
 }
 
 #[test]
@@ -57,8 +54,14 @@ fn apply_runs_all_then_is_idempotent() {
     assert_eq!(applied, vec![1, 2]);
     assert_eq!(current_version(s.as_ref()).unwrap(), 2);
     // the migration effects landed
-    assert!(ask(s.as_ref(), "ASK { GRAPH <urn:meta> { <urn:x:a> ?p ?o } }"));
-    assert!(ask(s.as_ref(), "ASK { GRAPH <urn:meta> { <urn:x:b> ?p ?o } }"));
+    assert!(ask(
+        s.as_ref(),
+        "ASK { GRAPH <urn:meta> { <urn:x:a> ?p ?o } }"
+    ));
+    assert!(ask(
+        s.as_ref(),
+        "ASK { GRAPH <urn:meta> { <urn:x:b> ?p ?o } }"
+    ));
     // second run applies nothing
     let again = apply(s.as_ref(), &[M1, M2]).unwrap();
     assert!(again.is_empty(), "expected no pending on second apply");
@@ -78,7 +81,10 @@ fn checksum_drift_is_detected() {
     )
     .unwrap();
     // re-applying the same set must now refuse due to drift
-    assert!(apply(s.as_ref(), &[M1]).is_err(), "tampered checksum must abort");
+    assert!(
+        apply(s.as_ref(), &[M1]).is_err(),
+        "tampered checksum must abort"
+    );
 }
 
 #[test]

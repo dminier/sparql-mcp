@@ -97,7 +97,10 @@ fn count_scalar(store: &dyn SparqlStore, sparql: &str) -> Result<u64> {
         anyhow::bail!("expected SELECT solutions for count query");
     };
     let row = sol.rows.first().context("count query returned no rows")?;
-    let var = sol.variables.first().context("count query has no variables")?;
+    let var = sol
+        .variables
+        .first()
+        .context("count query has no variables")?;
     let term = row.get(var).context("count cell missing")?;
     term.as_value_str()
         .parse::<u64>()

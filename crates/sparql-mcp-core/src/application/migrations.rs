@@ -61,7 +61,10 @@ pub fn current_version(store: &dyn SparqlStore) -> Result<u32> {
     match sol.rows.first() {
         None => Ok(0),
         Some(row) => {
-            let var = sol.variables.first().context("no variable in version query")?;
+            let var = sol
+                .variables
+                .first()
+                .context("no variable in version query")?;
             let term = row.get(var).context("version cell missing")?;
             term.as_value_str()
                 .parse::<u32>()

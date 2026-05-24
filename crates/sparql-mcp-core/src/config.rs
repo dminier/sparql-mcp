@@ -86,8 +86,12 @@ pub struct McpServer {
     pub env: BTreeMap<String, String>,
 }
 
-fn default_backup_retain() -> usize { 5 }
-fn default_true() -> bool { true }
+fn default_backup_retain() -> usize {
+    5
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GDriveConfig {
