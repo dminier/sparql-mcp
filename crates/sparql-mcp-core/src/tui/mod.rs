@@ -138,3 +138,49 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{kept}…")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::stats::ProjectStat;
+
+    fn proj(id: &str) -> ProjectStat {
+        ProjectStat {
+            id: id.into(),
+            label: id.into(),
+            description: String::new(),
+            graph_iri: format!("urn:project:{id}"),
+            triples: 0,
+            nodes: 0,
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings_and_respects_char_boundaries() {
+        assert_eq!(truncate("short", 48), "short");
+        // multibyte: must not panic and must end with the ellipsis
+        let long = "é".repeat(60);
+        let out = truncate(&long, 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn move_selection_wraps_both_ends() {
+        let projects = [proj("a"), proj("b"), proj("c")];
+        let mut st = TableState::default();
+        st.select(Some(0));
+        move_selection(&mut st, &projects, -1); // wrap to last
+        assert_eq!(st.selected(), Some(2));
+        move_selection(&mut st, &projects, 1); // wrap to first
+        assert_eq!(st.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_selection_noop_on_empty() {
+        let projects: [ProjectStat; 0] = [];
+        let mut st = TableState::default();
+        move_selection(&mut st, &projects, 1);
+        assert_eq!(st.selected(), None);
+    }
+}
