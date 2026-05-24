@@ -3,6 +3,7 @@
 //! No infrastructure imports here.  Each function receives `Arc<dyn SparqlStore>`
 //! or `Arc<dyn DocStore>` and returns `CallToolResult`.
 
+pub mod archive;
 pub mod detail;
 pub mod migrations;
 pub mod stats;

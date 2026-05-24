@@ -52,6 +52,12 @@ pub fn docs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./docs"))
 }
 
+pub fn backups_dir() -> PathBuf {
+    data_home()
+        .map(|p| p.join("backups"))
+        .unwrap_or_else(|| PathBuf::from("./backups"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

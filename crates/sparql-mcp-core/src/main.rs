@@ -106,6 +106,22 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export the whole KB to a portable, shareable zip archive.
+    KbExport {
+        /// Tag a versioned snapshot (omit for the daily `latest.zip`).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Output path (default: <data>/backups/latest.zip or kb-<tag>-<ts>.zip).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import a KB archive zip back into the store.
+    KbImport {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// List KB archives in the backups directory.
+    KbList,
     /// Register this binary as an MCP server in detected agent configs
     /// (Claude Code, Codex CLI, Gemini CLI).
     Install {
@@ -175,6 +191,28 @@ async fn run(cli: Cli) -> Result<()> {
             yes,
             dry_run,
         });
+    }
+
+    if let Cmd::KbList = cli.cmd {
+        use sparql_mcp::application::archive;
+        let dir = sparql_mcp::xdg::backups_dir();
+        let mut entries = archive::list_archives(&dir)?;
+        entries.sort_by(|a, b| a.created.cmp(&b.created));
+        if entries.is_empty() {
+            println!("no KB archives in {}", dir.display());
+        } else {
+            for e in &entries {
+                let tag = e.tag.as_deref().unwrap_or("latest");
+                println!(
+                    "{}  [{}]  {} graphs  {}",
+                    e.created,
+                    tag,
+                    e.graphs,
+                    e.path.display()
+                );
+            }
+        }
+        return Ok(());
     }
 
     let mut cfg = Config::load(&cli.config)?;
@@ -247,7 +285,7 @@ async fn run(cli: Cli) -> Result<()> {
     // The TUI viewer is read-only: open the store WITHOUT the exclusive RocksDB
     // write lock, so it works even while an MCP server holds the store. Fall
     // back to a normal (creating) open when the store does not exist yet.
-    if matches!(cli.cmd, Cmd::Tui | Cmd::Stats) {
+    if matches!(cli.cmd, Cmd::Tui | Cmd::Stats | Cmd::KbExport { .. }) {
         let store: Arc<dyn SparqlStore> = match OxigraphAdapter::open_read_only(&store_path) {
             Ok(s) => Arc::new(s),
             Err(_) => Arc::new(OxigraphAdapter::open(&store_path)?),
@@ -256,6 +294,20 @@ async fn run(cli: Cli) -> Result<()> {
             Cmd::Tui => sparql_mcp::tui::run(store),
             Cmd::Stats => {
                 println!("triples: {}", store.triple_count()?);
+                Ok(())
+            }
+            Cmd::KbExport { tag, out } => {
+                use sparql_mcp::application::archive;
+                let path = out.unwrap_or_else(|| {
+                    archive::default_path(&sparql_mcp::xdg::backups_dir(), tag.as_deref())
+                });
+                let info = archive::export_archive(store.as_ref(), &path, tag.as_deref())?;
+                println!(
+                    "exported {} graph(s) -> {} ({} bytes)",
+                    info.graphs,
+                    info.path.display(),
+                    info.bytes
+                );
                 Ok(())
             }
             _ => unreachable!(),
@@ -427,6 +479,16 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::KbImport { path } => {
+            let report = sparql_mcp::application::archive::import_archive(store.as_ref(), &path)?;
+            println!(
+                "imported {} graph(s), {} triples from {}",
+                report.graphs,
+                report.triples,
+                path.display()
+            );
+        }
+        Cmd::KbExport { .. } | Cmd::KbList => unreachable!("handled before store open"),
         Cmd::Install { .. } => unreachable!("handled above"),
     }
 

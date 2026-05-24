@@ -6,6 +6,7 @@
 //! Tab/←/→ or 1·2·3 switch tab, ↑/↓ scroll, Esc/Backspace back.
 
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -17,13 +18,15 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap};
 
+use crate::application::archive::{self, ArchiveEntry};
 use crate::application::detail::{collect_project_detail, ProjectDetail};
 use crate::application::stats::{
     collect_project_stats, collect_store_stats, ProjectStat, StoreStats,
 };
 use crate::domain::SparqlStore;
+use crate::xdg;
 
-const TABS: [&str; 3] = ["Detail", "Ontologies", "Metrics"];
+const TABS: [&str; 4] = ["Detail", "Ontologies", "Metrics", "Backup"];
 
 enum Screen {
     List,
@@ -62,13 +65,24 @@ pub fn run(store: Arc<dyn SparqlStore>) -> Result<()> {
     }
     let mut screen = Screen::List;
     let mut detail: Option<ProjectDetail> = None;
+    let backups_dir = xdg::backups_dir();
+    let mut backups = archive::list_archives(&backups_dir).unwrap_or_default();
+    let mut backup_msg: Option<String> = None;
 
     loop {
         terminal.draw(|f| match &screen {
             Screen::List => render_list(f, &stats, &projects, &mut state),
             Screen::Detail { tab, scroll } => {
                 if let Some(d) = &detail {
-                    render_detail(f, d, *tab, *scroll);
+                    render_detail(
+                        f,
+                        d,
+                        *tab,
+                        *scroll,
+                        &backups,
+                        &backups_dir,
+                        backup_msg.as_deref(),
+                    );
                 }
             }
         })?;
@@ -107,21 +121,29 @@ pub fn run(store: Arc<dyn SparqlStore>) -> Result<()> {
                 }
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                     screen = Screen::Detail {
-                        tab: (tab + 1) % 3,
+                        tab: (tab + 1) % 4,
                         scroll: 0,
                     }
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
                     screen = Screen::Detail {
-                        tab: (tab + 2) % 3,
+                        tab: (tab + 3) % 4,
                         scroll: 0,
                     }
                 }
-                KeyCode::Char(c @ '1'..='3') => {
+                KeyCode::Char(c @ '1'..='4') => {
                     screen = Screen::Detail {
                         tab: c as usize - '1' as usize,
                         scroll: 0,
                     }
+                }
+                KeyCode::Char('b') => {
+                    let path = archive::default_path(&backups_dir, None);
+                    backup_msg = Some(match archive::export_archive(store.as_ref(), &path, None) {
+                        Ok(i) => format!("\u{2713} saved latest.zip ({} graphs)", i.graphs),
+                        Err(e) => format!("\u{2717} backup failed: {e}"),
+                    });
+                    backups = archive::list_archives(&backups_dir).unwrap_or_default();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     screen = Screen::Detail {
@@ -206,7 +228,16 @@ fn render_list(
     f.render_widget(footer, chunks[2]);
 }
 
-fn render_detail(f: &mut Frame, d: &ProjectDetail, tab: usize, scroll: u16) {
+#[allow(clippy::too_many_arguments)]
+fn render_detail(
+    f: &mut Frame,
+    d: &ProjectDetail,
+    tab: usize,
+    scroll: u16,
+    backups: &[ArchiveEntry],
+    backups_dir: &Path,
+    backup_msg: Option<&str>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -229,6 +260,7 @@ fn render_detail(f: &mut Frame, d: &ProjectDetail, tab: usize, scroll: u16) {
     let lines = match tab {
         1 => ontologies_lines(d),
         2 => metrics_lines(d),
+        3 => backup_lines(backups, backups_dir, backup_msg),
         _ => detail_lines(d),
     };
     let body = Paragraph::new(lines)
@@ -328,6 +360,86 @@ fn metrics_lines(d: &ProjectDetail) -> Vec<Line<'static>> {
         out.push(Line::from(format!("   → {}", m.interpretation)));
         out.push(Line::from(""));
     }
+    out
+}
+
+fn backup_lines(backups: &[ArchiveEntry], dir: &Path, msg: Option<&str>) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::styled(
+            "Backups dir  ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(dir.display().to_string()),
+    ])];
+
+    // daily `latest.zip` status
+    let latest = dir.join("latest.zip");
+    let status = match std::fs::metadata(&latest).and_then(|m| m.modified()) {
+        Ok(modified) => match modified.elapsed() {
+            Ok(age) => {
+                let hours = age.as_secs() / 3600;
+                let due = if hours >= 24 { "  ⚠ due (daily)" } else { "" };
+                format!("updated {hours}h ago{due}")
+            }
+            Err(_) => "present".to_string(),
+        },
+        Err(_) => "none yet — press b to create".to_string(),
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            "latest.zip   ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(status, Style::default().fg(Color::Yellow)),
+    ]));
+
+    if let Some(m) = msg {
+        out.push(Line::from(Span::styled(
+            m.to_string(),
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        format!("Archives ({})", backups.len()),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if backups.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  (none yet)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for e in backups {
+            let tag = e.tag.as_deref().unwrap_or("latest");
+            out.push(Line::from(format!(
+                "  {}  [{}]  {} graphs",
+                e.created, tag, e.graphs
+            )));
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        "A KB archive is a portable container: share it and re-import anywhere.",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    for hint in [
+        "  b                       refresh latest.zip now",
+        "  sparql-mcp kb-export --tag <name>    tagged, timestamped version",
+        "  sparql-mcp kb-import --path <zip>    reload / import a shared archive",
+        "  sparql-mcp kb-list                   list archives",
+    ] {
+        out.push(Line::from(Span::styled(
+            hint.to_string(),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    out.push(Line::from(Span::styled(
+        "  Sync: set [gdrive] in sparql-mcp.toml; push via the kb-workbench skill.",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
     out
 }
 
