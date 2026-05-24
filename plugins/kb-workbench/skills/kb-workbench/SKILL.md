@@ -36,6 +36,16 @@ Triggered by: `kb sync`, `kb sync push`, `kb sync pull`, `kb sync status`,
 
 → Load `references/gdrive-sync.md` and follow the matching operation (push / pull / status / bootstrap).
 
+## Data versioning (private git repo)
+
+Triggered by: `version the data`, `data repo`, `setup data versioning`,
+`versionne les données`, `repo de données`, `configure le versioning`,
+`snapshot the data`, `restore data on new machine`.
+
+→ Load `references/data-versioning.md`. Personal store data is versioned in a
+**private** git repo (per-project TTL), strictly separate from the public code +
+schema-migration repo. If not yet configured, walk the user through the setup.
+
 # kb-workbench — the shared semantic backbone
 
 Every domain skill in this workspace (enterprise-architecture, research-notebook, incident-response,
