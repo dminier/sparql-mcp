@@ -247,12 +247,19 @@ async fn run(cli: Cli) -> Result<()> {
     // The TUI viewer is read-only: open the store WITHOUT the exclusive RocksDB
     // write lock, so it works even while an MCP server holds the store. Fall
     // back to a normal (creating) open when the store does not exist yet.
-    if let Cmd::Tui = cli.cmd {
+    if matches!(cli.cmd, Cmd::Tui | Cmd::Stats) {
         let store: Arc<dyn SparqlStore> = match OxigraphAdapter::open_read_only(&store_path) {
             Ok(s) => Arc::new(s),
             Err(_) => Arc::new(OxigraphAdapter::open(&store_path)?),
         };
-        return sparql_mcp::tui::run(store);
+        return match cli.cmd {
+            Cmd::Tui => sparql_mcp::tui::run(store),
+            Cmd::Stats => {
+                println!("triples: {}", store.triple_count()?);
+                Ok(())
+            }
+            _ => unreachable!(),
+        };
     }
 
     let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open(&store_path)?);
@@ -278,9 +285,7 @@ async fn run(cli: Cli) -> Result<()> {
                 store.triple_count()?
             );
         }
-        Cmd::Stats => {
-            println!("triples: {}", store.triple_count()?);
-        }
+        Cmd::Stats => unreachable!("handled before store open"),
         Cmd::CodeImport {
             db,
             cbm_project,
