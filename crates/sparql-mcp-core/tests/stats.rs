@@ -63,6 +63,26 @@ fn store_stats_are_exact() {
 }
 
 #[test]
+fn project_with_declared_but_empty_graph_reports_zero() {
+    let s: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+    s.load_rdf(
+        b"@prefix smc: <https://sparql-mcp.dev/ns#> .\n\
+          <urn:project:gamma> a smc:Project ; smc:projectId \"gamma\" ; smc:label \"Gamma\" ;\n\
+            smc:namedGraph <urn:project:gamma> .",
+        LoadOpts {
+            graph_iri: Some("urn:meta".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ps = collect_project_stats(s.as_ref()).unwrap();
+    assert_eq!(ps.len(), 1);
+    assert_eq!(ps[0].id, "gamma");
+    assert_eq!(ps[0].triples, 0);
+    assert_eq!(ps[0].nodes, 0);
+}
+
+#[test]
 fn project_stats_sorted_with_counts_and_description_fallback() {
     let s = seeded();
     let ps = collect_project_stats(s.as_ref()).unwrap();

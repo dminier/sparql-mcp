@@ -1,6 +1,11 @@
 //! Store and per-project statistics for the TUI viewer.
 //!
 //! Pure read-only collectors over a `SparqlStore`. No infrastructure imports.
+//! Per-project counts use grouped (`GROUP BY ?g`) queries joined in Rust — one
+//! query each for triples and nodes regardless of project count, and no project
+//! graph IRI is ever interpolated into SPARQL.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
@@ -8,6 +13,11 @@ use crate::domain::{QueryResult, RdfTerm, SparqlStore};
 
 const SMC_NS: &str = "https://sparql-mcp.dev/ns#";
 const META_GRAPH: &str = "urn:meta";
+
+const TRIPLES_BY_GRAPH: &str =
+    "SELECT ?g (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g";
+const NODES_BY_GRAPH: &str = "SELECT ?g (COUNT(DISTINCT ?n) AS ?c) WHERE { \
+     GRAPH ?g { { ?n ?p ?o } UNION { ?s ?p ?n } } FILTER(isIri(?n)) } GROUP BY ?g";
 
 /// Global store statistics shown in the TUI header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +56,31 @@ pub fn collect_store_stats(store: &dyn SparqlStore) -> Result<StoreStats> {
 }
 
 pub fn collect_project_stats(store: &dyn SparqlStore) -> Result<Vec<ProjectStat>> {
+    let projects = list_projects(store)?;
+    let triples_by_graph = counts_by_graph(store, TRIPLES_BY_GRAPH)?;
+    let nodes_by_graph = counts_by_graph(store, NODES_BY_GRAPH)?;
+
+    Ok(projects
+        .into_iter()
+        .map(|p| ProjectStat {
+            triples: triples_by_graph.get(&p.graph_iri).copied().unwrap_or(0),
+            nodes: nodes_by_graph.get(&p.graph_iri).copied().unwrap_or(0),
+            id: p.id,
+            label: p.label,
+            description: p.description,
+            graph_iri: p.graph_iri,
+        })
+        .collect())
+}
+
+struct ProjectRow {
+    id: String,
+    label: String,
+    description: String,
+    graph_iri: String,
+}
+
+fn list_projects(store: &dyn SparqlStore) -> Result<Vec<ProjectRow>> {
     let sparql = format!(
         "PREFIX smc: <{SMC_NS}>\n\
          SELECT ?id ?label ?graph ?desc WHERE {{\n\
@@ -59,37 +94,45 @@ pub fn collect_project_stats(store: &dyn SparqlStore) -> Result<Vec<ProjectStat>
     let QueryResult::Solutions(sol) = store.query(&sparql)? else {
         anyhow::bail!("expected SELECT solutions for project list");
     };
+    Ok(sol
+        .rows
+        .iter()
+        .map(|row| {
+            let id = str_cell(row, "id");
+            let label = str_cell(row, "label");
+            let graph_iri = iri_cell(row, "graph").unwrap_or_else(|| format!("urn:project:{id}"));
+            let description = match row.get("desc") {
+                Some(t) if !t.as_value_str().is_empty() => t.as_value_str().to_string(),
+                _ => label.clone(),
+            };
+            ProjectRow {
+                id,
+                label,
+                description,
+                graph_iri,
+            }
+        })
+        .collect())
+}
 
-    let mut out = Vec::with_capacity(sol.rows.len());
+/// Run a grouped `SELECT ?g (COUNT(..) AS ?c) ... GROUP BY ?g` and collect a
+/// graph-IRI -> count map.
+fn counts_by_graph(store: &dyn SparqlStore, sparql: &str) -> Result<HashMap<String, u64>> {
+    let QueryResult::Solutions(sol) = store.query(sparql)? else {
+        anyhow::bail!("expected SELECT solutions for grouped count");
+    };
+    let mut map = HashMap::with_capacity(sol.rows.len());
     for row in &sol.rows {
-        let id = str_cell(row, "id");
-        let label = str_cell(row, "label");
-        let graph_iri = iri_cell(row, "graph").unwrap_or_else(|| format!("urn:project:{id}"));
-        let description = match row.get("desc") {
-            Some(t) if !t.as_value_str().is_empty() => t.as_value_str().to_string(),
-            _ => label.clone(),
+        let Some(graph) = iri_cell(row, "g") else {
+            continue;
         };
-        let triples = count_scalar(
-            store,
-            &format!("SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }}"),
-        )?;
-        let nodes = count_scalar(
-            store,
-            &format!(
-                "SELECT (COUNT(DISTINCT ?n) AS ?c) WHERE {{ GRAPH <{graph_iri}> \
-                 {{ {{ ?n ?p ?o }} UNION {{ ?s ?p ?n }} }} FILTER(isIri(?n)) }}"
-            ),
-        )?;
-        out.push(ProjectStat {
-            id,
-            label,
-            description,
-            graph_iri,
-            triples,
-            nodes,
-        });
+        let count = row
+            .get("c")
+            .and_then(|t| t.as_value_str().parse::<u64>().ok())
+            .unwrap_or(0);
+        map.insert(graph, count);
     }
-    Ok(out)
+    Ok(map)
 }
 
 fn count_scalar(store: &dyn SparqlStore, sparql: &str) -> Result<u64> {
@@ -107,13 +150,13 @@ fn count_scalar(store: &dyn SparqlStore, sparql: &str) -> Result<u64> {
         .with_context(|| format!("count value not an integer: {}", term.as_value_str()))
 }
 
-fn str_cell(row: &std::collections::HashMap<String, RdfTerm>, var: &str) -> String {
+fn str_cell(row: &HashMap<String, RdfTerm>, var: &str) -> String {
     row.get(var)
         .map(|t| t.as_value_str().to_string())
         .unwrap_or_default()
 }
 
-fn iri_cell(row: &std::collections::HashMap<String, RdfTerm>, var: &str) -> Option<String> {
+fn iri_cell(row: &HashMap<String, RdfTerm>, var: &str) -> Option<String> {
     row.get(var).and_then(|t| match t {
         RdfTerm::Iri(s) => Some(s.clone()),
         _ => None,
