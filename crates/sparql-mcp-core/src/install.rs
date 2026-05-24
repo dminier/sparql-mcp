@@ -74,6 +74,10 @@ pub fn run(opts: InstallOpts) -> Result<()> {
             Err(e) => eprintln!("  ! {} failed: {e:#}", a.name),
         }
     }
+
+    if let Err(e) = install_desktop(&bin, opts.dry_run) {
+        eprintln!("  ! desktop launcher failed: {e:#}");
+    }
     Ok(())
 }
 
@@ -215,9 +219,122 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes")
 }
 
+// ── Desktop launcher (Linux) ──────────────────────────────────────────────────
+
+/// Simple semantic-graph logo: 5 orange nodes + edges on a cream background.
+pub fn logo_svg() -> &'static str {
+    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect x="0" y="0" width="64" height="64" rx="12" fill="#FBF3E0"/>
+  <g stroke="#E8820C" stroke-width="2.6" stroke-linecap="round">
+    <line x1="32" y1="15" x2="51" y2="29"/>
+    <line x1="51" y1="29" x2="44" y2="51"/>
+    <line x1="44" y1="51" x2="20" y2="51"/>
+    <line x1="20" y1="51" x2="13" y2="29"/>
+    <line x1="13" y1="29" x2="32" y2="15"/>
+    <line x1="32" y1="15" x2="44" y2="51"/>
+  </g>
+  <g fill="#E8820C" stroke="#B25E00" stroke-width="1.4">
+    <circle cx="32" cy="15" r="5.4"/>
+    <circle cx="51" cy="29" r="5.4"/>
+    <circle cx="44" cy="51" r="5.4"/>
+    <circle cx="20" cy="51" r="5.4"/>
+    <circle cx="13" cy="29" r="5.4"/>
+  </g>
+</svg>
+"##
+}
+
+/// XDG `.desktop` entry launching the TUI viewer in a terminal.
+fn desktop_entry(bin: &str, icon_path: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=sparql-mcp\n\
+         Comment=Browse sparql-mcp projects (semantic knowledge base)\n\
+         Exec={bin} tui\n\
+         Icon={icon_path}\n\
+         Terminal=true\n\
+         Categories=Development;Utility;\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_desktop(bin: &str, dry_run: bool) -> Result<()> {
+    let home = dirs_home().context("no HOME directory")?;
+    let icon_dir = home.join(".local/share/icons");
+    let app_dir = home.join(".local/share/applications");
+    let icon_path = icon_dir.join("sparql-mcp.svg");
+    let desktop_path = app_dir.join("sparql-mcp.desktop");
+    let entry = desktop_entry(bin, &icon_path.to_string_lossy());
+
+    if dry_run {
+        println!("[dry-run] would write icon  {}", icon_path.display());
+        println!("[dry-run] would write launcher {}", desktop_path.display());
+        return Ok(());
+    }
+
+    fs::create_dir_all(&icon_dir).context("creating icon dir")?;
+    fs::create_dir_all(&app_dir).context("creating applications dir")?;
+    fs::write(&icon_path, logo_svg()).context("writing logo")?;
+    fs::write(&desktop_path, &entry).context("writing .desktop")?;
+    set_executable(&desktop_path);
+    println!(
+        "  + desktop launcher installed ({})",
+        desktop_path.display()
+    );
+
+    // Best-effort copy onto the Desktop, if one exists.
+    let desk = home.join("Desktop");
+    if desk.is_dir() {
+        let on_desktop = desk.join("sparql-mcp.desktop");
+        if fs::write(&on_desktop, &entry).is_ok() {
+            set_executable(&on_desktop);
+            println!("  + desktop icon placed ({})", on_desktop.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_desktop(_bin: &str, _dry_run: bool) -> Result<()> {
+    println!("  = desktop launcher: skipped (Linux only)");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perm = meta.permissions();
+        perm.set_mode(0o755);
+        let _ = fs::set_permissions(path, perm);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_entry_launches_tui_in_terminal() {
+        let e = desktop_entry(
+            "/usr/bin/sparql-mcp",
+            "/home/u/.local/share/icons/sparql-mcp.svg",
+        );
+        assert!(e.contains("Exec=/usr/bin/sparql-mcp tui"));
+        assert!(e.contains("Terminal=true"));
+        assert!(e.contains("Type=Application"));
+        assert!(e.contains("Icon=/home/u/.local/share/icons/sparql-mcp.svg"));
+    }
+
+    #[test]
+    fn logo_is_orange_on_cream_svg() {
+        let svg = logo_svg();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("#FBF3E0"), "cream background");
+        assert!(svg.contains("#E8820C"), "orange nodes");
+        assert_eq!(svg.matches("<circle").count(), 5, "5 nodes");
+    }
 
     #[test]
     fn claude_patch_creates_entry() {
