@@ -3,7 +3,26 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] — 2026-05-25
+## [0.2.0] — 2026-05-25
+
+### Added
+- Terminal viewer `sparql-mcp tui` — project list + 4-tab detail
+  (Detail / Ontologies with `subClassOf` inheritance / Metrics / Backup).
+- Schema migrations: `sparql-mcp migrate [--status|--dry-run]`
+  (forward-only, embedded, version + checksum in `<urn:meta>`).
+- KB container: `kb-export [--tag]`, `kb-import`, `kb-list` — portable,
+  shareable zip of the whole store; daily `latest.zip` + auto-incremental
+  `vN` versions; a Backup Manager screen (F5/F6) in the viewer.
+- Contextual `claude` launch from the viewer (`c`).
+- Desktop launcher + semantic-graph logo created by `install` (Linux).
+- Default `tdd` skill and root `CLAUDE.md` resume rules.
+
+### Changed
+- Read-only store open for viewers (`tui`, `stats`, `kb-export`) — no RocksDB
+  write-lock contention with a running MCP server.
+- Per-project stats use grouped queries (no N+1, no SPARQL-injection surface).
+
+## [0.1.0] — 2026-04-28
 
 Initial public cut. Extracted from a larger private monorepo and scrubbed
 of domain-specific content.
@@ -21,17 +40,6 @@ of domain-specific content.
 - `kb-workbench` Claude Code plugin and skill.
 - CI: fmt, clippy (-D warnings), tests.
 
-- Terminal viewer `sparql-mcp tui` — project list + 4-tab detail
-  (Detail / Ontologies with `subClassOf` inheritance / Metrics / Backup).
-- Schema migrations: `sparql-mcp migrate [--status|--dry-run]`
-  (forward-only, embedded, version + checksum in `<urn:meta>`).
-- KB container: `kb-export [--tag]`, `kb-import`, `kb-list` — portable,
-  shareable zip of the whole store; daily `latest.zip` + auto-incremental
-  `vN` versions; Backup Manager screen (F5/F6) in the TUI.
-- Contextual `claude` launch from the viewer (`c`).
-- Desktop launcher + semantic-graph logo created by `install` (Linux).
-- Read-only store open for viewers (`tui`, `stats`, `kb-export`) — no lock
-  contention with a running MCP server.
 
 ### Scaffolded (wiring in v0.2)
 - `per_project_store` flag in `[core]` — will open one RocksDB store per
