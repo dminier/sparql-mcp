@@ -197,18 +197,25 @@ async fn run(cli: Cli) -> Result<()> {
         use sparql_mcp::application::archive;
         let dir = sparql_mcp::xdg::backups_dir();
         let mut entries = archive::list_archives(&dir)?;
-        entries.sort_by(|a, b| a.created.cmp(&b.created));
+        entries.sort_by(|a, b| b.created.cmp(&a.created)); // newest first
         if entries.is_empty() {
             println!("no KB archives in {}", dir.display());
         } else {
+            println!(
+                "{:<22}  {:<14}  {:>6}  {:>8}  file",
+                "date", "tag", "graphs", "size"
+            );
             for e in &entries {
                 let tag = e.tag.as_deref().unwrap_or("latest");
+                let size = if e.bytes >= 1024 {
+                    format!("{:.1}K", e.bytes as f64 / 1024.0)
+                } else {
+                    format!("{}B", e.bytes)
+                };
+                let file = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 println!(
-                    "{}  [{}]  {} graphs  {}",
-                    e.created,
-                    tag,
-                    e.graphs,
-                    e.path.display()
+                    "{:<22}  {:<14}  {:>6}  {:>8}  {}",
+                    e.created, tag, e.graphs, size, file
                 );
             }
         }

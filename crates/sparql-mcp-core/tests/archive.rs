@@ -71,3 +71,35 @@ fn list_archives_reports_zips_in_dir() {
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().any(|e| e.tag.as_deref() == Some("tag")));
 }
+
+#[test]
+fn next_version_tag_increments() {
+    use sparql_mcp::application::archive::{next_version_tag, ArchiveEntry};
+    let mk = |tag: Option<&str>| ArchiveEntry {
+        path: std::path::PathBuf::from("x.zip"),
+        tag: tag.map(str::to_string),
+        created: "2026-05-25T00:00:00Z".into(),
+        graphs: 1,
+        bytes: 0,
+    };
+    // empty -> v1
+    assert_eq!(next_version_tag(&[]), "v1");
+    // ignores non-vN tags and `latest`
+    let entries = [
+        mk(None),
+        mk(Some("release")),
+        mk(Some("v2")),
+        mk(Some("v5")),
+        mk(Some("vx")),
+    ];
+    assert_eq!(next_version_tag(&entries), "v6");
+}
+
+#[test]
+fn list_archives_reports_size() {
+    let dir = TempDir::new().unwrap();
+    let src = seeded();
+    export_archive(src.as_ref(), &dir.path().join("latest.zip"), None).unwrap();
+    let entries = list_archives(dir.path()).unwrap();
+    assert!(entries.iter().all(|e| e.bytes > 0), "bytes populated");
+}

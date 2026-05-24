@@ -49,6 +49,7 @@ pub struct ArchiveEntry {
     pub tag: Option<String>,
     pub created: String,
     pub graphs: usize,
+    pub bytes: u64,
 }
 
 /// Export every named graph in `store` into a zip archive at `out`.
@@ -159,11 +160,13 @@ pub fn list_archives(dir: &Path) -> Result<Vec<ArchiveEntry>> {
             continue;
         }
         if let Ok(m) = read_manifest(&path) {
+            let bytes = fs::metadata(&path).map(|md| md.len()).unwrap_or(0);
             out.push(ArchiveEntry {
                 path,
                 tag: m.tag,
                 created: m.created,
                 graphs: m.graphs.len(),
+                bytes,
             });
         }
     }
@@ -190,6 +193,18 @@ pub fn default_path(dir: &Path, tag: Option<&str>) -> PathBuf {
             dir.join(format!("kb-{safe}-{stamp}.zip"))
         }
     }
+}
+
+/// Next auto-incremental version tag (`v1`, `v2`, …) given existing archives.
+/// Scans `vN` tags, returns `v{max+1}` (or `v1` when none exist).
+pub fn next_version_tag(entries: &[ArchiveEntry]) -> String {
+    let max = entries
+        .iter()
+        .filter_map(|e| e.tag.as_deref())
+        .filter_map(|t| t.strip_prefix('v').and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(0);
+    format!("v{}", max + 1)
 }
 
 fn open_zip(zip_path: &Path) -> Result<ZipArchive<File>> {
