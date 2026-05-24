@@ -296,9 +296,68 @@ fn install_desktop(bin: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows `.cmd` launcher that opens the terminal viewer.
+pub fn windows_launcher_cmd(bin: &str) -> String {
+    format!("@echo off\r\n\"{bin}\" tui\r\n")
+}
+
+#[cfg(windows)]
+fn install_desktop(bin: &str, dry_run: bool) -> Result<()> {
+    let home = dirs_home().context("no home directory")?;
+    let desktop = home.join("Desktop");
+    let programs = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    let script = windows_launcher_cmd(bin);
+
+    if dry_run {
+        println!(
+            "[dry-run] would write {}",
+            desktop.join("sparql-mcp.cmd").display()
+        );
+        println!(
+            "[dry-run] would write {}",
+            programs.join("sparql-mcp.cmd").display()
+        );
+        return Ok(());
+    }
+
+    for dir in [&desktop, &programs] {
+        if fs::create_dir_all(dir).is_ok() {
+            let path = dir.join("sparql-mcp.cmd");
+            if fs::write(&path, &script).is_ok() {
+                println!("  + launcher installed ({})", path.display());
+            }
+        }
+    }
+
+    // Best-effort: a real .lnk shortcut on the Desktop (nicer icon, single click).
+    let lnk = desktop.join("sparql-mcp.lnk");
+    let ps = format!(
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');\
+         $s.TargetPath='{}';$s.Arguments='tui';$s.IconLocation='{},0';$s.Save()",
+        lnk.display(),
+        bin,
+        bin
+    );
+    let made_lnk = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if made_lnk {
+        println!("  + desktop shortcut placed ({})", lnk.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn install_desktop(_bin: &str, _dry_run: bool) -> Result<()> {
-    println!("  = desktop launcher: skipped (Linux only)");
+    println!("  = desktop launcher: skipped (Linux and Windows only)");
     Ok(())
 }
 
@@ -327,6 +386,14 @@ mod tests {
         assert!(e.contains("Terminal=true"));
         assert!(e.contains("Type=Application"));
         assert!(e.contains("Icon=/home/u/.local/share/icons/sparql-mcp.svg"));
+    }
+
+    #[test]
+    fn windows_launcher_cmd_runs_tui() {
+        let c = windows_launcher_cmd("C:\\bin\\sparql-mcp.exe");
+        assert!(c.contains("@echo off"));
+        assert!(c.contains("sparql-mcp.exe"));
+        assert!(c.trim_end().ends_with("tui"));
     }
 
     #[test]

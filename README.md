@@ -37,7 +37,9 @@ Pin a version with `SPARQL_MCP_VERSION=v0.1.0`, change the location with
 
 **Windows:** download the archive from the
 [latest release](https://github.com/dminier/sparql-mcp/releases/latest), put
-`sparql-mcp.exe` on your `PATH`, then run `sparql-mcp.exe install -y`.
+`sparql-mcp.exe` on your `PATH`, then run `sparql-mcp.exe install -y`. This
+registers the MCP entry and drops a **launcher** (`sparql-mcp.cmd` + a Desktop
+shortcut) that opens the viewer.
 
 Restart your agent afterwards — `sparql-mcp` is a STDIO server the agent starts
 on demand. Nothing keeps running in the background.

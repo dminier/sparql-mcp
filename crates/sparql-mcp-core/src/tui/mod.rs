@@ -247,16 +247,33 @@ fn move_row(state: &mut TableState, len: usize, delta: isize) {
     state.select(Some(next as usize));
 }
 
+/// Build the `claude` invocation. On Windows the CLI is usually a `claude.cmd`
+/// shim, which `CreateProcess` won't resolve directly, so go through `cmd /C`.
+#[cfg(windows)]
+fn claude_command(prompt: Option<&str>) -> Command {
+    let mut c = Command::new("cmd");
+    c.arg("/C").arg("claude");
+    if let Some(p) = prompt {
+        c.arg(p);
+    }
+    c
+}
+
+#[cfg(not(windows))]
+fn claude_command(prompt: Option<&str>) -> Command {
+    let mut c = Command::new("claude");
+    if let Some(p) = prompt {
+        c.arg(p);
+    }
+    c
+}
+
 /// Suspend the TUI, run `claude` (optionally seeded with a prompt) attached to
 /// the real terminal, then restore the TUI. Returns a status line.
 fn run_claude(terminal: &mut Terminal<CrosstermBackend<Stdout>>, prompt: Option<String>) -> String {
     let _ = disable_raw_mode();
     let _ = io::stdout().execute(LeaveAlternateScreen);
-    let mut cmd = Command::new("claude");
-    if let Some(p) = &prompt {
-        cmd.arg(p);
-    }
-    let result = cmd.status();
+    let result = claude_command(prompt.as_deref()).status();
     let _ = enable_raw_mode();
     let _ = io::stdout().execute(EnterAlternateScreen);
     let _ = terminal.clear();
