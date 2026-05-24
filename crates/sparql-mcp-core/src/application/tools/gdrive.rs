@@ -1,6 +1,6 @@
 //! get_gdrive_config tool — returns GDrive sync configuration and store path.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use rmcp::model::{CallToolResult, Content, Tool};
 use rmcp::ErrorData as McpError;
@@ -20,7 +20,7 @@ pub fn tool_get_gdrive_config_def() -> Tool {
 
 pub fn get_gdrive_config(
     gdrive: &Option<GDriveConfig>,
-    store_path: &PathBuf,
+    store_path: &Path,
 ) -> Result<CallToolResult, McpError> {
     let payload = match gdrive {
         Some(gd) => json!({
@@ -47,6 +47,7 @@ pub fn get_gdrive_config(
 mod tests {
     use super::*;
     use rmcp::model::RawContent;
+    use std::path::PathBuf;
 
     #[test]
     fn returns_config_when_present() {

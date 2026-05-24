@@ -75,10 +75,7 @@ fn resolve_db_path(args: &JsonObject) -> Result<PathBuf, McpError> {
         .get("repo_path")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            McpError::invalid_params(
-                "must provide either 'cbm_db_path' or 'repo_path'",
-                None,
-            )
+            McpError::invalid_params("must provide either 'cbm_db_path' or 'repo_path'", None)
         })?;
     let slug = slug_from_repo_path(repo)?;
     Ok(cache_dir().join(format!("{slug}.db")))

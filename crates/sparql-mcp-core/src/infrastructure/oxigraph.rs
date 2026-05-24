@@ -53,6 +53,16 @@ impl OxigraphAdapter {
             store: Store::new()?,
         })
     }
+
+    /// Open an existing store **read-only**. Unlike `open`, this does not take
+    /// the exclusive RocksDB write lock, so it works while another process
+    /// (e.g. a running MCP server) holds the store. Read-only views may lag
+    /// slightly behind the writer's latest flush.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let store = Store::open_read_only(path)
+            .with_context(|| format!("opening Oxigraph store read-only at {}", path.display()))?;
+        Ok(Self { store })
+    }
 }
 
 impl SparqlStore for OxigraphAdapter {

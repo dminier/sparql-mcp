@@ -95,6 +95,33 @@ enum Cmd {
     },
     /// Run as an MCP stdio server.
     Serve,
+    /// Launch the terminal project viewer.
+    Tui,
+    /// Apply pending schema migrations.
+    Migrate {
+        /// Report current/embedded version and pending list without applying.
+        #[arg(long)]
+        status: bool,
+        /// List what would run without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export the whole KB to a portable, shareable zip archive.
+    KbExport {
+        /// Tag a versioned snapshot (omit for the daily `latest.zip`).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Output path (default: <data>/backups/latest.zip or kb-<tag>-<ts>.zip).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import a KB archive zip back into the store.
+    KbImport {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// List KB archives in the backups directory.
+    KbList,
     /// Register this binary as an MCP server in detected agent configs
     /// (Claude Code, Codex CLI, Gemini CLI).
     Install {
@@ -166,6 +193,35 @@ async fn run(cli: Cli) -> Result<()> {
         });
     }
 
+    if let Cmd::KbList = cli.cmd {
+        use sparql_mcp::application::archive;
+        let dir = sparql_mcp::xdg::backups_dir();
+        let mut entries = archive::list_archives(&dir)?;
+        entries.sort_by(|a, b| b.created.cmp(&a.created)); // newest first
+        if entries.is_empty() {
+            println!("no KB archives in {}", dir.display());
+        } else {
+            println!(
+                "{:<22}  {:<14}  {:>6}  {:>8}  file",
+                "date", "tag", "graphs", "size"
+            );
+            for e in &entries {
+                let tag = e.tag.as_deref().unwrap_or("latest");
+                let size = if e.bytes >= 1024 {
+                    format!("{:.1}K", e.bytes as f64 / 1024.0)
+                } else {
+                    format!("{}B", e.bytes)
+                };
+                let file = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                println!(
+                    "{:<22}  {:<14}  {:>6}  {:>8}  {}",
+                    e.created, tag, e.graphs, size, file
+                );
+            }
+        }
+        return Ok(());
+    }
+
     let mut cfg = Config::load(&cli.config)?;
     let merged = cfg.merge_mcp_json(&cli.mcp_json)?;
     if merged > 0 {
@@ -201,7 +257,10 @@ async fn run(cli: Cli) -> Result<()> {
         tracing::info!(project = %kg.project.name, nodes = kg.nodes.len(), edges = kg.edges.len(), "loaded CBM graph");
         let turtle = cbm_turtle::graph_to_turtle_with(
             &kg,
-            cbm_turtle::ExportOptions { with_source, max_source_bytes },
+            cbm_turtle::ExportOptions {
+                with_source,
+                max_source_bytes,
+            },
         );
         let slug: String = kg
             .project
@@ -230,6 +289,38 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The TUI viewer is read-only: open the store WITHOUT the exclusive RocksDB
+    // write lock, so it works even while an MCP server holds the store. Fall
+    // back to a normal (creating) open when the store does not exist yet.
+    if matches!(cli.cmd, Cmd::Tui | Cmd::Stats | Cmd::KbExport { .. }) {
+        let store: Arc<dyn SparqlStore> = match OxigraphAdapter::open_read_only(&store_path) {
+            Ok(s) => Arc::new(s),
+            Err(_) => Arc::new(OxigraphAdapter::open(&store_path)?),
+        };
+        return match cli.cmd {
+            Cmd::Tui => sparql_mcp::tui::run(store),
+            Cmd::Stats => {
+                println!("triples: {}", store.triple_count()?);
+                Ok(())
+            }
+            Cmd::KbExport { tag, out } => {
+                use sparql_mcp::application::archive;
+                let path = out.unwrap_or_else(|| {
+                    archive::default_path(&sparql_mcp::xdg::backups_dir(), tag.as_deref())
+                });
+                let info = archive::export_archive(store.as_ref(), &path, tag.as_deref())?;
+                println!(
+                    "exported {} graph(s) -> {} ({} bytes)",
+                    info.graphs,
+                    info.path.display(),
+                    info.bytes
+                );
+                Ok(())
+            }
+            _ => unreachable!(),
+        };
+    }
+
     let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open(&store_path)?);
     store.load_ontology_dir(&ontology_path)?;
 
@@ -253,9 +344,7 @@ async fn run(cli: Cli) -> Result<()> {
                 store.triple_count()?
             );
         }
-        Cmd::Stats => {
-            println!("triples: {}", store.triple_count()?);
-        }
+        Cmd::Stats => unreachable!("handled before store open"),
         Cmd::CodeImport {
             db,
             cbm_project,
@@ -280,7 +369,10 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let turtle = cbm_turtle::graph_to_turtle_with(
                 &kg,
-                cbm_turtle::ExportOptions { with_source, max_source_bytes },
+                cbm_turtle::ExportOptions {
+                    with_source,
+                    max_source_bytes,
+                },
             );
             let slug: String = kg
                 .project
@@ -361,6 +453,49 @@ async fn run(cli: Cli) -> Result<()> {
             );
             srv.serve_stdio().await?;
         }
+        Cmd::Tui => unreachable!("handled before store open"),
+        Cmd::Migrate { status, dry_run } => {
+            use sparql_mcp::application::migrations;
+            let embedded = migrations::embedded();
+            let cur = migrations::current_version(store.as_ref())?;
+            let max = embedded.last().map(|m| m.version).unwrap_or(0);
+            let pending = migrations::pending(store.as_ref(), embedded)?;
+            if status {
+                println!("schema version: {cur} (embedded max: {max})");
+                if pending.is_empty() {
+                    println!("up to date");
+                } else {
+                    for m in &pending {
+                        println!("pending: {:04} {}", m.version, m.name);
+                    }
+                }
+            } else if dry_run {
+                if pending.is_empty() {
+                    println!("up to date (version {cur})");
+                } else {
+                    for m in &pending {
+                        println!("would apply: {:04} {}", m.version, m.name);
+                    }
+                }
+            } else {
+                let applied = migrations::apply(store.as_ref(), embedded)?;
+                if applied.is_empty() {
+                    println!("up to date (version {cur})");
+                } else {
+                    println!("applied: {applied:?} (now version {max})");
+                }
+            }
+        }
+        Cmd::KbImport { path } => {
+            let report = sparql_mcp::application::archive::import_archive(store.as_ref(), &path)?;
+            println!(
+                "imported {} graph(s), {} triples from {}",
+                report.graphs,
+                report.triples,
+                path.display()
+            );
+        }
+        Cmd::KbExport { .. } | Cmd::KbList => unreachable!("handled before store open"),
         Cmd::Install { .. } => unreachable!("handled above"),
     }
 

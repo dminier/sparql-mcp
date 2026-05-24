@@ -1,0 +1,34 @@
+#!/bin/sh
+# Guard: keep personal store data out of the PUBLIC repo.
+# Personal triples (urn:project:*) and RocksDB snapshots belong in the private
+# data repo (see plugins/kb-workbench/skills/kb-workbench/references/data-versioning.md).
+# Enable once per clone:  git config core.hooksPath .githooks
+
+set -eu
+
+blocked=""
+
+# Staged, added/copied/modified files only.
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+for f in $staged; do
+    case "$f" in
+        # Schema migrations are TTL/SPARQL of STRUCTURE — explicitly allowed.
+        migrations/*.ru|ontology/*.ttl) continue ;;
+        *.tar.gz|*.rocksdb|*/store/*)
+            blocked="$blocked\n  $f  (looks like a store snapshot)" ;;
+        *.ttl)
+            if git show ":$f" 2>/dev/null | grep -q 'urn:project:'; then
+                blocked="$blocked\n  $f  (contains urn:project: personal data)"
+            fi ;;
+    esac
+done
+
+if [ -n "$blocked" ]; then
+    printf '\033[31mpre-commit blocked — personal data must NOT enter the public repo:\033[0m'
+    printf '%b\n' "$blocked"
+    printf 'Move these to the private data repo (\$SPARQL_MCP_DATA_REPO). See data-versioning.md §2.\n'
+    printf 'Override (rarely correct):  git commit --no-verify\n'
+    exit 1
+fi
+exit 0
