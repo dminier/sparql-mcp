@@ -87,3 +87,27 @@ fn embedded_set_is_valid() {
     validate(embedded()).unwrap();
     assert!(!embedded().is_empty());
 }
+
+#[test]
+fn embedded_0001_backfills_project_description() {
+    let s = store();
+    s.update(
+        "PREFIX smc: <https://sparql-mcp.dev/ns#>\n\
+         INSERT DATA { GRAPH <urn:meta> {\n\
+             <urn:project:demo> a smc:Project ; smc:projectId \"demo\" ; smc:label \"Demo\" .\n\
+         } }",
+    )
+    .unwrap();
+    // no description before
+    assert!(!ask(
+        s.as_ref(),
+        "ASK { GRAPH <urn:meta> { <urn:project:demo> <https://sparql-mcp.dev/ns#description> ?d } }"
+    ));
+    apply(s.as_ref(), embedded()).unwrap();
+    // backfilled from the label
+    assert!(ask(
+        s.as_ref(),
+        "ASK { GRAPH <urn:meta> { <urn:project:demo> \
+         <https://sparql-mcp.dev/ns#description> \"Demo\" } }"
+    ));
+}

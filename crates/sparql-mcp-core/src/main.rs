@@ -97,6 +97,15 @@ enum Cmd {
     Serve,
     /// Launch the terminal project viewer.
     Tui,
+    /// Apply pending schema migrations.
+    Migrate {
+        /// Report current/embedded version and pending list without applying.
+        #[arg(long)]
+        status: bool,
+        /// List what would run without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Register this binary as an MCP server in detected agent configs
     /// (Claude Code, Codex CLI, Gemini CLI).
     Install {
@@ -365,6 +374,38 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Tui => {
             sparql_mcp::tui::run(store)?;
+        }
+        Cmd::Migrate { status, dry_run } => {
+            use sparql_mcp::application::migrations;
+            let embedded = migrations::embedded();
+            let cur = migrations::current_version(store.as_ref())?;
+            let max = embedded.last().map(|m| m.version).unwrap_or(0);
+            let pending = migrations::pending(store.as_ref(), embedded)?;
+            if status {
+                println!("schema version: {cur} (embedded max: {max})");
+                if pending.is_empty() {
+                    println!("up to date");
+                } else {
+                    for m in &pending {
+                        println!("pending: {:04} {}", m.version, m.name);
+                    }
+                }
+            } else if dry_run {
+                if pending.is_empty() {
+                    println!("up to date (version {cur})");
+                } else {
+                    for m in &pending {
+                        println!("would apply: {:04} {}", m.version, m.name);
+                    }
+                }
+            } else {
+                let applied = migrations::apply(store.as_ref(), embedded)?;
+                if applied.is_empty() {
+                    println!("up to date (version {cur})");
+                } else {
+                    println!("applied: {applied:?} (now version {max})");
+                }
+            }
         }
         Cmd::Install { .. } => unreachable!("handled above"),
     }
