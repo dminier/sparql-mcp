@@ -244,6 +244,17 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The TUI viewer is read-only: open the store WITHOUT the exclusive RocksDB
+    // write lock, so it works even while an MCP server holds the store. Fall
+    // back to a normal (creating) open when the store does not exist yet.
+    if let Cmd::Tui = cli.cmd {
+        let store: Arc<dyn SparqlStore> = match OxigraphAdapter::open_read_only(&store_path) {
+            Ok(s) => Arc::new(s),
+            Err(_) => Arc::new(OxigraphAdapter::open(&store_path)?),
+        };
+        return sparql_mcp::tui::run(store);
+    }
+
     let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open(&store_path)?);
     store.load_ontology_dir(&ontology_path)?;
 
@@ -378,9 +389,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
             srv.serve_stdio().await?;
         }
-        Cmd::Tui => {
-            sparql_mcp::tui::run(store)?;
-        }
+        Cmd::Tui => unreachable!("handled before store open"),
         Cmd::Migrate { status, dry_run } => {
             use sparql_mcp::application::migrations;
             let embedded = migrations::embedded();

@@ -251,7 +251,8 @@ fn desktop_entry(bin: &str, icon_path: &str) -> String {
          Type=Application\n\
          Name=sparql-mcp\n\
          Comment=Browse sparql-mcp projects (semantic knowledge base)\n\
-         Exec={bin} tui\n\
+         Exec=bash -c \"{bin} tui || {{ echo; echo [sparql-mcp] exited with an error; \
+read -rsn1 -p 'Press any key to close...'; }}\"\n\
          Icon={icon_path}\n\
          Terminal=true\n\
          Categories=Development;Utility;\n"
@@ -321,7 +322,8 @@ mod tests {
             "/usr/bin/sparql-mcp",
             "/home/u/.local/share/icons/sparql-mcp.svg",
         );
-        assert!(e.contains("Exec=/usr/bin/sparql-mcp tui"));
+        assert!(e.contains("/usr/bin/sparql-mcp tui"));
+        assert!(e.contains("Press any key to close"), "stays open on error");
         assert!(e.contains("Terminal=true"));
         assert!(e.contains("Type=Application"));
         assert!(e.contains("Icon=/home/u/.local/share/icons/sparql-mcp.svg"));
