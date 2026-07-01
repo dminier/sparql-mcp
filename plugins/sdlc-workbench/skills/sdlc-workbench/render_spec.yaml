@@ -1,0 +1,93 @@
+# .claude/skills/sdlc-workbench/render_spec.yaml
+#
+# Consumed by kb-workbench's generic renderer
+# (scripts/obsidian_render.py) — see references/obsidian-rendering.md for the
+# folder-note convention, marker-based preservation, and canvas patterns.
+
+vault_root: ~/Documents/kb-vault
+
+entities:
+  - type: sdlc:Spec
+    template: templates/sdlc-spec-card.md
+    folder: projects/{project_slug}/sdlc/specs
+    slug_predicate: dct:title
+    canvas_pattern: grid
+    auto_region:
+      start: "<!-- kb:auto-start -->"
+      end: "<!-- kb:auto-end -->"
+    query: |
+      PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+      PREFIX dct:  <http://purl.org/dc/terms/>
+      SELECT ?spec ?title ?date WHERE {
+        GRAPH <urn:project:{project_slug}> {
+          ?spec a sdlc:Spec ; dct:title ?title ; dct:date ?date .
+        }
+      } ORDER BY DESC(?date)
+
+  - type: sdlc:Plan
+    template: templates/sdlc-plan-card.md
+    folder: projects/{project_slug}/sdlc/plans
+    slug_predicate: dct:title
+    canvas_pattern: grid
+    query: |
+      PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+      PREFIX dct:  <http://purl.org/dc/terms/>
+      SELECT ?plan ?title ?spec WHERE {
+        GRAPH <urn:project:{project_slug}> {
+          ?plan a sdlc:Plan ; dct:title ?title ; sdlc:derivesFrom ?spec .
+        }
+      }
+
+  - type: sdlc:ShipEvent
+    template: templates/sdlc-ship-card.md
+    folder: projects/{project_slug}/sdlc/ships
+    slug_predicate: sdlc:version
+    canvas_pattern: trajectory
+    query: |
+      PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+      SELECT ?ship ?version ?deployedAt ?run WHERE {
+        GRAPH <urn:project:{project_slug}> {
+          ?ship a sdlc:ShipEvent ;
+                sdlc:version ?version ;
+                sdlc:deployedAt ?deployedAt .
+          OPTIONAL { ?ship sdlc:qualifiedBy ?run }
+        }
+      } ORDER BY DESC(?deployedAt)
+
+  - type: sdlc:Retro
+    template: templates/sdlc-retro-card.md
+    folder: projects/{project_slug}/sdlc/retros
+    slug_predicate: dct:title
+    canvas_pattern: grid
+    query: |
+      PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+      PREFIX dct:  <http://purl.org/dc/terms/>
+      SELECT ?retro ?title ?date WHERE {
+        GRAPH <urn:project:{project_slug}> {
+          ?retro a sdlc:Retro ; dct:title ?title ; dct:date ?date .
+        }
+      } ORDER BY DESC(?date)
+
+# ── Dashboard note (single, not per-entity) ───────────────────────────────────
+dashboard:
+  template: templates/sdlc-dashboard.md
+  path: projects/{project_slug}/sdlc/dashboard.md
+  query_ref: references/sparql-queries.md#project-dashboard--current-phase-snapshot
+
+# ── Canvas: full lifecycle timeline per feature ───────────────────────────────
+canvas:
+  - name: sdlc-timeline
+    pattern: trajectory
+    path: projects/{project_slug}/sdlc/timeline.canvas
+    stages: [sdlc:Spec, sdlc:Plan, sdlc:Review, sdlc:QARun, sdlc:ShipEvent]
+    edges: [sdlc:derivesFrom, sdlc:reviewedBy, sdlc:qualifiedBy]
+
+# ── MOCs ───────────────────────────────────────────────────────────────────────
+moc:
+  - name: decisions-moc
+    path: projects/{project_slug}/sdlc/MOC-decisions.md
+    entity_type: smc:ADR
+  - name: retro-moc
+    path: projects/{project_slug}/sdlc/MOC-retros.md
+    entity_type: sdlc:Retro
+    breakdown_by: sdlc:AgentPersona   # per-persona breakdown, not per-human

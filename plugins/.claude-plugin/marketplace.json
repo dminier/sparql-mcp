@@ -12,6 +12,14 @@
       "version": "0.1.0",
       "category": "knowledge-management",
       "keywords": ["sparql", "rdf", "oxigraph", "knowledge-base", "ontology", "obsidian", "mcp"]
+    },
+    {
+      "name": "sdlc-workbench",
+      "source": "./sdlc-workbench",
+      "description": "Software-delivery lifecycle (spec/plan/review/QA/ship/retro) tracked as a graph in sparql-mcp, for multi-agent SDLC memory.",
+      "version": "0.1.0",
+      "category": "project-management",
+      "keywords": ["sparql", "sdlc", "project-management", "multi-agent", "knowledge-base", "mcp"]
     }
   ]
 }

@@ -1,0 +1,171 @@
+@prefix sdlc: <https://sparql-mcp.dev/ns/sdlc#> .
+@prefix smc:  <https://sparql-mcp.dev/ns#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix dct:  <http://purl.org/dc/terms/> .
+
+# ── Ontology declaration ──────────────────────────────────────────────────────
+# L2 — domain layer. Generic to any software project's delivery lifecycle
+# (spec -> plan -> review -> qualification -> ship -> retro -> learning).
+# Would exist the same way in another project of the same kind — kept out of
+# L3, which holds this workspace's concrete persona catalog
+# (see 3-sdlc-personas.ttl).
+
+<https://sparql-mcp.dev/ns/sdlc#>
+    a owl:Ontology ;
+    rdfs:label "SDLC workbench ontology" ;
+    rdfs:comment "Vocabulary for tracking the software-delivery lifecycle (spec, plan, review, QA, ship, retro, learning) as graph entities." .
+
+# ── Classes ────────────────────────────────────────────────────────────────────
+
+sdlc:Spec
+    a owl:Class ;
+    rdfs:label "Spec" ;
+    rdfs:comment "A design specification describing a feature or change, written before planning begins." .
+
+sdlc:Plan
+    a owl:Class ;
+    rdfs:label "Plan" ;
+    rdfs:comment "An implementation plan derived from a Spec, breaking work into tasks." .
+
+sdlc:Review
+    a owl:Class ;
+    rdfs:label "Review" ;
+    rdfs:comment "A structured verdict from an agent persona (product, engineering, design, DevEx, security, ...) on a Spec or a Plan." .
+
+sdlc:QARun
+    a owl:Class ;
+    rdfs:label "QA run" ;
+    rdfs:comment "A quality-assurance execution (test run, audit pass, manual QA session) producing a pass/fail verdict." .
+
+sdlc:QAFinding
+    a owl:Class ;
+    rdfs:label "QA finding" ;
+    rdfs:comment "A single defect or issue discovered during a QARun." .
+
+sdlc:ShipEvent
+    a owl:Class ;
+    rdfs:label "Ship event" ;
+    rdfs:comment "A release or deployment of a qualified change." .
+
+sdlc:Retro
+    a owl:Class ;
+    rdfs:label "Retro" ;
+    rdfs:comment "A retrospective held after a ShipEvent or another milestone." .
+
+sdlc:Learning
+    a owl:Class ;
+    rdfs:label "Learning" ;
+    rdfs:comment "A durable lesson captured from a Retro, a QAFinding, or a Review, meant to inform future Specs." .
+
+sdlc:AgentPersona
+    a owl:Class ;
+    rdfs:label "Agent persona" ;
+    rdfs:comment "A role-based agent persona (e.g. reviewer, QA lead, release engineer) that can be invoked to perform one or more SDLC steps. Concrete instances live in the L3 layer (3-sdlc-personas.ttl)." .
+
+# ── Datatype properties — facets on lifecycle entities ────────────────────────
+
+sdlc:reviewKind
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:Review ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "review kind" ;
+    rdfs:comment "One of: ceo | eng | design | devex | security." .
+
+sdlc:verdict
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:Review ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "verdict" ;
+    rdfs:comment "One of: approved | changes-requested | blocked." .
+
+sdlc:qaStatus
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:QARun ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "QA run status" ;
+    rdfs:comment "One of: passed | failed | running." .
+
+sdlc:severity
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:QAFinding ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "finding severity" ;
+    rdfs:comment "One of: blocker | major | minor | info." .
+
+sdlc:findingStatus
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:QAFinding ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "finding status" ;
+    rdfs:comment "One of: open | fixed | wontfix." .
+
+sdlc:version
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:ShipEvent ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "version" ;
+    rdfs:comment "The released version identifier, e.g. semver string." .
+
+sdlc:commitSha
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:ShipEvent ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "commit SHA" ;
+    rdfs:comment "The git commit shipped by this event." .
+
+sdlc:deployedAt
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:ShipEvent ;
+    rdfs:range  xsd:dateTime ;
+    rdfs:label  "deployed at" ;
+    rdfs:comment "ISO 8601 timestamp of the deployment." .
+
+# ── Object properties — typed relations between lifecycle entities ───────────
+
+sdlc:derivesFrom
+    a owl:ObjectProperty ;
+    rdfs:domain sdlc:Plan ;
+    rdfs:range  sdlc:Spec ;
+    rdfs:label  "derives from" ;
+    rdfs:comment "A Plan derives from the Spec it implements." .
+
+sdlc:reviewedBy
+    a owl:ObjectProperty ;
+    rdfs:range  sdlc:Review ;
+    rdfs:label  "reviewed by" ;
+    rdfs:comment "A Spec or a Plan has been reviewed, producing this Review verdict." .
+
+sdlc:qualifiedBy
+    a owl:ObjectProperty ;
+    rdfs:domain sdlc:ShipEvent ;
+    rdfs:range  sdlc:QARun ;
+    rdfs:label  "qualified by" ;
+    rdfs:comment "A ShipEvent is qualified by a QARun (expected status=passed before shipping)." .
+
+sdlc:foundIn
+    a owl:ObjectProperty ;
+    rdfs:domain sdlc:QAFinding ;
+    rdfs:range  sdlc:QARun ;
+    rdfs:label  "found in" ;
+    rdfs:comment "The QARun during which this QAFinding was discovered." .
+
+sdlc:learnedFrom
+    a owl:ObjectProperty ;
+    rdfs:domain sdlc:Learning ;
+    rdfs:label  "learned from" ;
+    rdfs:comment "A Learning is derived from a Retro, a QAFinding, or a Review." .
+
+sdlc:backedBySkill
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "backed by skill" ;
+    rdfs:comment "Name/path of the skill implementing this persona, e.g. 'sdlc-workbench/skills/review'." .
+
+# ── Shared bookkeeping properties (Dublin Core, domain-agnostic) ─────────────
+# dct:title and dct:date are usable on any sdlc:* instance for a human title
+# and a creation timestamp; kept unrestricted (no rdfs:domain) as Dublin Core
+# intends. Audit rules P3/P6 rely on dct:date for age-based checks.

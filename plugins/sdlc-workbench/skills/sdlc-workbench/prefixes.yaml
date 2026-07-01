@@ -1,0 +1,8 @@
+# .claude/skills/sdlc-workbench/prefixes.yaml
+#
+# Prefixes used by sdlc-workbench, on top of kb-workbench's standard set
+# (scripts/sparql_boilerplate.py::PrefixRegistry.STANDARD).
+
+sdlc: https://sparql-mcp.dev/ns/sdlc#
+smc:  https://sparql-mcp.dev/ns#
+dct:  http://purl.org/dc/terms/

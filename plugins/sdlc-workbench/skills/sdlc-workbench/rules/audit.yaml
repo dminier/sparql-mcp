@@ -1,0 +1,122 @@
+# .claude/skills/sdlc-workbench/rules/audit.yaml
+#
+# Run via kb-workbench's shared runner:
+#   uv run python .claude/skills/kb-workbench/scripts/kb_audit.py \
+#       --rules .claude/skills/sdlc-workbench/rules/audit.yaml \
+#       --project sparql-mcp-dev
+
+- id: P1
+  name: ShipEvent not qualified by a passed QARun
+  severity: blocker
+  description: >-
+    Shipping without a passing QARun means the release has no recorded
+    quality gate.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:ShipEvent .
+      FILTER NOT EXISTS {
+        ?violation sdlc:qualifiedBy ?run .
+        ?run a sdlc:QARun ;
+             sdlc:qaStatus "passed" .
+      }
+    }
+  remediation: >-
+    Run a QARun to completion (sdlc:qaStatus "passed") and link it via
+    sdlc:qualifiedBy before recording the ShipEvent.
+
+- id: P2
+  name: Plan without an approved Review
+  severity: major
+  description: >-
+    A Plan that nobody approved should not move to implementation.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:Plan .
+      FILTER NOT EXISTS {
+        ?violation sdlc:reviewedBy ?review .
+        ?review a sdlc:Review ;
+                sdlc:verdict "approved" .
+      }
+    }
+  remediation: >-
+    Run at least one review persona against the Plan and record its
+    sdlc:Review with sdlc:verdict "approved".
+
+- id: P3
+  name: Stale Spec without a Plan
+  severity: warning
+  description: >-
+    A Spec sitting for more than 14 days without a derived Plan signals a
+    stalled feature.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    PREFIX dct:  <http://purl.org/dc/terms/>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:Spec ;
+                 dct:date ?date .
+      FILTER (?date < (NOW() - "P14D"^^xsd:duration))
+      FILTER NOT EXISTS {
+        ?plan a sdlc:Plan ;
+              sdlc:derivesFrom ?violation .
+      }
+    }
+  remediation: >-
+    Either write the Plan that derives from this Spec, or close/retire the
+    Spec if it is no longer relevant.
+
+- id: P4
+  name: Retro without a captured Learning
+  severity: info
+  description: >-
+    A Retro that produced no Learning is a missed opportunity to feed
+    future Specs.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:Retro .
+      FILTER NOT EXISTS {
+        ?learning a sdlc:Learning ;
+                  sdlc:learnedFrom ?violation .
+      }
+    }
+  remediation: >-
+    Capture at least one sdlc:Learning with sdlc:learnedFrom pointing back
+    to this Retro.
+
+- id: P5
+  name: AgentPersona missing the mcpNative facet
+  severity: major
+  description: >-
+    Without the mcpNative facet, the persona's MCP integration level is
+    undocumented and canvases/ADRs can't compare personas.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:AgentPersona .
+      FILTER NOT EXISTS { ?violation sdlc:mcpNative ?_ }
+    }
+  remediation: >-
+    Set sdlc:mcpNative to "true", "false", or "partial" depending on
+    whether the persona's skill invokes MCP tools directly.
+
+- id: P6
+  name: Stale open blocker QAFinding
+  severity: blocker
+  description: >-
+    A blocker-severity finding left open for more than 3 days is a release
+    risk that must surface immediately.
+  query: |
+    PREFIX sdlc: <https://sparql-mcp.dev/ns/sdlc#>
+    PREFIX dct:  <http://purl.org/dc/terms/>
+    SELECT ?violation WHERE {
+      ?violation a sdlc:QAFinding ;
+                 sdlc:severity "blocker" ;
+                 sdlc:findingStatus "open" ;
+                 dct:date ?date .
+      FILTER (?date < (NOW() - "P3D"^^xsd:duration))
+    }
+  remediation: >-
+    Fix the finding, downgrade its severity if it was overestimated, or
+    mark it wontfix with a documented reason.

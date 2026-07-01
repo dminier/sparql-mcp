@@ -1,0 +1,154 @@
+@prefix sdlc: <https://sparql-mcp.dev/ns/sdlc#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# ── Ontology declaration ──────────────────────────────────────────────────────
+# L3 — specialized layer. Concrete catalog of agent personas for this
+# workspace's sdlc-workbench. Volatile by design: new personas are added here
+# as new review/QA/release steps get their own skill.
+
+<https://sparql-mcp.dev/ns/sdlc-personas#>
+    a owl:Ontology ;
+    rdfs:label "SDLC workbench — persona catalog" ;
+    rdfs:comment "Concrete agent-persona catalog for sparql-mcp's own sdlc-workbench, specializing sdlc:AgentPersona (2-sdlc.ttl)." .
+
+# ── The 5 cross-cutting facets, scoped to sdlc:AgentPersona ───────────────────
+# Follows the kb-workbench doctrine's "5 mandatory facets" convention
+# (references/ontology-design.md), declared locally here since 1-smc.ttl is
+# frozen and no other domain skill has formalized them yet as shared L1
+# properties.
+
+sdlc:sourcing
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "sourcing" ;
+    rdfs:comment "One of: oss | vendor | hybrid | custom." .
+
+sdlc:sovereigntyTier
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "sovereignty tier" ;
+    rdfs:comment "One of: secnumcloud | bleu | s3ns | eu-hyperscaler | us-hyperscaler | on-prem | saas-global." .
+
+sdlc:maturity
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "maturity" ;
+    rdfs:comment "One of: poc | alpha | beta | rc | ga | deprecated." .
+
+sdlc:adoptionState
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "adoption state" ;
+    rdfs:comment "One of: candidate | evaluated | selected | adopted | deprecated." .
+
+sdlc:mcpNative
+    a owl:DatatypeProperty ;
+    rdfs:domain sdlc:AgentPersona ;
+    rdfs:range  xsd:string ;
+    rdfs:label  "MCP-native" ;
+    rdfs:comment "One of: true | false | partial — whether the persona's skill invokes MCP tools (query_sparql/update_sparql) directly rather than staying a plain prompt." .
+
+# ── Persona catalog ────────────────────────────────────────────────────────────
+# Each persona is declared both as an owl:Class (rdfs:subClassOf
+# sdlc:AgentPersona, for future specialization) and directly typed
+# sdlc:AgentPersona (punning) so the 5 facets — whose rdfs:domain is
+# sdlc:AgentPersona — attach to it directly and are queryable without RDFS
+# reasoning (oxigraph does not do subclass-instance entailment by default).
+#
+# Every persona below now has a backing skill under
+# .claude/skills/sdlc-workbench/skills/<name>/SKILL.md (sdlc:backedBySkill),
+# landed in the "Extension" delivery batch. adoptionState moved from
+# "candidate" to "selected" — not yet "adopted", since none has accumulated
+# real usage in urn:project:sparql-mcp-dev yet; that promotion should follow
+# actual dogfooding, not the mere existence of the skill file.
+
+sdlc:CEOReviewerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "CEO reviewer persona" ;
+    rdfs:comment "Reviews a Spec/Plan from a product/business-priority standpoint." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/review-ceo" .
+
+sdlc:EngReviewerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "Engineering reviewer persona" ;
+    rdfs:comment "Reviews a Spec/Plan for architecture and implementation soundness." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/review-eng" .
+
+sdlc:DesignReviewerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "Design reviewer persona" ;
+    rdfs:comment "Reviews a Spec/Plan for UX/interface consistency." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/review-design" .
+
+sdlc:DevExReviewerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "DevEx reviewer persona" ;
+    rdfs:comment "Reviews a Spec/Plan for developer-experience impact (tooling, onboarding, docs)." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/review-devex" .
+
+sdlc:QALeadPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "QA lead persona" ;
+    rdfs:comment "Runs and records QARun executions and QAFindings." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/qa-run" .
+
+sdlc:SecurityOfficerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "Security officer persona" ;
+    rdfs:comment "Runs security-focused QA and reviews (reviewKind=security)." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/qa-security" .
+
+sdlc:ReleaseEngineerPersona
+    a owl:Class, sdlc:AgentPersona ;
+    rdfs:subClassOf sdlc:AgentPersona ;
+    rdfs:label "Release engineer persona" ;
+    rdfs:comment "Records ShipEvents and their qualifying QARun." ;
+    sdlc:sourcing "custom" ;
+    sdlc:sovereigntyTier "on-prem" ;
+    sdlc:maturity "poc" ;
+    sdlc:adoptionState "selected" ;
+    sdlc:mcpNative "true" ;
+    sdlc:backedBySkill "sdlc-workbench/skills/ship" .

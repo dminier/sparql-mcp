@@ -1,0 +1,23 @@
+{
+  "name": "sdlc-workbench",
+  "version": "0.1.0",
+  "description": "Tracks the whole software-delivery lifecycle (spec, plan, review, QA, ship, retro, learning) as graph entities in sparql-mcp, giving a multi-agent team a shared, queryable memory of the project's own SDLC.",
+  "author": {
+    "name": "sparql-mcp contributors"
+  },
+  "homepage": "https://github.com/dminier/sparql-mcp",
+  "license": "MIT",
+  "keywords": [
+    "sparql",
+    "rdf",
+    "sdlc",
+    "project-management",
+    "multi-agent",
+    "knowledge-graph",
+    "mcp",
+    "oxigraph"
+  ],
+  "claudeCode": {
+    "minVersion": "1.0.0"
+  }
+}

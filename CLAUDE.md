@@ -37,6 +37,10 @@ SPARQL is the source of truth; the filesystem/Obsidian vault is a projection.
 
 Full doctrine: `plugins/kb-workbench/skills/kb-workbench/SKILL.md`.
 
+Meta-work on this repo's own SDLC (spec → plan → review → QA → ship → retro)
+is itself tracked as a domain skill on top of the same KB: see
+`.claude/skills/sdlc-workbench/SKILL.md`.
+
 ## Data separation (critical)
 
 The Oxigraph store contains **personal data**.
