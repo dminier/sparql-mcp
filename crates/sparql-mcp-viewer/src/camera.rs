@@ -1,11 +1,16 @@
 //! Scene camera: Bevy 0.20's `PanOrbitCamera` (right drag orbit, left drag
 //! pan, wheel zoom), plus an `F` key that frames the whole graph and a
 //! guard that freezes the controller while the pointer is over a UI node.
+//! Renders in HDR with bloom, AgX tonemapping, MSAA and distance fog.
 //! Graph changes never move the camera. No system here reads `ViewerGraph`.
 
+use bevy::camera::Hdr;
 use bevy::camera_controller::pan_orbit_camera::prelude::*;
+use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::picking::hover::Hovered;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::view::{Msaa, Tonemapping};
 use bevy::ui::Pressed;
 
 use crate::camera_input::CustomInputPlugin;
@@ -35,6 +40,18 @@ fn spawn_camera(mut commands: Commands) {
         Camera3d::default(),
         PanOrbitCamera::default(),
         Transform::from_xyz(0.0, 8.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
+        // HDR so class materials (emissive > 1) bloom, a filmic
+        // tonemapper to bring them back into display range, MSAA for the
+        // thin edge lines, and a light distance fog for depth.
+        Hdr,
+        Bloom::NATURAL,
+        Tonemapping::AgX,
+        Msaa::Sample4,
+        DistanceFog {
+            color: Color::srgb(0.02, 0.02, 0.05),
+            falloff: FogFalloff::Exponential { density: 0.006 },
+            ..default()
+        },
     ));
 }
 

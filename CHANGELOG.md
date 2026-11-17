@@ -20,6 +20,21 @@ of domain-specific content.
 - Core `smc:` ontology (`ontology/1-smc.ttl`).
 - `kb-workbench` Claude Code plugin and skill.
 - CI: fmt, clippy (-D warnings), tests.
+- Viewer side-channel in the server (`[viewer]` config section, off by
+  default): a loopback TCP listener that sends a snapshot of the active
+  project graph on connect, then one event per committed write
+  (`EventSink` / `StoreEvent`). `project_switch` now changes the active
+  graph for the running server.
+- `sparql-mcp-viewer` crate — optional native Windows app that renders the
+  active graph in 3D (Bevy) and grows it live: class/instance styling,
+  Barnes-Hut layout, last-batch highlight, activity feed, node inspection,
+  class filter, and a `--headless` smoke-test mode.
+- `viewer_load` example — load generator for the viewer, no agent needed.
+
+### Fixed
+- Idempotent file loading (`load_ontology_file`) failed on any Windows path:
+  the path was embedded unescaped in a Turtle literal, and `\` is a Turtle
+  escape character.
 
 ### Scaffolded (wiring in v0.2)
 - `per_project_store` flag in `[core]` — will open one RocksDB store per

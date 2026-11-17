@@ -65,6 +65,7 @@ server the agent spawns on demand — nothing to keep running.
 ```
 sparql-mcp/
 ├── crates/sparql-mcp-core/        # Rust: MCP server + Oxigraph core
+├── crates/sparql-mcp-viewer/      # Rust: optional live 3D graph viewer (Bevy)
 ├── plugins/kb-workbench/          # Claude Code plugin (skill only)
 ├── .claude/skills/kb-workbench/   # Symlink to the skill
 ├── ontology/1-smc.ttl             # Core RDF vocabulary (smc:)
@@ -98,6 +99,15 @@ sparql-mcp reload-ontology      # re-parse ontology/ into the store
 sparql-mcp load-file --path …   # load Turtle / NTriples / RDF-XML
 sparql-mcp code-import --db …   # ingest a codebase-memory-mcp SQLite graph
 ```
+
+## Live 3D viewer (optional)
+
+`sparql-mcp-viewer` is a separate native Windows app that shows the active
+project graph in 3D and grows it live as the agent writes — classes and
+instances, `rdf:type` edges, the latest batch highlighted, an activity feed,
+and node inspection on click. It reads from a loopback side-channel that is
+off by default (`[viewer] enabled = true` in `sparql-mcp.toml`). See
+[`crates/sparql-mcp-viewer/README.md`](crates/sparql-mcp-viewer/README.md).
 
 ## Install the Claude Code plugin (skill)
 

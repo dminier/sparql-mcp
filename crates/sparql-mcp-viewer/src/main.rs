@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::{
     default, App, AppExit, ClearColor, Color, DefaultPlugins, PluginGroup, Window, WindowPlugin,
 };
@@ -30,6 +31,9 @@ struct Cli {
     /// Run with no window or renderer.
     #[arg(long)]
     headless: bool,
+    /// Log frame time and FPS once per second (windowed mode).
+    #[arg(long)]
+    diagnostics: bool,
 }
 
 fn resolve_addr(cli: &Cli) -> Result<SocketAddr> {
@@ -69,13 +73,21 @@ fn resolve_addr(cli: &Cli) -> Result<SocketAddr> {
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // `LogDiagnosticsPlugin` logs under the `bevy_diagnostic` target, so
+    // `--diagnostics` widens the default filter to let it through.
+    let default_filter = if cli.diagnostics {
+        "sparql_mcp_viewer=info,bevy_diagnostic=info"
+    } else {
+        "sparql_mcp_viewer=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "sparql_mcp_viewer=info".into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
-    let cli = Cli::parse();
     let addr = match resolve_addr(&cli) {
         Ok(addr) => addr,
         Err(e) => {
@@ -88,7 +100,7 @@ fn main() -> ExitCode {
     let exit = if cli.headless {
         sparql_mcp_viewer::headless::run(addr, connect_timeout)
     } else {
-        run_windowed(addr, connect_timeout)
+        run_windowed(addr, connect_timeout, cli.diagnostics)
     };
     match exit {
         AppExit::Success => ExitCode::SUCCESS,
@@ -98,9 +110,9 @@ fn main() -> ExitCode {
 
 const CLEAR_COLOR: Color = Color::srgb(0.02, 0.02, 0.05);
 
-fn run_windowed(addr: SocketAddr, connect_timeout: Duration) -> AppExit {
-    App::new()
-        .insert_resource(ClearColor(CLEAR_COLOR))
+fn run_windowed(addr: SocketAddr, connect_timeout: Duration, diagnostics: bool) -> AppExit {
+    let mut app = App::new();
+    app.insert_resource(ClearColor(CLEAR_COLOR))
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -116,6 +128,12 @@ fn run_windowed(addr: SocketAddr, connect_timeout: Duration) -> AppExit {
         .add_plugins(ViewerPlugin {
             addr,
             connect_timeout,
-        })
-        .run()
+        });
+    if diagnostics {
+        app.add_plugins((
+            FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
+        ));
+    }
+    app.run()
 }
