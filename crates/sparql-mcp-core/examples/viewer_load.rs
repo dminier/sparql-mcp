@@ -1,9 +1,11 @@
 //! Load generator for the viewer: an in-memory store behind the viewer
-//! side-channel, fed `ontology/1-smc.ttl` and then typed `smc:Project`
-//! instances in batches. Needs no agent and never touches RocksDB.
+//! side-channel, fed an ontology (`ontology/1-smc.ttl` unless `--ontology`
+//! is given) and then typed `smc:Project` instances in batches. Needs no
+//! agent and never touches RocksDB.
 //!
 //! ```text
 //! cargo run --release -p sparql-mcp --example viewer_load -- --bind 127.0.0.1:7878 --count 5000
+//! cargo run --release -p sparql-mcp --example viewer_load -- --ontology schemaorg.ttl --count 0
 //! sparql-mcp-viewer --connect 127.0.0.1:7878
 //! ```
 
@@ -43,6 +45,24 @@ struct Args {
     /// `changed` event, which makes the viewer resync (CUJ 3).
     #[arg(long, default_value_t = 0)]
     pattern_delete: usize,
+    /// RDF file(s) to load instead of the `smc:` ontology. Repeatable.
+    /// Format from the extension: `.ttl`, `.nt`, or `.rdf` / `.owl` /
+    /// `.xml` (RDF/XML).
+    #[arg(long = "ontology")]
+    ontologies: Vec<PathBuf>,
+}
+
+fn format_for(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("nt") => "ntriples",
+        Some("rdf" | "owl" | "xml") => "rdfxml",
+        _ => "turtle",
+    }
 }
 
 #[tokio::main]
@@ -60,17 +80,29 @@ async fn main() -> Result<()> {
         rx,
     ));
 
-    let ttl_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ontology/1-smc.ttl");
-    let turtle = std::fs::read_to_string(&ttl_path)
-        .with_context(|| format!("reading {}", ttl_path.display()))?;
-    ontology::load_ontology(
-        &store,
-        &object!({ "turtle": turtle, "graph_iri": ACTIVE_GRAPH }),
-        &active_graph,
-        &sink,
-    )
-    .map_err(|e| anyhow::anyhow!("load_ontology: {e:?}"))?;
-    println!("serving {ACTIVE_GRAPH} on {} — ontology loaded", args.bind);
+    let ontologies = if args.ontologies.is_empty() {
+        vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ontology/1-smc.ttl")]
+    } else {
+        args.ontologies.clone()
+    };
+    for path in &ontologies {
+        let payload =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let format = format_for(path);
+        ontology::load_ontology(
+            &store,
+            &object!({ "turtle": payload, "format": format, "graph_iri": ACTIVE_GRAPH }),
+            &active_graph,
+            &sink,
+        )
+        .map_err(|e| anyhow::anyhow!("load_ontology {}: {e:?}", path.display()))?;
+        println!("loaded {} ({format})", path.display());
+    }
+    println!(
+        "serving {ACTIVE_GRAPH} on {} — {} triples",
+        args.bind,
+        store.triple_count()?
+    );
 
     tokio::time::sleep(Duration::from_secs(args.delay_secs)).await;
 

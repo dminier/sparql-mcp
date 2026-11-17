@@ -4,7 +4,7 @@
 //! snapshot rebuild reassigns ids, and a selection by id would silently
 //! jump to another node.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use bevy::picking::events::{PointerClick, PointerOut, PointerOver};
@@ -22,6 +22,11 @@ use crate::render::NodeRef;
 const CLICK_MAX: Duration = Duration::from_millis(250);
 /// The selection panel lists at most this many edges per direction.
 const MAX_EDGE_LINES: usize = 25;
+/// The class filter panel lists at most this many classes.
+const MAX_FILTER_ROWS: usize = 30;
+/// How many class labels are shown at once (nearest to the camera).
+const LABEL_BUDGET: usize = 30;
+const LABEL_REFRESH_SECS: f32 = 0.25;
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 #[derive(Resource, Default)]
@@ -356,33 +361,73 @@ fn update_selection_panel(
     });
 }
 
+/// One row of the class filter: a type that at least one instance has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterEntry {
+    pub term: String,
+    pub label: String,
+    pub instances: usize,
+}
+
+/// The types worth filtering on: those that type at least one instance,
+/// most-used first. Filtering only ever hides instances, so a class that
+/// types none (or a property) would be a dead toggle — on a real ontology
+/// like Schema.org that is the vast majority of class-kind nodes.
+pub fn filter_entries(graph: &ViewerGraph) -> Vec<FilterEntry> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for node in graph.nodes.iter().flatten() {
+        if node.kind == NodeKind::Instance {
+            for t in &node.types {
+                *counts.entry(t.as_str()).or_default() += 1;
+            }
+        }
+    }
+    let mut entries: Vec<FilterEntry> = counts
+        .into_iter()
+        .map(|(term, instances)| FilterEntry {
+            term: term.to_string(),
+            label: graph
+                .index
+                .get(term)
+                .and_then(|id| graph.nodes.get(id.0 as usize)?.as_ref())
+                .map_or_else(|| short(term), |n| n.label.clone()),
+            instances,
+        })
+        .collect();
+    entries.sort_by(|a, b| b.instances.cmp(&a.instances).then(a.label.cmp(&b.label)));
+    entries
+}
+
 fn update_filter_panel(
     mut commands: Commands,
     filter: Res<ClassFilter>,
     graph: Res<ViewerGraph>,
     panel: Query<Entity, With<FilterPanel>>,
-    mut last_classes: Local<Vec<(String, String)>>,
+    mut last_entries: Local<Vec<FilterEntry>>,
 ) {
-    let classes: Vec<(String, String)> = {
-        let mut c: Vec<_> = graph
-            .nodes
-            .iter()
-            .flatten()
-            .filter(|n| n.kind == NodeKind::Class)
-            .map(|n| (n.term.clone(), n.label.clone()))
-            .collect();
-        c.sort_by(|a, b| a.1.cmp(&b.1));
-        c
-    };
-    if !filter.is_changed() && classes == *last_classes {
+    if !filter.is_changed() && !graph.is_changed() {
         return;
     }
-    *last_classes = classes.clone();
+    let entries = filter_entries(&graph);
+    if !filter.is_changed() && entries == *last_entries {
+        return;
+    }
+    *last_entries = entries.clone();
     let Ok(panel) = panel.single() else { return };
     commands.entity(panel).despawn_related::<Children>();
     commands.entity(panel).with_children(|p| {
-        p.spawn(text("classes (click to filter)", 13.0, DIM));
-        for (term, label) in classes {
+        p.spawn(text("instances by class (click to filter)", 13.0, DIM));
+        if entries.is_empty() {
+            p.spawn(text("  (no typed instances)", 12.0, DIM));
+        }
+        let hidden_rows = entries.len().saturating_sub(MAX_FILTER_ROWS);
+        for FilterEntry {
+            term,
+            label,
+            instances,
+        } in entries.into_iter().take(MAX_FILTER_ROWS)
+        {
+            let label = format!("{label} ({instances})");
             let on = !filter.hidden.contains(&term);
             p.spawn((
                 button_node(),
@@ -405,6 +450,9 @@ fn update_filter_panel(
                 },
             );
         }
+        if hidden_rows > 0 {
+            p.spawn(text(format!("  ... {hidden_rows} more classes"), 12.0, DIM));
+        }
         let on = filter.show_untyped;
         p.spawn((button_node(), BackgroundColor(BUTTON_BG)))
             .with_child(text(
@@ -420,25 +468,58 @@ fn update_filter_panel(
 
 // ── Labels ─────────────────────────────────────────────────────────────────
 
-/// A floating label for one node: every class, the selected node and the
-/// hovered node.
+/// A floating label for one node: the classes nearest the camera, the
+/// selected node and the hovered node.
 #[derive(Component)]
 struct NodeLabel(NodeId);
 
-fn update_labels(
-    mut commands: Commands,
-    graph: Res<ViewerGraph>,
-    selection: Res<Selection>,
-    hovered: Res<HoveredNode>,
-    mut labels: Query<(Entity, &NodeLabel, &mut Text)>,
-) {
-    let mut wanted: HashSet<NodeId> = graph
+/// Up to `k` class nodes closest to `eye`. Labelling every class does not
+/// scale: a real ontology has thousands, which is both unreadable and
+/// thousands of UI nodes to reposition every frame.
+pub fn nearest_classes(
+    graph: &ViewerGraph,
+    positions: &[Vec3],
+    eye: Vec3,
+    k: usize,
+) -> Vec<NodeId> {
+    let mut classes: Vec<(f32, NodeId)> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| n.as_ref().is_some_and(|n| n.kind == NodeKind::Class))
-        .map(|(i, _)| NodeId(i as u32))
+        .filter(|(i, n)| {
+            n.as_ref().is_some_and(|n| n.kind == NodeKind::Class) && *i < positions.len()
+        })
+        .map(|(i, _)| (positions[i].distance_squared(eye), NodeId(i as u32)))
         .collect();
+    if classes.len() > k {
+        classes.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
+        classes.truncate(k);
+    }
+    classes.into_iter().map(|(_, id)| id).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_labels(
+    mut commands: Commands,
+    graph: Res<ViewerGraph>,
+    layout: Res<LayoutState>,
+    selection: Res<Selection>,
+    hovered: Res<HoveredNode>,
+    time: Res<Time>,
+    camera: Query<&GlobalTransform, With<SceneCamera>>,
+    mut labels: Query<(Entity, &NodeLabel, &mut Text)>,
+    mut nearest: Local<(f32, Vec<NodeId>)>,
+) {
+    // Re-pick the nearest classes a few times a second, not every frame.
+    nearest.0 -= time.delta_secs();
+    if nearest.0 <= 0.0 || graph.is_changed() {
+        nearest.0 = LABEL_REFRESH_SECS;
+        nearest.1 = camera.single().map_or_else(
+            |_| Vec::new(),
+            |eye| nearest_classes(&graph, &layout.pos, eye.translation(), LABEL_BUDGET),
+        );
+    }
+    let mut wanted: HashSet<NodeId> = nearest.1.iter().copied().collect();
     if let Some(id) = selection.0.as_deref().and_then(|t| graph.index.get(t)) {
         wanted.insert(*id);
     }
@@ -504,7 +585,7 @@ fn position_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparql_mcp::application::event_sink::Snapshot;
+    use sparql_mcp::application::event_sink::{Snapshot, StoreEvent};
 
     fn t(s: &str, p: &str, o: &str) -> [String; 3] {
         [s.into(), p.into(), o.into()]
@@ -586,6 +667,42 @@ mod tests {
 
         filter.show_untyped = false;
         assert!(!filter.is_visible(&node("<urn:u>")));
+    }
+
+    #[test]
+    fn filter_lists_only_types_with_instances_most_used_first() {
+        let mut graph = sample();
+        let extra = StoreEvent::Insert {
+            graph: "g".into(),
+            triples: vec![t("<urn:c2>", TYPE, "<urn:C>")],
+            kinds: Default::default(),
+        };
+        graph.apply_event(&extra);
+
+        let entries = filter_entries(&graph);
+        let rows: Vec<(&str, usize)> = entries
+            .iter()
+            .map(|e| (e.term.as_str(), e.instances))
+            .collect();
+        // C types a and c2; D types b. owl:Class only types class nodes,
+        // so it is not a filter row.
+        assert_eq!(rows, vec![("<urn:C>", 2), ("<urn:D>", 1)]);
+    }
+
+    #[test]
+    fn nearest_classes_picks_the_k_closest_class_nodes() {
+        let graph = sample();
+        let mut positions = vec![Vec3::ZERO; graph.nodes.len()];
+        let c = graph.index["<urn:C>"].0 as usize;
+        let d = graph.index["<urn:D>"].0 as usize;
+        let a = graph.index["<urn:a>"].0 as usize;
+        positions[c] = Vec3::new(100.0, 0.0, 0.0);
+        positions[d] = Vec3::new(1.0, 0.0, 0.0);
+        positions[a] = Vec3::new(0.5, 0.0, 0.0); // an instance: never picked
+
+        let picked = nearest_classes(&graph, &positions, Vec3::ZERO, 1);
+        assert_eq!(picked, vec![NodeId(d as u32)]);
+        assert_eq!(nearest_classes(&graph, &positions, Vec3::ZERO, 10).len(), 2);
     }
 
     #[test]
