@@ -1,9 +1,8 @@
-//! Bevy rendering (Phase 3 scope): entity reconciliation against
-//! `ViewerGraph`, shared mesh/material handles, one `LineList` mesh per
-//! edge style, base lights, and the `layout_step_system` /
-//! `write_transforms` wrappers around `LayoutState`. HDR, bloom,
-//! tonemapping, fog and MSAA are Phase 6; arrival/departure animation is
-//! Phase 4.
+//! Bevy rendering: entity reconciliation against `ViewerGraph`, shared
+//! mesh/material handles, one `LineList` mesh per edge style, base
+//! lights, arrival/departure scale animation, and the
+//! `layout_step_system` / `write_transforms` wrappers around
+//! `LayoutState`. HDR, bloom, tonemapping, fog and MSAA are Phase 6.
 
 use std::collections::HashMap;
 
@@ -138,16 +137,35 @@ pub fn sync_entities(
     }
     *last_generation = Some(graph.generation);
 
+    let handles_for = |kind: NodeKind| match kind {
+        NodeKind::Class => (style.class_mesh.clone(), style.class_material.clone()),
+        NodeKind::Instance => (style.instance_mesh.clone(), style.instance_material.clone()),
+    };
+
     spawned.0.retain(|id, (entity, term, kind)| {
-        let still_valid = graph
+        let Some(node) = graph
             .nodes
             .get(id.0 as usize)
             .and_then(Option::as_ref)
-            .is_some_and(|node| node.term == *term && node.kind == *kind);
-        if !still_valid {
-            commands.entity(*entity).despawn();
+            .filter(|node| node.term == *term)
+        else {
+            // Gone, or its id now names another node after a rebuild:
+            // shrink it out where it stands.
+            commands
+                .entity(*entity)
+                .remove::<(NodeRef, Spawning)>()
+                .insert(Despawning::default());
+            return false;
+        };
+        if node.kind != *kind {
+            // Same node, newly a class: swap the shared handles in place.
+            let (mesh, material) = handles_for(node.kind);
+            commands
+                .entity(*entity)
+                .insert((Mesh3d(mesh), MeshMaterial3d(material)));
+            *kind = node.kind;
         }
-        still_valid
+        true
     });
 
     for (i, slot) in graph.nodes.iter().enumerate() {
@@ -156,19 +174,66 @@ pub fn sync_entities(
         if spawned.0.contains_key(&id) {
             continue;
         }
-        let (mesh, material) = match node.kind {
-            NodeKind::Class => (style.class_mesh.clone(), style.class_material.clone()),
-            NodeKind::Instance => (style.instance_mesh.clone(), style.instance_material.clone()),
-        };
+        let (mesh, material) = handles_for(node.kind);
         let entity = commands
             .spawn((
                 NodeRef(id),
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
-                Transform::IDENTITY,
+                Transform::from_scale(Vec3::ZERO),
+                Spawning::default(),
             ))
             .id();
         spawned.0.insert(id, (entity, node.term.clone(), node.kind));
+    }
+}
+
+/// Arrival/departure animation length.
+pub const ANIM_SECS: f32 = 0.3;
+
+/// A new node growing from scale 0 to 1.
+#[derive(Component, Default)]
+pub struct Spawning {
+    elapsed: f32,
+}
+
+/// A removed node shrinking to 0, then despawned. Its `NodeRef` is gone,
+/// so the layout no longer moves it.
+#[derive(Component, Default)]
+pub struct Despawning {
+    elapsed: f32,
+    from: Option<f32>,
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Drives [`Spawning`] and [`Despawning`]. Acts only on
+/// `Transform.scale`, never on materials.
+pub fn animate_spawn_despawn(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut arriving: Query<(Entity, &mut Spawning, &mut Transform), Without<Despawning>>,
+    mut leaving: Query<(Entity, &mut Despawning, &mut Transform), Without<Spawning>>,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut spawning, mut transform) in &mut arriving {
+        spawning.elapsed += dt;
+        let t = spawning.elapsed / ANIM_SECS;
+        transform.scale = Vec3::splat(ease_out_cubic(t));
+        if t >= 1.0 {
+            commands.entity(entity).remove::<Spawning>();
+        }
+    }
+    for (entity, mut despawning, mut transform) in &mut leaving {
+        let from = *despawning.from.get_or_insert(transform.scale.x);
+        despawning.elapsed += dt;
+        let t = despawning.elapsed / ANIM_SECS;
+        transform.scale = Vec3::splat(from * (1.0 - ease_out_cubic(t)));
+        if t >= 1.0 {
+            commands.entity(entity).despawn();
+        }
     }
 }
 

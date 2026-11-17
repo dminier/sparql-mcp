@@ -1,7 +1,7 @@
 //! Force-directed layout — plain Rust (`bevy::math` for `Vec3` only, no
 //! App/ECS/systems). The Bevy wrapper (`layout_step_system`) lives in
-//! `render.rs`. Barnes-Hut (`octree.rs`) lands in Phase 4; this is the
-//! all-pairs version Phase 3 needs.
+//! `render.rs`. Repulsion uses Barnes-Hut over an octree (`octree.rs`);
+//! the exact all-pairs pass stays as the reference for tests.
 
 use bevy::math::Vec3;
 use bevy::prelude::Resource;
@@ -9,6 +9,12 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use crate::graph::{EdgeStyle, NodeId, Remap, ViewerGraph};
+
+pub mod octree;
+use octree::Octree;
+
+/// Below this many bodies per thread, the repulsion pass stays serial.
+const PARALLEL_CHUNK_MIN: usize = 512;
 
 #[derive(Debug, Clone, Copy, Resource)]
 pub struct LayoutParams {
@@ -164,17 +170,11 @@ impl LayoutState {
         self.live = vec![false; new_len];
     }
 
-    /// One all-pairs repulsion + spring-attraction tick. No-op while
-    /// asleep. Sets `awake = false` once total kinetic energy drops below
-    /// `params.sleep_energy`.
-    pub fn step(&mut self, graph: &ViewerGraph, dt: f32, params: &LayoutParams) {
-        self.sync_live(graph);
-        if !self.awake {
-            return;
-        }
-        let n = graph.nodes.len();
+    /// Exact O(n²) repulsion on every live node — the reference the
+    /// Barnes-Hut pass is checked against.
+    pub fn repulsion_all_pairs(&self, graph: &ViewerGraph, params: &LayoutParams) -> Vec<Vec3> {
+        let n = graph.nodes.len().min(self.pos.len());
         let mut forces = vec![Vec3::ZERO; n];
-
         for i in 0..n {
             if graph.nodes[i].is_none() {
                 continue;
@@ -191,6 +191,60 @@ impl LayoutState {
                 forces[j] -= dir * f;
             }
         }
+        forces
+    }
+
+    /// Barnes-Hut approximation of [`Self::repulsion_all_pairs`],
+    /// O(n log n), controlled by `params.theta`.
+    pub fn repulsion_barnes_hut(&self, graph: &ViewerGraph, params: &LayoutParams) -> Vec<Vec3> {
+        let n = graph.nodes.len().min(self.pos.len());
+        let bodies: Vec<(u32, Vec3)> = (0..n)
+            .filter(|&i| graph.nodes[i].is_some())
+            .map(|i| (i as u32, self.pos[i]))
+            .collect();
+        let tree = Octree::build(&bodies);
+
+        // The tree is read-only and each body's force is independent, so
+        // the traversal splits cleanly across cores. Small graphs stay on
+        // one thread, where spawning would cost more than it saves.
+        let mut per_body = vec![Vec3::ZERO; bodies.len()];
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |t| t.get())
+            .min(bodies.len().div_ceil(PARALLEL_CHUNK_MIN).max(1));
+        let chunk = bodies.len().div_ceil(threads.max(1)).max(1);
+        let compute = |bodies: &[(u32, Vec3)], out: &mut [Vec3]| {
+            let mut stack = Vec::new();
+            for (&(i, p), f) in bodies.iter().zip(out) {
+                *f = tree.force_on_with(i, p, params.theta, params.repulsion, &mut stack);
+            }
+        };
+        if threads <= 1 {
+            compute(&bodies, &mut per_body);
+        } else {
+            std::thread::scope(|scope| {
+                for (b, out) in bodies.chunks(chunk).zip(per_body.chunks_mut(chunk)) {
+                    scope.spawn(move || compute(b, out));
+                }
+            });
+        }
+
+        let mut forces = vec![Vec3::ZERO; n];
+        for (&(i, _), f) in bodies.iter().zip(per_body) {
+            forces[i as usize] = f;
+        }
+        forces
+    }
+
+    /// One repulsion (Barnes-Hut) + spring-attraction tick. No-op while
+    /// asleep. Sets `awake = false` once total kinetic energy drops below
+    /// `params.sleep_energy`.
+    pub fn step(&mut self, graph: &ViewerGraph, dt: f32, params: &LayoutParams) {
+        self.sync_live(graph);
+        if !self.awake {
+            return;
+        }
+        let n = graph.nodes.len();
+        let mut forces = self.repulsion_barnes_hut(graph, params);
 
         for edge in &graph.edges {
             let (i, j) = (edge.from.0 as usize, edge.to.0 as usize);
@@ -377,5 +431,81 @@ mod tests {
         };
 
         assert_eq!(run(), run());
+    }
+
+    /// Bare graph of `n` nodes at seeded random positions inside a cube
+    /// of side `extent`, with every node live.
+    fn scattered(n: usize, extent: f32, seed: u64) -> (ViewerGraph, LayoutState) {
+        let graph = bare_graph(n, vec![]);
+        let mut layout = LayoutState::new(seed);
+        let ids: Vec<NodeId> = (0..n as u32).map(NodeId).collect();
+        layout.place_new(&graph, &ids);
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let h = extent / 2.0;
+        for p in &mut layout.pos {
+            *p = Vec3::new(
+                rng.random_range(-h..h),
+                rng.random_range(-h..h),
+                rng.random_range(-h..h),
+            );
+        }
+        (graph, layout)
+    }
+
+    #[test]
+    fn barnes_hut_stays_within_5_percent_of_all_pairs() {
+        let (graph, layout) = scattered(200, 40.0, 7);
+        let params = LayoutParams::default();
+        let exact = layout.repulsion_all_pairs(&graph, &params);
+        let approx = layout.repulsion_barnes_hut(&graph, &params);
+
+        let mean_relative_error = exact
+            .iter()
+            .zip(&approx)
+            .map(|(e, a)| (*e - *a).length() / e.length().max(1e-6))
+            .sum::<f32>()
+            / exact.len() as f32;
+        assert!(
+            mean_relative_error < 0.05,
+            "mean relative error {mean_relative_error} ≥ 5%"
+        );
+    }
+
+    /// Phase 4 budget: 5,000 nodes (50 classes, 4,950 instances), 10,000
+    /// edges, 100 steps, mean step ≤ 4 ms. Run with
+    /// `cargo test --release -p sparql-mcp-viewer -- --ignored layout_budget_5000`.
+    #[test]
+    #[ignore]
+    fn layout_budget_5000() {
+        const CLASSES: u32 = 50;
+        const INSTANCES: u32 = 4_950;
+        const N: u32 = CLASSES + INSTANCES;
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let mut edges: Vec<(u32, u32, EdgeStyle)> = (CLASSES..N)
+            .map(|i| (i, rng.random_range(0..CLASSES), EdgeStyle::Type))
+            .collect();
+        while edges.len() < 10_000 {
+            let (a, b) = (rng.random_range(0..N), rng.random_range(0..N));
+            if a != b {
+                edges.push((a, b, EdgeStyle::Relation));
+            }
+        }
+        let (_, mut layout) = scattered(N as usize, 60.0, 42);
+        let graph = bare_graph(N as usize, edges);
+        let params = LayoutParams::default();
+
+        const STEPS: u32 = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..STEPS {
+            layout.awake = true;
+            layout.step(&graph, 1.0 / 60.0, &params);
+        }
+        let mean_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(STEPS);
+        println!("layout_budget_5000: mean step {mean_ms:.2} ms");
+        assert!(
+            mean_ms <= 4.0,
+            "mean step {mean_ms:.2} ms exceeds the 4 ms budget"
+        );
     }
 }

@@ -14,7 +14,8 @@ use crate::connection::{self, ConnState, ShutdownHandle, ViewerMsg};
 use crate::graph::{NodeId, Remap, ViewerGraph};
 use crate::layout::{LayoutParams, LayoutState};
 use crate::render::{
-    layout_step_system, sync_entities, update_edge_meshes, write_transforms, RenderPlugin,
+    animate_spawn_despawn, layout_step_system, sync_entities, update_edge_meshes, write_transforms,
+    RenderPlugin,
 };
 
 #[derive(Resource)]
@@ -79,7 +80,7 @@ pub struct ViewerPlugin {
 }
 
 /// Fixed seed so the same graph always lays out the same way.
-const LAYOUT_SEED: u64 = 0x5_9A2C_4D;
+const LAYOUT_SEED: u64 = 0x059A_2C4D;
 
 impl Plugin for ViewerPlugin {
     fn build(&self, app: &mut App) {
@@ -95,7 +96,7 @@ impl Plugin for ViewerPlugin {
         .add_systems(FixedUpdate, layout_step_system)
         .add_systems(
             PostUpdate,
-            (write_transforms, update_edge_meshes)
+            (write_transforms, animate_spawn_despawn, update_edge_meshes)
                 .chain()
                 .before(TransformSystems::Propagate),
         );
