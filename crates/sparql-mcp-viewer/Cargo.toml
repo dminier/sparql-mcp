@@ -34,8 +34,11 @@ bevy = { version = "=0.20.1", default-features = false, features = [
     "3d",
     "bevy_camera_controller",
     "pan_orbit_camera",
-    "bevy_ui",
+    # `bevy_ui` alone is only the API; `ui_bevy_render` also draws it.
+    "ui_bevy_render",
+    "ui_picking",
 ] }
+arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"

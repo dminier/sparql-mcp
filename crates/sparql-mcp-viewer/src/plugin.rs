@@ -1,6 +1,7 @@
 //! Bevy wiring and the Bevy-side resources shared by the headless and
 //! windowed paths: `CorePlugin` (connection + graph, both paths) and
-//! `ViewerPlugin` (windowed path: layout, render, camera).
+//! `ViewerPlugin` (windowed path: layout, render, camera, interaction and
+//! the ingestion view).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -12,10 +13,12 @@ use bevy::transform::TransformSystems;
 use crate::camera::CameraPlugin;
 use crate::connection::{self, ConnState, ShutdownHandle, ViewerMsg};
 use crate::graph::{NodeId, Remap, ViewerGraph};
+use crate::ingest::IngestPlugin;
+use crate::interact::InteractPlugin;
 use crate::layout::{LayoutParams, LayoutState};
 use crate::render::{
-    animate_spawn_despawn, layout_step_system, sync_entities, update_edge_meshes, write_transforms,
-    RenderPlugin,
+    animate_spawn_despawn, apply_node_materials, layout_step_system, sync_entities,
+    update_edge_meshes, write_transforms, RenderPlugin,
 };
 
 #[derive(Resource)]
@@ -39,6 +42,7 @@ pub enum CoreSet {
     Net,
     Graph,
     Sync,
+    Ui,
 }
 
 /// Connects to the viewer side-channel and keeps `ViewerGraph` in sync.
@@ -59,7 +63,7 @@ impl Plugin for CorePlugin {
 
         app.configure_sets(
             Update,
-            (CoreSet::Net, CoreSet::Graph, CoreSet::Sync).chain(),
+            (CoreSet::Net, CoreSet::Graph, CoreSet::Sync, CoreSet::Ui).chain(),
         );
         app.add_systems(
             Update,
@@ -71,9 +75,9 @@ impl Plugin for CorePlugin {
     }
 }
 
-/// Windowed path: `CorePlugin` plus layout, rendering and the camera.
-/// Phase 5 adds `Selection`, `ClassFilter`, `ActivityFeed` and the
-/// interact/ingest plugins here.
+/// Windowed path: `CorePlugin` plus layout, rendering, the camera,
+/// interaction (selection, class filter, labels) and the ingestion view
+/// (activity feed, last-batch pulse, resync banner).
 pub struct ViewerPlugin {
     pub addr: SocketAddr,
     pub connect_timeout: Duration,
@@ -91,8 +95,13 @@ impl Plugin for ViewerPlugin {
         .insert_resource(LayoutParams::default())
         .insert_resource(LayoutState::new(LAYOUT_SEED))
         .insert_resource(Time::<Fixed>::from_hz(60.0))
-        .add_plugins((RenderPlugin, CameraPlugin))
-        .add_systems(Update, sync_entities.in_set(CoreSet::Sync))
+        .add_plugins((RenderPlugin, CameraPlugin, InteractPlugin, IngestPlugin))
+        .add_systems(
+            Update,
+            (sync_entities, apply_node_materials)
+                .chain()
+                .in_set(CoreSet::Sync),
+        )
         .add_systems(FixedUpdate, layout_step_system)
         .add_systems(
             PostUpdate,
@@ -114,7 +123,7 @@ fn drain_inbox(inbox: Res<Inbox>, mut frame: ResMut<FrameMessages>) {
 /// Applies each of this frame's messages to [`ViewerGraph`] and
 /// [`ConnStatus`]. When a [`LayoutState`] exists (windowed path), new
 /// nodes are placed and a same-graph rebuild carries positions over.
-fn apply_to_graph(
+pub fn apply_to_graph(
     frame: Res<FrameMessages>,
     mut graph: ResMut<ViewerGraph>,
     mut status: ResMut<ConnStatus>,

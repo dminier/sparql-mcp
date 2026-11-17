@@ -12,28 +12,42 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 
 use crate::graph::{EdgeStyle, NodeId, NodeKind, ViewerGraph};
+use crate::ingest::LastBatch;
+use crate::interact::{ClassFilter, Selection};
 use crate::layout::{LayoutParams, LayoutState};
 
 /// Links a spawned entity to the graph node it draws.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct NodeRef(pub NodeId);
 
-/// One mesh handle per shape and one material handle per style — the
-/// viewer never creates a material per node.
+/// One mesh handle per shape and one material handle per style (class,
+/// instance, selected, faded, last batch) — the viewer never creates a
+/// material per node.
 #[derive(Resource)]
 pub struct ViewerStyle {
     pub class_mesh: Handle<Mesh>,
     pub instance_mesh: Handle<Mesh>,
     pub class_material: Handle<StandardMaterial>,
     pub instance_material: Handle<StandardMaterial>,
+    pub selected_material: Handle<StandardMaterial>,
+    pub faded_material: Handle<StandardMaterial>,
+    pub last_batch_material: Handle<StandardMaterial>,
+    /// How long the last batch pulses.
+    pub pulse_secs: f32,
 }
 
-/// The three `LineList` meshes, one per [`EdgeStyle`].
+/// The `LineList` edge meshes: one per [`EdgeStyle`], each in a normal
+/// and a faded variant (an edge is faded if either end is filtered out).
 #[derive(Resource)]
-pub struct EdgeMeshes {
-    pub type_edges: Handle<Mesh>,
-    pub subclass_edges: Handle<Mesh>,
-    pub relation_edges: Handle<Mesh>,
+pub struct EdgeMeshes(pub [Handle<Mesh>; 6]);
+
+fn edge_slot(style: EdgeStyle, faded: bool) -> usize {
+    let base = match style {
+        EdgeStyle::Type => 0,
+        EdgeStyle::SubClass => 2,
+        EdgeStyle::Relation => 4,
+    };
+    base + usize::from(faded)
 }
 
 /// Entity spawned for each node, plus the term it was spawned for — a
@@ -72,6 +86,23 @@ fn setup_style(
             perceptual_roughness: 0.9,
             ..default()
         }),
+        selected_material: materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            emissive: LinearRgba::rgb(2.5, 2.5, 2.5),
+            ..default()
+        }),
+        faded_material: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.5, 0.55, 0.65, 0.12),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        }),
+        last_batch_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.4, 1.0, 0.55),
+            emissive: LinearRgba::rgb(0.4, 1.6, 0.6),
+            ..default()
+        }),
+        pulse_secs: 2.0,
     });
 }
 
@@ -91,24 +122,29 @@ fn setup_edges(
         alpha_mode: AlphaMode::Blend,
         ..default()
     };
-    let handles = EdgeMeshes {
-        type_edges: meshes.add(empty_line_list()),
-        subclass_edges: meshes.add(empty_line_list()),
-        relation_edges: meshes.add(empty_line_list()),
-    };
-    for (mesh, color) in [
-        (&handles.type_edges, Color::srgba(1.0, 0.7, 0.3, 0.45)),
-        (&handles.subclass_edges, Color::srgba(1.0, 1.0, 1.0, 0.6)),
-        (&handles.relation_edges, Color::srgba(0.5, 0.75, 1.0, 0.3)),
-    ] {
-        commands.spawn((
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(materials.add(edge_material(color))),
-            Transform::IDENTITY,
-            Pickable::IGNORE,
-        ));
+    const FADED_ALPHA: f32 = 0.05;
+    let colors = [
+        (EdgeStyle::Type, Color::srgba(1.0, 0.7, 0.3, 0.45)),
+        (EdgeStyle::SubClass, Color::srgba(1.0, 1.0, 1.0, 0.6)),
+        (EdgeStyle::Relation, Color::srgba(0.5, 0.75, 1.0, 0.3)),
+    ];
+    let handles: [Handle<Mesh>; 6] = std::array::from_fn(|_| meshes.add(empty_line_list()));
+    for (style, color) in colors {
+        for faded in [false, true] {
+            let color = if faded {
+                color.with_alpha(FADED_ALPHA)
+            } else {
+                color
+            };
+            commands.spawn((
+                Mesh3d(handles[edge_slot(style, faded)].clone()),
+                MeshMaterial3d(materials.add(edge_material(color))),
+                Transform::IDENTITY,
+                Pickable::IGNORE,
+            ));
+        }
     }
-    commands.insert_resource(handles);
+    commands.insert_resource(EdgeMeshes(handles));
 }
 
 fn setup_lights(mut commands: Commands) {
@@ -258,23 +294,29 @@ pub fn write_transforms(layout: Res<LayoutState>, mut nodes: Query<(&NodeRef, &m
     }
 }
 
-/// Rewrite the three edge meshes' vertex positions. Only does work while
-/// the layout is awake or the graph changed.
+/// Rewrite the edge meshes' vertex positions. Only does work while the
+/// layout is awake, the graph changed, or the class filter changed.
 pub fn update_edge_meshes(
     graph: Res<ViewerGraph>,
     layout: Res<LayoutState>,
     edges: Option<Res<EdgeMeshes>>,
+    filter: Option<Res<ClassFilter>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_generation: Local<Option<u64>>,
 ) {
     let Some(edges) = edges else { return };
     let graph_changed = *last_generation != Some(graph.generation);
-    if !layout.awake && !graph_changed {
+    let filter_changed = filter.as_ref().is_some_and(|f| f.is_changed());
+    if !layout.awake && !graph_changed && !filter_changed {
         return;
     }
     *last_generation = Some(graph.generation);
 
-    let mut by_style: [Vec<[f32; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let visible = |id: NodeId| match (&filter, graph.nodes.get(id.0 as usize)) {
+        (Some(filter), Some(Some(node))) => filter.is_visible(node),
+        _ => true,
+    };
+    let mut buckets: [Vec<[f32; 3]>; 6] = Default::default();
     for edge in &graph.edges {
         let (Some(a), Some(b)) = (
             layout.pos.get(edge.from.0 as usize),
@@ -282,23 +324,110 @@ pub fn update_edge_meshes(
         ) else {
             continue;
         };
-        let bucket = match edge.style {
-            EdgeStyle::Type => 0,
-            EdgeStyle::SubClass => 1,
-            EdgeStyle::Relation => 2,
-        };
-        by_style[bucket].push(a.to_array());
-        by_style[bucket].push(b.to_array());
+        let faded = !visible(edge.from) || !visible(edge.to);
+        let bucket = &mut buckets[edge_slot(edge.style, faded)];
+        bucket.push(a.to_array());
+        bucket.push(b.to_array());
     }
 
-    let [type_pos, subclass_pos, relation_pos] = by_style;
-    for (handle, positions) in [
-        (&edges.type_edges, type_pos),
-        (&edges.subclass_edges, subclass_pos),
-        (&edges.relation_edges, relation_pos),
-    ] {
+    for (handle, positions) in edges.0.iter().zip(buckets) {
         if let Some(mut mesh) = meshes.get_mut(handle) {
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         }
+    }
+}
+
+/// The amplitude of the last-batch pulse: scale oscillates in `[1, 1.3]`.
+const PULSE_AMPLITUDE: f32 = 0.3;
+const PULSE_HZ: f32 = 1.5;
+
+/// Pulse scale at `t` seconds into the pulse: 1.0 at t = 0, peaks at 1.3.
+pub fn pulse_scale(t: f32) -> f32 {
+    let phase = (t * PULSE_HZ * std::f32::consts::TAU).cos();
+    1.0 + PULSE_AMPLITUDE * (0.5 - 0.5 * phase)
+}
+
+/// Pick each node's shared material — selected, then faded (filtered out),
+/// then last batch, then its kind — and drive the last-batch pulse on
+/// `Transform.scale`. Handles and scales are only written when they change.
+#[allow(clippy::type_complexity)]
+pub fn apply_node_materials(
+    graph: Res<ViewerGraph>,
+    style: Option<Res<ViewerStyle>>,
+    selection: Option<Res<Selection>>,
+    filter: Option<Res<ClassFilter>>,
+    last_batch: Option<Res<LastBatch>>,
+    mut nodes: Query<
+        (
+            &NodeRef,
+            &mut MeshMaterial3d<StandardMaterial>,
+            &mut Transform,
+        ),
+        (Without<Spawning>, Without<Despawning>),
+    >,
+) {
+    let Some(style) = style else { return };
+    let selected = selection
+        .as_ref()
+        .and_then(|s| s.0.as_deref())
+        .and_then(|t| graph.index.get(t))
+        .copied();
+    let pulse_t = last_batch.as_ref().and_then(|b| {
+        let t = b.started?.elapsed().as_secs_f32();
+        (t < style.pulse_secs).then_some((b.seq?, t))
+    });
+
+    for (node_ref, mut material, mut transform) in &mut nodes {
+        let Some(Some(node)) = graph.nodes.get(node_ref.0 .0 as usize) else {
+            continue;
+        };
+        let pulsing = pulse_t.filter(|(seq, _)| node.last_touched == *seq);
+        let filtered_out = filter.as_ref().is_some_and(|f| !f.is_visible(node));
+        let wanted = if selected == Some(node_ref.0) {
+            &style.selected_material
+        } else if filtered_out {
+            &style.faded_material
+        } else if pulsing.is_some() {
+            &style.last_batch_material
+        } else {
+            match node.kind {
+                NodeKind::Class => &style.class_material,
+                NodeKind::Instance => &style.instance_material,
+            }
+        };
+        if material.0 != *wanted {
+            material.0 = wanted.clone();
+        }
+
+        let scale = pulsing.map_or(1.0, |(_, t)| pulse_scale(t));
+        if (transform.scale.x - scale).abs() > 1e-4 {
+            transform.scale = Vec3::splat(scale);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulse_starts_at_rest_and_stays_between_1_and_1_3() {
+        assert!((pulse_scale(0.0) - 1.0).abs() < 1e-6);
+        for i in 0..200 {
+            let s = pulse_scale(i as f32 * 0.01);
+            assert!((1.0..=1.3 + 1e-6).contains(&s), "scale {s} at step {i}");
+        }
+        let peak = pulse_scale(1.0 / (2.0 * PULSE_HZ));
+        assert!((peak - 1.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn edge_slots_are_distinct() {
+        let mut slots: Vec<usize> = [EdgeStyle::Type, EdgeStyle::SubClass, EdgeStyle::Relation]
+            .into_iter()
+            .flat_map(|s| [edge_slot(s, false), edge_slot(s, true)])
+            .collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![0, 1, 2, 3, 4, 5]);
     }
 }

@@ -38,6 +38,11 @@ struct Args {
     /// watch the instances arrive.
     #[arg(long, default_value_t = 3)]
     delay_secs: u64,
+    /// After inserting, remove this many instances with a pattern-based
+    /// `DELETE … WHERE` — the server can only report it as a coarse
+    /// `changed` event, which makes the viewer resync (CUJ 3).
+    #[arg(long, default_value_t = 0)]
+    pattern_delete: usize,
 }
 
 #[tokio::main]
@@ -85,7 +90,24 @@ async fn main() -> Result<()> {
         inserted += n;
         tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
     }
-    println!("inserted {inserted} instances; serving until Ctrl-C");
+    println!("inserted {inserted} instances");
+
+    let doomed = args.pattern_delete.min(inserted);
+    if doomed > 0 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let targets: Vec<String> = (0..doomed)
+            .map(|i| format!("<urn:viewer-load:p{i}>"))
+            .collect();
+        let update = format!(
+            "DELETE {{ GRAPH <{ACTIVE_GRAPH}> {{ ?s ?p ?o }} }} \
+             WHERE {{ GRAPH <{ACTIVE_GRAPH}> {{ ?s ?p ?o . FILTER(?s IN ({})) }} }}",
+            targets.join(", ")
+        );
+        sparql::update_sparql(&store, &object!({ "update": update }), &active_graph, &sink)
+            .map_err(|e| anyhow::anyhow!("update_sparql: {e:?}"))?;
+        println!("pattern-deleted {doomed} instances (coarse `changed` event)");
+    }
+    println!("serving until Ctrl-C");
 
     tokio::signal::ctrl_c().await?;
     Ok(())
