@@ -25,14 +25,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `sync` for the inbox channel; no `process`, which the viewer never spawns.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 crossbeam-channel = "0.5"
+rand = { version = "0.9", features = ["small_rng"] }
 
-# Bevy is added here with only what Phase 2 (headless path, `CorePlugin`)
-# needs to compile and run `MinimalPlugins` + `ScheduleRunnerPlugin` — no
-# windowing or rendering yet. The windowing/rendering/camera/picking
-# feature list for the windowed path (Phase 3 onward) is added when that
-# code lands, verified against an actual build rather than guessed ahead
-# of time.
-bevy = { version = "=0.20.1", default-features = false }
+# "3d" pulls in default_platform (bevy_winit + x11/wayland + multi_threaded),
+# 3D rendering/PBR, picking and scene — matching the Technical Plan's
+# feature list without hand-picking each sub-crate.
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "3d",
+    "bevy_camera_controller",
+    "pan_orbit_camera",
+    "bevy_ui",
+] }
 
 [dev-dependencies]
 tempfile = "3"

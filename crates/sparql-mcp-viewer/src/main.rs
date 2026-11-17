@@ -4,7 +4,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bevy::prelude::{
+    default, App, AppExit, ClearColor, Color, DefaultPlugins, PluginGroup, Window, WindowPlugin,
+};
 use clap::Parser;
+use sparql_mcp_viewer::plugin::ViewerPlugin;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -81,13 +85,37 @@ fn main() -> ExitCode {
     };
     let connect_timeout = Duration::from_secs(cli.connect_timeout);
 
-    if !cli.headless {
-        eprintln!("error: windowed mode is not implemented yet (Phase 3) — pass --headless");
-        return ExitCode::FAILURE;
+    let exit = if cli.headless {
+        sparql_mcp_viewer::headless::run(addr, connect_timeout)
+    } else {
+        run_windowed(addr, connect_timeout)
+    };
+    match exit {
+        AppExit::Success => ExitCode::SUCCESS,
+        AppExit::Error(code) => ExitCode::from(code.get()),
     }
+}
 
-    match sparql_mcp_viewer::headless::run(addr, connect_timeout) {
-        bevy::app::AppExit::Success => ExitCode::SUCCESS,
-        bevy::app::AppExit::Error(code) => ExitCode::from(code.get()),
-    }
+const CLEAR_COLOR: Color = Color::srgb(0.02, 0.02, 0.05);
+
+fn run_windowed(addr: SocketAddr, connect_timeout: Duration) -> AppExit {
+    App::new()
+        .insert_resource(ClearColor(CLEAR_COLOR))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "sparql-mcp viewer".into(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                // `main` already installed a tracing subscriber.
+                .disable::<bevy::log::LogPlugin>(),
+        )
+        .add_plugins(ViewerPlugin {
+            addr,
+            connect_timeout,
+        })
+        .run()
 }
