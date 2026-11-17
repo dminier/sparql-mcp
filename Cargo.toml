@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sparql-mcp-core", "examples/hello-plugin"]
+members = ["crates/sparql-mcp-core", "crates/sparql-mcp-viewer", "examples/hello-plugin"]
 resolver = "2"
 
 [workspace.package]
@@ -8,3 +8,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/dminier/sparql-mcp"
 rust-version = "1.78"
+
+# Bevy is unusably slow in an unoptimized dev build. Optimizing every
+# dependency (not the viewer's own crate) keeps `cargo build`/`cargo test`
+# fast to recompile while still running at a judgeable frame rate.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,6 +1,6 @@
 //! Integration tests — project_create / project_list / project_switch tools.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::json;
 use sparql_mcp::application::tools::project::{project_create, project_list, project_switch};
@@ -9,6 +9,10 @@ use sparql_mcp::infrastructure::OxigraphAdapter;
 
 fn store() -> Arc<dyn SparqlStore> {
     Arc::new(OxigraphAdapter::open_in_memory().unwrap())
+}
+
+fn active_graph() -> Arc<RwLock<String>> {
+    Arc::new(RwLock::new("urn:project:default".to_string()))
 }
 
 fn args(val: serde_json::Value) -> rmcp::model::JsonObject {
@@ -104,17 +108,18 @@ fn create_same_id_twice_project_appears_in_list() {
 
 #[test]
 fn switch_returns_correct_graph_iri() {
-    let s = store();
-    let res = project_switch(&s, &args(json!({"id": "my-proj"}))).unwrap();
+    let graph = active_graph();
+    let res = project_switch(&graph, &args(json!({"id": "my-proj"}))).unwrap();
     let body: serde_json::Value =
         serde_json::from_str(res.content[0].as_text().unwrap().text.as_str()).unwrap();
     assert_eq!(body["active_graph"], "urn:project:my-proj");
     assert_eq!(body["status"], "ok");
+    assert_eq!(*graph.read().unwrap(), "urn:project:my-proj");
 }
 
 #[test]
 fn switch_invalid_id_rejected() {
-    let s = store();
-    let res = project_switch(&s, &args(json!({"id": "bad id!"})));
+    let graph = active_graph();
+    let res = project_switch(&graph, &args(json!({"id": "bad id!"})));
     assert!(res.is_err() || res.unwrap().is_error.unwrap_or(false));
 }

@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result};
 use rmcp::model::{
@@ -21,6 +21,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
 use crate::application::tools::{cbm, doc, export, gdrive, ontology, project, sparql};
+use crate::application::{EventSink, NullEventSink};
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -31,10 +32,14 @@ pub struct SparqlMcpServer {
     store: Arc<dyn SparqlStore>,
     doc_store: Arc<dyn DocStore>,
     ontology_dir: PathBuf,
-    active_graph: String,
+    /// Shared with `infrastructure::viewer_channel`: `project_switch`
+    /// writes here, and the viewer channel re-snapshots when it changes
+    /// (Required Change 5 in the viewer design).
+    active_graph: Arc<RwLock<String>>,
     plugins: Arc<Vec<Box<dyn ToolPlugin>>>,
     gdrive_config: Option<crate::config::GDriveConfig>,
     store_path: std::path::PathBuf,
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl SparqlMcpServer {
@@ -42,7 +47,7 @@ impl SparqlMcpServer {
         store: Arc<dyn SparqlStore>,
         doc_store: Arc<dyn DocStore>,
         ontology_dir: PathBuf,
-        active_graph: String,
+        active_graph: Arc<RwLock<String>>,
         gdrive_config: Option<crate::config::GDriveConfig>,
         store_path: PathBuf,
     ) -> Self {
@@ -54,7 +59,13 @@ impl SparqlMcpServer {
             plugins: Arc::new(Vec::new()),
             gdrive_config,
             store_path,
+            event_sink: Arc::new(NullEventSink),
         }
+    }
+
+    pub fn with_event_sink(mut self, event_sink: Arc<dyn EventSink>) -> Self {
+        self.event_sink = event_sink;
+        self
     }
 
     pub fn with_plugins(mut self, plugins: Vec<Box<dyn ToolPlugin>>) -> Self {
@@ -75,7 +86,11 @@ impl SparqlMcpServer {
         PluginContext {
             store: self.store.clone(),
             doc_store: self.doc_store.clone(),
-            active_graph: self.active_graph.clone(),
+            active_graph: self
+                .active_graph
+                .read()
+                .expect("active_graph lock poisoned")
+                .clone(),
         }
     }
 
@@ -88,16 +103,31 @@ impl SparqlMcpServer {
     ) -> Option<Result<CallToolResult, McpError>> {
         let result = match name {
             "query_sparql" => sparql::query_sparql(&self.store, args),
-            "update_sparql" => sparql::update_sparql(&self.store, args),
-            "load_ontology" => ontology::load_ontology(&self.store, args),
-            "load_ontology_file" => ontology::load_ontology_file(&self.store, args),
+            "update_sparql" => sparql::update_sparql(
+                &self.store,
+                args,
+                &self.active_graph,
+                self.event_sink.as_ref(),
+            ),
+            "load_ontology" => ontology::load_ontology(
+                &self.store,
+                args,
+                &self.active_graph,
+                self.event_sink.as_ref(),
+            ),
+            "load_ontology_file" => ontology::load_ontology_file(
+                &self.store,
+                args,
+                &self.active_graph,
+                self.event_sink.as_ref(),
+            ),
             "cbm_load_graph" => cbm::cbm_load_graph(&self.store, args),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),
             "project_create" => project::project_create(&self.store, args),
             "project_list" => project::project_list(&self.store),
-            "project_switch" => project::project_switch(&self.store, args),
+            "project_switch" => project::project_switch(&self.active_graph, args),
             "write_doc" => doc::write_doc(&self.doc_store, args),
             "get_gdrive_config" => gdrive::get_gdrive_config(&self.gdrive_config, &self.store_path),
             #[cfg(feature = "recording")]
@@ -308,7 +338,7 @@ mod dispatch_tests {
             store,
             doc_store,
             std::path::PathBuf::from("./ontology"),
-            "urn:project:default".into(),
+            Arc::new(RwLock::new("urn:project:default".into())),
             None,
             std::path::PathBuf::from("/tmp/smcp-test-store"),
         )

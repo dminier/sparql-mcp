@@ -1,15 +1,16 @@
 //! load_ontology and load_ontology_file tools.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
+use crate::application::event_sink::{classify_subjects, EventSink, StoreEvent};
 use crate::domain::{InputFormat, LoadOpts, SparqlStore};
 
-use super::sparql::{make_tool, require_str, with_delta};
+use super::sparql::{make_tool, require_str};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -67,6 +68,8 @@ pub fn tool_load_ontology_file_def() -> Tool {
 pub fn load_ontology(
     store: &Arc<dyn SparqlStore>,
     args: &JsonObject,
+    active_graph: &Arc<RwLock<String>>,
+    event_sink: &dyn EventSink,
 ) -> Result<CallToolResult, McpError> {
     let turtle = require_str(args, "turtle")?;
     let format_label = args
@@ -75,11 +78,6 @@ pub fn load_ontology(
         .unwrap_or("turtle");
     let format = parse_format(format_label)?;
     let graph_iri = args.get("graph_iri").and_then(Value::as_str);
-
-    let mut extra = json!({ "format": format_label });
-    if let Some(iri) = graph_iri {
-        extra["graph_iri"] = json!(iri);
-    }
 
     let opts = LoadOpts {
         format,
@@ -91,17 +89,38 @@ pub fn load_ontology(
     };
     let content = turtle.as_bytes().to_vec();
 
-    with_delta(store, extra, |_| {
-        store
-            .load_rdf(&content, opts)
-            .map(|_| ())
-            .map_err(|e| McpError::invalid_params(format!("parse/load error: {e}"), None))
-    })
+    let before = store
+        .triple_count()
+        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
+    let (_delta, triples) = store
+        .load_rdf_with_triples(&content, opts)
+        .map_err(|e| McpError::invalid_params(format!("parse/load error: {e}"), None))?;
+    let after = store
+        .triple_count()
+        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
+
+    emit_insert(active_graph, event_sink, &triples)?;
+
+    let mut payload = json!({
+        "status": "ok",
+        "triples_before": before,
+        "triples_after": after,
+        "delta": after as i64 - before as i64,
+        "format": format_label,
+    });
+    if let Some(iri) = graph_iri {
+        payload["graph_iri"] = json!(iri);
+    }
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )]))
 }
 
 pub fn load_ontology_file(
     store: &Arc<dyn SparqlStore>,
     args: &JsonObject,
+    active_graph: &Arc<RwLock<String>>,
+    event_sink: &dyn EventSink,
 ) -> Result<CallToolResult, McpError> {
     let path_str = require_str(args, "path")?;
     let format = args
@@ -125,6 +144,10 @@ pub fn load_ontology_file(
         .load_rdf_file(Path::new(path_str), opts, force)
         .map_err(|e| McpError::invalid_params(format!("load file: {e}"), None))?;
 
+    if !result.skipped {
+        emit_insert(active_graph, event_sink, &result.triples)?;
+    }
+
     let mut payload = json!({
         "status": "ok",
         "path": result.path,
@@ -146,6 +169,29 @@ pub fn load_ontology_file(
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&payload).unwrap(),
     )]))
+}
+
+/// Both `load_ontology` and `load_ontology_file` load ground data, so both
+/// can always emit a precise `StoreEvent::Insert` — unlike `update_sparql`,
+/// there is no pattern-based case here.
+fn emit_insert(
+    active_graph: &Arc<RwLock<String>>,
+    event_sink: &dyn EventSink,
+    triples: &[[String; 3]],
+) -> Result<(), McpError> {
+    if triples.is_empty() {
+        return Ok(());
+    }
+    let graph = active_graph
+        .read()
+        .map_err(|_| McpError::internal_error("active_graph lock poisoned", None))?
+        .clone();
+    event_sink.emit(StoreEvent::Insert {
+        graph,
+        kinds: classify_subjects(triples),
+        triples: triples.to_vec(),
+    });
+    Ok(())
 }
 
 fn parse_format(label: &str) -> Result<InputFormat, McpError> {

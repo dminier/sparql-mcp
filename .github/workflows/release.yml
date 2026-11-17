@@ -71,7 +71,14 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-12
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++-12
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc-12
-        run: cargo build --release --target ${{ matrix.target }}
+        # Scoped to the server crate: the Linux (and any re-enabled macOS)
+        # targets above never pull in Bevy.
+        run: cargo build --release --target ${{ matrix.target }} -p sparql-mcp
+
+      - name: Build viewer
+        if: matrix.os == 'windows'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p sparql-mcp-viewer
 
       - name: Package
         shell: bash
@@ -82,6 +89,7 @@ jobs:
           mkdir -p "$STAGE"
           if [ "${{ matrix.os }}" = "windows" ]; then
             cp target/${{ matrix.target }}/release/sparql-mcp.exe "$STAGE/"
+            cp target/${{ matrix.target }}/release/sparql-mcp-viewer.exe "$STAGE/"
           else
             cp target/${{ matrix.target }}/release/sparql-mcp "$STAGE/"
             # Strip to shrink binary; ignore failures on macOS for arm64.

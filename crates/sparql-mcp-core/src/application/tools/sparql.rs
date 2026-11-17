@@ -1,13 +1,14 @@
 //! query_sparql and update_sparql tools.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::domain::{QueryResult, RdfTerm, SolutionSet, SparqlStore};
+use crate::application::event_sink::{classify_subjects, EventSink, StoreEvent};
+use crate::domain::{QueryResult, RdfTerm, SolutionSet, SparqlStore, UpdateOutcome};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -65,6 +66,8 @@ pub fn query_sparql(
 pub fn update_sparql(
     store: &Arc<dyn SparqlStore>,
     args: &JsonObject,
+    active_graph: &Arc<RwLock<String>>,
+    event_sink: &dyn EventSink,
 ) -> Result<CallToolResult, McpError> {
     let sparql = require_str(args, "update")?;
     let dry_run = args
@@ -94,11 +97,60 @@ pub fn update_sparql(
         )]));
     }
 
-    with_delta(store, json!({}), |_| {
-        store
-            .update(sparql)
-            .map_err(|e| McpError::invalid_params(format!("update: {e}"), None))
-    })
+    let outcome = store
+        .update_with_outcome(sparql)
+        .map_err(|e| McpError::invalid_params(format!("update: {e}"), None))?;
+
+    let graph = active_graph
+        .read()
+        .map_err(|_| McpError::internal_error("active_graph lock poisoned", None))?
+        .clone();
+
+    // This is an explicit, documented limitation, not a silent gap:
+    // pattern-based updates do not get node-level detail in the viewer in
+    // v1 — only ground INSERT DATA / DELETE DATA produce a precise event.
+    match &outcome {
+        UpdateOutcome::Ground {
+            inserted, deleted, ..
+        } => {
+            if !inserted.is_empty() {
+                event_sink.emit(StoreEvent::Insert {
+                    graph: graph.clone(),
+                    kinds: classify_subjects(inserted),
+                    triples: inserted.clone(),
+                });
+            }
+            if !deleted.is_empty() {
+                event_sink.emit(StoreEvent::Delete {
+                    graph: graph.clone(),
+                    kinds: classify_subjects(deleted),
+                    triples: deleted.clone(),
+                });
+            }
+        }
+        UpdateOutcome::Pattern {
+            triples_before,
+            triples_after,
+        } => {
+            event_sink.emit(StoreEvent::Changed {
+                graph,
+                triples_before: *triples_before,
+                triples_after: *triples_after,
+            });
+        }
+    }
+
+    let before = outcome.triples_before();
+    let after = outcome.triples_after();
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&json!({
+            "status": "ok",
+            "triples_before": before,
+            "triples_after": after,
+            "delta": after as i64 - before as i64,
+        }))
+        .unwrap(),
+    )]))
 }
 
 // ── Shared helpers exported for other tool modules ────────────────────────────

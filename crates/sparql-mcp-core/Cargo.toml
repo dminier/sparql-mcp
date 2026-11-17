@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 oxigraph = "0.5"
+spargebra = "0.4"
 rmcp = { version = "1.5", default-features = false, features = [
     "client",
     "server",
@@ -17,7 +18,7 @@ rmcp = { version = "1.5", default-features = false, features = [
     "transport-child-process",
     "transport-io",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

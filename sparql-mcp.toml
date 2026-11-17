@@ -15,3 +15,9 @@ folder_id = "1504oh7sczjz02Q9Bn6U7Nrws2QrIyX1H"
 [plugins]
 # Activate third-party plugins here. Plugin code lives under crates/ or
 # as an external dependency implementing the ToolPlugin trait.
+
+[viewer]
+# Live 3D graph viewer side-channel (crates/sparql-mcp-viewer). Off by
+# default — enabling it costs one extra loopback TCP listener, nothing else.
+enabled = false
+bind    = "127.0.0.1:7878"

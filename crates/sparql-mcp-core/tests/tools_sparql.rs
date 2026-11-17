@@ -1,14 +1,19 @@
 //! Integration tests — query_sparql / update_sparql application tools.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::json;
+use sparql_mcp::application::event_sink::NullEventSink;
 use sparql_mcp::application::tools::sparql::{query_sparql, update_sparql};
 use sparql_mcp::domain::SparqlStore;
 use sparql_mcp::infrastructure::OxigraphAdapter;
 
 fn store() -> Arc<dyn SparqlStore> {
     Arc::new(OxigraphAdapter::open_in_memory().unwrap())
+}
+
+fn active_graph() -> Arc<RwLock<String>> {
+    Arc::new(RwLock::new("urn:project:default".to_string()))
 }
 
 fn args(val: serde_json::Value) -> rmcp::model::JsonObject {
@@ -38,6 +43,8 @@ fn query_select_after_insert() {
     update_sparql(
         &s,
         &args(json!({"update": "INSERT DATA { <urn:a> <urn:b> <urn:c> . }"})),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
 
@@ -59,6 +66,8 @@ fn query_ask_true() {
     update_sparql(
         &s,
         &args(json!({"update": "INSERT DATA { <urn:x> a <urn:Thing> . }"})),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
     let res = query_sparql(&s, &args(json!({"query": "ASK { <urn:x> a <urn:Thing> }"}))).unwrap();
@@ -103,6 +112,8 @@ fn update_insert_returns_delta() {
     let res = update_sparql(
         &s,
         &args(json!({"update": "INSERT DATA { <urn:s> <urn:p> <urn:o> . }"})),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
     let body: serde_json::Value =
@@ -118,11 +129,15 @@ fn update_delete_returns_negative_delta() {
     update_sparql(
         &s,
         &args(json!({"update": "INSERT DATA { <urn:s> <urn:p> <urn:o> . }"})),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
     let res = update_sparql(
         &s,
         &args(json!({"update": "DELETE DATA { <urn:s> <urn:p> <urn:o> . }"})),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
     let body: serde_json::Value =
@@ -139,6 +154,8 @@ fn update_into_named_graph() {
         &args(json!({"update":
             "INSERT DATA { GRAPH <urn:g1> { <urn:s> <urn:p> <urn:o> . } }",
         })),
+        &active_graph(),
+        &NullEventSink,
     )
     .unwrap();
     let res = query_sparql(

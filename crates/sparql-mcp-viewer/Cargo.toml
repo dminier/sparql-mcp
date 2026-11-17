@@ -1,0 +1,39 @@
+[package]
+name = "sparql-mcp-viewer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sparql-mcp-viewer"
+path = "src/main.rs"
+
+[dependencies]
+sparql-mcp = { path = "../sparql-mcp-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Not a straight reuse of the core crate's tokio feature list: single-
+# threaded `rt` (not `rt-multi-thread`), `time` for the reconnect backoff,
+# `sync` for the inbox channel; no `process`, which the viewer never spawns.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+crossbeam-channel = "0.5"
+
+# Bevy is added here with only what Phase 2 (headless path, `CorePlugin`)
+# needs to compile and run `MinimalPlugins` + `ScheduleRunnerPlugin` — no
+# windowing or rendering yet. The windowing/rendering/camera/picking
+# feature list for the windowed path (Phase 3 onward) is added when that
+# code lands, verified against an actual build rather than guessed ahead
+# of time.
+bevy = { version = "=0.20.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+rmcp = { version = "1.5", default-features = false, features = ["macros"] }

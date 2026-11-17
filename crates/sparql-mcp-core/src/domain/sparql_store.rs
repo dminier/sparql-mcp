@@ -88,6 +88,45 @@ pub enum QueryResult {
     Graph(String),
 }
 
+/// What a SPARQL 1.1 Update actually changed, for event emission.
+///
+/// A ground update (`INSERT DATA` / `DELETE DATA`) names the exact triples
+/// touched, encoded as N-Triples term strings (subject, predicate, object).
+/// A pattern-based update (`INSERT/DELETE … WHERE`, `LOAD`, `CLEAR`, …)
+/// only reports aggregate counts — the literal triples bound by the
+/// pattern are not cheaply knowable.
+#[derive(Debug, Clone)]
+pub enum UpdateOutcome {
+    Ground {
+        inserted: Vec<[String; 3]>,
+        deleted: Vec<[String; 3]>,
+        triples_before: u64,
+        triples_after: u64,
+    },
+    Pattern {
+        triples_before: u64,
+        triples_after: u64,
+    },
+}
+
+impl UpdateOutcome {
+    pub fn triples_before(&self) -> u64 {
+        match self {
+            Self::Ground { triples_before, .. } | Self::Pattern { triples_before, .. } => {
+                *triples_before
+            }
+        }
+    }
+
+    pub fn triples_after(&self) -> u64 {
+        match self {
+            Self::Ground { triples_after, .. } | Self::Pattern { triples_after, .. } => {
+                *triples_after
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FileLoadResult {
     pub path: String,
@@ -97,6 +136,10 @@ pub struct FileLoadResult {
     pub skipped: bool,
     pub triples_before: u64,
     pub triples_after: u64,
+    /// Triples parsed from the file, N-Triples-encoded (empty when
+    /// `skipped` is `true`) — the exact data a `StoreEvent::Insert` for
+    /// this load reports.
+    pub triples: Vec<[String; 3]>,
 }
 
 impl FileLoadResult {
@@ -118,9 +161,23 @@ pub trait SparqlStore: Send + Sync {
     /// Run a SPARQL 1.1 Update (INSERT DATA, DELETE, CLEAR, …).
     fn update(&self, sparql: &str) -> Result<()>;
 
+    /// Run a SPARQL 1.1 Update and report what changed (see
+    /// [`UpdateOutcome`]) — used by the viewer side-channel to emit precise
+    /// events for ground updates without a full-graph diff.
+    fn update_with_outcome(&self, sparql: &str) -> Result<UpdateOutcome>;
+
     /// Parse `content` and load it into the store.
     /// Returns the number of triples added (delta).
     fn load_rdf(&self, content: &[u8], opts: LoadOpts) -> Result<u64>;
+
+    /// Same as [`Self::load_rdf`], but also returns every triple parsed
+    /// (N-Triples-encoded) — used by `load_ontology` to emit a precise
+    /// `StoreEvent::Insert`, since the payload is always ground data.
+    fn load_rdf_with_triples(
+        &self,
+        content: &[u8],
+        opts: LoadOpts,
+    ) -> Result<(u64, Vec<[String; 3]>)>;
 
     /// Load an RDF file from disk, with SHA-256 idempotence.
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult>;

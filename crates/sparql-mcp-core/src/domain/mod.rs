@@ -9,4 +9,5 @@ pub mod sparql_store;
 pub use doc_store::DocStore;
 pub use sparql_store::{
     FileLoadResult, InputFormat, LoadOpts, QueryResult, RdfTerm, SolutionSet, SparqlStore,
+    UpdateOutcome,
 };

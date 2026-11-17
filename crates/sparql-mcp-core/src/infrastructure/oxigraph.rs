@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 use crate::domain::{
     FileLoadResult, InputFormat, LoadOpts, QueryResult, RdfTerm, SolutionSet, SparqlStore,
+    UpdateOutcome,
 };
 
 // Named graph holding SHA-256 records for idempotent file loading.
@@ -72,20 +73,47 @@ impl SparqlStore for OxigraphAdapter {
         Ok(())
     }
 
-    fn load_rdf(&self, content: &[u8], opts: LoadOpts) -> Result<u64> {
+    fn update_with_outcome(&self, sparql: &str) -> Result<UpdateOutcome> {
+        // `spargebra::Update` is parsed separately (and purely) from the
+        // execution path below, just to classify the operations — the
+        // oxigraph `Update` type that `.on_store(...)` needs is deprecated
+        // for exactly this kind of inspection (see `ground_quads`).
+        let ground = spargebra::SparqlParser::new()
+            .parse_update(sparql)
+            .ok()
+            .and_then(|parsed| ground_quads(&parsed));
+
         let before = self.store.len()? as u64;
-        let format = to_oxigraph_format(opts.format);
-        let mut parser = RdfParser::from_format(format);
-        if let Some(base) = opts.base_iri {
-            parser = parser.with_base_iri(&base)?;
-        }
-        if let Some(iri) = opts.graph_iri {
-            let node = NamedNode::new(&iri)?;
-            parser = parser.with_default_graph(GraphName::NamedNode(node));
-        }
-        self.store.load_from_reader(parser, content)?;
+        SparqlEvaluator::new()
+            .parse_update(sparql)?
+            .on_store(&self.store)
+            .execute()?;
         let after = self.store.len()? as u64;
-        Ok(after.saturating_sub(before))
+
+        match ground {
+            Some((inserted, deleted)) => Ok(UpdateOutcome::Ground {
+                inserted,
+                deleted,
+                triples_before: before,
+                triples_after: after,
+            }),
+            None => Ok(UpdateOutcome::Pattern {
+                triples_before: before,
+                triples_after: after,
+            }),
+        }
+    }
+
+    fn load_rdf(&self, content: &[u8], opts: LoadOpts) -> Result<u64> {
+        self.load_rdf_impl(content, opts).map(|(delta, _)| delta)
+    }
+
+    fn load_rdf_with_triples(
+        &self,
+        content: &[u8],
+        opts: LoadOpts,
+    ) -> Result<(u64, Vec<[String; 3]>)> {
+        self.load_rdf_impl(content, opts)
     }
 
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult> {
@@ -108,10 +136,11 @@ impl SparqlStore for OxigraphAdapter {
                 skipped: true,
                 triples_before,
                 triples_after: triples_before,
+                triples: Vec::new(),
             });
         }
 
-        self.load_rdf(&bytes, opts)?;
+        let (_delta, triples) = self.load_rdf_impl(&bytes, opts)?;
         self.record_loaded_file(&sha256, &path_str)?;
         let triples_after = self.store.len()? as u64;
 
@@ -123,6 +152,7 @@ impl SparqlStore for OxigraphAdapter {
             skipped: false,
             triples_before,
             triples_after,
+            triples,
         })
     }
 
@@ -207,6 +237,33 @@ impl SparqlStore for OxigraphAdapter {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 impl OxigraphAdapter {
+    /// Parse `content` and insert it, returning both the delta and every
+    /// triple parsed (N-Triples-encoded) — `load_rdf` and
+    /// `load_rdf_with_triples` are thin wrappers around this so both stay
+    /// in sync.
+    fn load_rdf_impl(&self, content: &[u8], opts: LoadOpts) -> Result<(u64, Vec<[String; 3]>)> {
+        let before = self.store.len()? as u64;
+        let format = to_oxigraph_format(opts.format);
+        let mut parser = RdfParser::from_format(format);
+        if let Some(base) = &opts.base_iri {
+            parser = parser.with_base_iri(base)?;
+        }
+        if let Some(iri) = &opts.graph_iri {
+            let node = NamedNode::new(iri)?;
+            parser = parser.with_default_graph(GraphName::NamedNode(node));
+        }
+
+        let mut triples = Vec::new();
+        for quad in parser.for_reader(content) {
+            let quad = quad?;
+            triples.push(quad_to_triple(&quad));
+            self.store.insert(quad.as_ref())?;
+        }
+
+        let after = self.store.len()? as u64;
+        Ok((after.saturating_sub(before), triples))
+    }
+
     fn file_already_loaded(&self, hash: &str) -> Result<bool> {
         let q = format!("ASK {{ GRAPH <{META_GRAPH}> {{ ?f <{META_SHA256}> \"{hash}\" }} }}");
         match SparqlEvaluator::new()
@@ -220,11 +277,17 @@ impl OxigraphAdapter {
     }
 
     fn record_loaded_file(&self, hash: &str, path: &str) -> Result<()> {
+        // `path` is a filesystem path, not a pre-escaped Turtle literal —
+        // on native Windows it always contains `\`, which Turtle's string
+        // grammar treats as the start of an escape sequence (breaking the
+        // parse on anything but `\\`, `\"`, `\uXXXX`, …). Escape `\` and
+        // `"` before embedding it.
+        let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
         let turtle = format!(
             "@prefix meta: <urn:hkb:meta:> .\n\
              <urn:hkb:meta:file:{hash}> a <{META_FILE}> ;\n\
                  <{META_SHA256}> \"{hash}\" ;\n\
-                 <{META_PATH}> \"{path}\" .\n"
+                 <{META_PATH}> \"{escaped_path}\" .\n"
         );
         let graph_node = NamedNode::new(META_GRAPH)?;
         let parser = RdfParser::from_format(RdfFormat::Turtle)
@@ -232,6 +295,61 @@ impl OxigraphAdapter {
         self.store.load_from_reader(parser, turtle.as_bytes())?;
         Ok(())
     }
+}
+
+// ── Update classification ─────────────────────────────────────────────────────
+
+/// If `update` consists solely of ground `INSERT DATA` / `DELETE DATA`
+/// operations (no `WHERE` pattern), return the literal quads inserted and
+/// deleted, each encoded as an N-Triples term string. Any other operation
+/// (`INSERT/DELETE … WHERE`, `LOAD`, `CLEAR`, `CREATE`, `DROP`, `ADD`,
+/// `MOVE`, `COPY`) makes the whole update non-ground: `None`.
+/// (inserted triples, deleted triples), each N-Triples-encoded.
+type GroundTriples = (Vec<[String; 3]>, Vec<[String; 3]>);
+
+fn ground_quads(update: &spargebra::Update) -> Option<GroundTriples> {
+    let mut inserted = Vec::new();
+    let mut deleted = Vec::new();
+    for op in &update.operations {
+        match op {
+            // `INSERT DATA` allows blank nodes (`spargebra::term::Quad`);
+            // `DELETE DATA` forbids them per the SPARQL 1.1 grammar, so
+            // spargebra gives it the narrower `GroundQuad` type instead —
+            // both have the same `subject`/`predicate`/`object` shape.
+            spargebra::GraphUpdateOperation::InsertData { data } => {
+                inserted.extend(data.iter().map(|q| {
+                    [
+                        q.subject.to_string(),
+                        q.predicate.to_string(),
+                        q.object.to_string(),
+                    ]
+                }));
+            }
+            spargebra::GraphUpdateOperation::DeleteData { data } => {
+                deleted.extend(data.iter().map(|q| {
+                    [
+                        q.subject.to_string(),
+                        q.predicate.to_string(),
+                        q.object.to_string(),
+                    ]
+                }));
+            }
+            _ => return None,
+        }
+    }
+    Some((inserted, deleted))
+}
+
+/// Render an RDF-parser quad's subject/predicate/object as N-Triples term
+/// strings (`Display` on Oxigraph's term types already produces this
+/// syntax — see `convert_query_results`'s `Graph` branch above for the
+/// same pattern).
+fn quad_to_triple(q: &oxigraph::model::Quad) -> [String; 3] {
+    [
+        q.subject.to_string(),
+        q.predicate.to_string(),
+        q.object.to_string(),
+    ]
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────

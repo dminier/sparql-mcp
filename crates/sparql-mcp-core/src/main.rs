@@ -1,15 +1,17 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use sparql_mcp::application::BroadcastEventSink;
 use sparql_mcp::cbm::{db as cbm_db, turtle as cbm_turtle};
 use sparql_mcp::config::{Config, McpServer, DEFAULT_CONFIG_FILE, DEFAULT_MCP_JSON_FILE};
 use sparql_mcp::domain::{InputFormat, LoadOpts, SparqlStore};
-use sparql_mcp::infrastructure::{FsDocStore, OxigraphAdapter};
+use sparql_mcp::infrastructure::{spawn_viewer_channel, FsDocStore, OxigraphAdapter};
 use sparql_mcp::mcp::{client, importer, server::SparqlMcpServer};
 
 #[derive(Parser)]
@@ -351,14 +353,34 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve => {
             let doc_store = Arc::new(FsDocStore::new(docs_path));
-            let srv = SparqlMcpServer::new(
-                store,
+            let active_graph = Arc::new(RwLock::new(cli.active_graph));
+
+            let mut srv = SparqlMcpServer::new(
+                store.clone(),
                 doc_store,
                 ontology_path,
-                cli.active_graph,
+                active_graph.clone(),
                 cfg.gdrive.clone(),
                 store_path.clone(),
             );
+
+            if let Some(viewer) = cfg.viewer.clone().filter(|v| v.enabled) {
+                match viewer.bind.parse::<SocketAddr>() {
+                    Ok(bind) => {
+                        let (tx, rx) = tokio::sync::broadcast::channel(1024);
+                        srv = srv.with_event_sink(Arc::new(BroadcastEventSink(tx)));
+                        tokio::spawn(spawn_viewer_channel(bind, store, active_graph, rx));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bind = %viewer.bind,
+                            error = %e,
+                            "invalid [viewer] bind address; starting without the viewer side-channel"
+                        );
+                    }
+                }
+            }
+
             srv.serve_stdio().await?;
         }
         Cmd::Install { .. } => unreachable!("handled above"),

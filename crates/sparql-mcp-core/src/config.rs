@@ -62,6 +62,10 @@ pub struct Config {
     /// Google Drive sync configuration.
     #[serde(default)]
     pub gdrive: Option<GDriveConfig>,
+
+    /// Live 3D viewer side-channel configuration.
+    #[serde(default)]
+    pub viewer: Option<ViewerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -88,6 +92,27 @@ pub struct McpServer {
 
 fn default_backup_retain() -> usize { 5 }
 fn default_true() -> bool { true }
+
+fn default_viewer_bind() -> String {
+    "127.0.0.1:7878".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_viewer_bind")]
+    pub bind: String,
+}
+
+impl Default for ViewerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_viewer_bind(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GDriveConfig {
@@ -211,5 +236,28 @@ sync_on_render = false
         assert_eq!(gd.backup_retain, 5);
         assert!(gd.sync_on_render);
         assert!(gd.folder_id.is_none());
+    }
+
+    #[test]
+    fn viewer_config_deserializes() {
+        let toml = "[viewer]\nenabled = true\nbind = \"127.0.0.1:9000\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let viewer = cfg.viewer.expect("viewer section present");
+        assert!(viewer.enabled);
+        assert_eq!(viewer.bind, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn viewer_config_defaults_when_absent() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.viewer.is_none());
+    }
+
+    #[test]
+    fn viewer_config_default_bind() {
+        let toml = "[viewer]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let viewer = cfg.viewer.unwrap();
+        assert_eq!(viewer.bind, "127.0.0.1:7878");
     }
 }

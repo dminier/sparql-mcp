@@ -3,7 +3,7 @@
 //! Projects are `smc:Project` instances in the `<urn:meta>` named graph.
 //! Each project owns a named graph `<urn:project:ID>`.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
@@ -143,12 +143,16 @@ pub fn project_list(store: &Arc<dyn SparqlStore>) -> Result<CallToolResult, McpE
 }
 
 pub fn project_switch(
-    _store: &Arc<dyn SparqlStore>,
+    active_graph: &Arc<RwLock<String>>,
     args: &JsonObject,
 ) -> Result<CallToolResult, McpError> {
     let id = require_str(args, "id")?;
     validate_id(id)?;
     let graph_iri = format!("urn:project:{id}");
+    *active_graph
+        .write()
+        .map_err(|_| McpError::internal_error("active_graph lock poisoned", None))? =
+        graph_iri.clone();
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&json!({
             "status": "ok",
