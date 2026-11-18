@@ -51,6 +51,11 @@ struct Args {
     /// project and `project_switch` to it. Example: `--show-only Database`.
     #[arg(long)]
     show_only: Option<String>,
+    /// After the scenario, drive a connected viewer through the `viewer_*`
+    /// tools: highlight, isolate and select nodes, hide a class, then give
+    /// the user's view back. Start `sparql-mcp-viewer` first.
+    #[arg(long)]
+    viewer_demo: bool,
 }
 
 const GRAPH: &str = "urn:project:e2e";
@@ -485,6 +490,144 @@ async fn main() -> Result<()> {
             "  the viewer now shows {shown} {class} instances (of {} in the whole graph)",
             args.instances
         );
+    }
+
+    // ── 9. Drive a connected viewer through the viewer_* tools.
+    if args.viewer_demo {
+        println!("\n[9] viewer control");
+        // The viewer connects on its own; give it a moment if it was just started.
+        let mut status = Value::Null;
+        for _ in 0..40 {
+            let (_, body) = call(&svc, "viewer_status", json!({})).await?;
+            if body["viewer"] == "connected" {
+                status = body;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        checks.check(
+            "a viewer is connected",
+            status["viewer"] == "connected",
+            || "no viewer connected within 20 s: start sparql-mcp-viewer first".to_string(),
+        );
+        if status["viewer"] == "connected" {
+            println!(
+                "  the viewer shows {} nodes, {} edges",
+                status["result"]["nodes"], status["result"]["edges"]
+            );
+            let show_pause = pause.max(Duration::from_millis(2500));
+            let epoch = status["user"]["epoch"].as_u64().unwrap_or(0);
+
+            // Databases are every fourth instance (see step 4).
+            let dbs: Vec<String> = (0..args.instances)
+                .filter(|i| i % 4 == 1)
+                .take(8)
+                .map(|i| format!("{NS}n{i}"))
+                .collect();
+            // The camera: back out to see everything, then the databases below.
+            let (err, body) = call(
+                &svc,
+                "viewer_camera",
+                json!({ "action": "frame_all", "duration_ms": 1200 }),
+            )
+            .await?;
+            checks.check(
+                "frame everything",
+                !err && body["applied"] == true && body["result"]["camera_moved"] == true,
+                || short(&body),
+            );
+            println!("  framed everything: {}", short(&body["result"]["camera"]));
+            tokio::time::sleep(show_pause).await;
+
+            let (err, body) = call(
+                &svc,
+                "viewer_show",
+                json!({
+                "iris": dbs, "mode": "highlight", "focus": true, "if_user_epoch": epoch }),
+            )
+            .await?;
+            checks.check(
+                "highlight eight databases",
+                !err && body["applied"] == true && body["result"]["shown"] == dbs.len(),
+                || short(&body),
+            );
+            println!(
+                "  highlighted {} nodes (cyan): {}",
+                body["result"]["shown"],
+                short(&body["result"])
+            );
+            tokio::time::sleep(show_pause).await;
+
+            let (err, body) = call(
+                &svc,
+                "viewer_show",
+                json!({
+                "iris": dbs, "mode": "isolate", "select": dbs[0], "focus": false }),
+            )
+            .await?;
+            checks.check(
+                "isolate them and select the first",
+                !err && body["applied"] == true,
+                || short(&body),
+            );
+            println!("  isolated them and selected {}", dbs[0]);
+            tokio::time::sleep(show_pause).await;
+
+            let (err, body) = call(
+                &svc,
+                "viewer_show",
+                json!({
+                "iris": [format!("{NS}no-such-node")], "focus": false }),
+            )
+            .await?;
+            checks.check(
+                "a node that is not drawn changes nothing",
+                !err && body["applied"] == false,
+                || short(&body),
+            );
+            println!("  asked for a node that is not drawn: {}", body["reason"]);
+
+            let (err, body) = call(
+                &svc,
+                "viewer_filter",
+                json!({
+                "hide_classes": [format!("{NS}Service")], "show_untyped": false }),
+            )
+            .await?;
+            checks.check(
+                "hide the Service class",
+                !err && body["applied"] == true,
+                || short(&body),
+            );
+            println!("  hid Service: hidden={}", body["result"]["hidden_classes"]);
+            tokio::time::sleep(show_pause).await;
+
+            // A command written for an epoch the user has moved past is refused.
+            let (_, body) = call(&svc, "viewer_status", json!({})).await?;
+            println!("  user: {}", body["user"]);
+
+            let (err, body) = call(
+                &svc,
+                "viewer_camera",
+                json!({ "action": "zoom", "factor": 2.0, "duration_ms": 1000 }),
+            )
+            .await?;
+            checks.check("zoom in", !err && body["applied"] == true, || short(&body));
+            println!("  zoomed in: {}", short(&body["result"]["camera"]));
+            tokio::time::sleep(show_pause).await;
+
+            let (err, body) = call(&svc, "viewer_clear", json!({ "restore": true })).await?;
+            checks.check(
+                "clear and give the user's view back",
+                !err && body["result"]["restored"] == true,
+                || short(&body),
+            );
+            println!(
+                "  cleared, and restored your view: {}",
+                short(&body["result"])
+            );
+            tokio::time::sleep(show_pause).await;
+        }
     }
 
     if args.hold_secs > 0 {

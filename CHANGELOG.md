@@ -85,6 +85,12 @@ of domain-specific content.
   something up; the activity feed lists what the agent did; the response's `user` block says
   whether the user is active and how many times they changed the view, and `if_user_epoch` refuses a
   stale command (`user_changed`). A headless viewer answers `unsupported_headless`.
+- **Viewer control, phase 3.** `viewer_camera` (`frame_all`, `frame` some IRIs, `zoom`; animated, 600 ms
+  by default) and `viewer_show` with `focus` (the default) now move the camera. The user always wins:
+  while they orbit, pan or zoom, or press `F`, a move in progress is dropped without writing the
+  camera again, a new one is refused (`user_controlling_camera`), and it counts in `user.epoch`.
+  Restoring the user's view (`Esc`, the chip, `viewer_clear` with `restore`) flies the camera back to
+  where it was. `F` now frames the graph through the same path. `viewer_status` reports the camera pose.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 

@@ -93,7 +93,7 @@ resyncs from a fresh snapshot.
 | Right drag | Orbit |
 | Left drag | Pan |
 | Mouse wheel | Zoom |
-| `F` | Frame the whole graph |
+| `F` | Frame the whole graph (this also stops any move the agent has under way) |
 | Click a node | Select it: label, IRI (with a copy button), attributes, incoming and outgoing edges |
 | Click an edge in the panel | Select the node at its other end |
 | `Escape` | One step per press: clear the selection; else give back the view the agent changed; else clear the agent's highlight |
@@ -113,8 +113,10 @@ With `[viewer] enabled` the server's `viewer_*` tools reach this viewer over the
     `agent filter`, `agent clear` or `agent restore`.
 
 The agent never locks the interface. What you change is counted (`user.epoch`) and reported to the
-agent, which is told to pass it back so that it does not overwrite your last move. Camera moves,
-search and screenshots are not built yet. A `--headless` viewer answers `status` and refuses the rest.
+agent, which is told to pass it back so that it does not overwrite your last move. The camera is moved by the
+agent with an eased animation (`viewer_camera`, and `viewer_show` with `focus`); the moment you orbit,
+pan, zoom or press `F`, the animation stops and the agent is told. Search and screenshots are not
+built yet. A `--headless` viewer answers `status` and refuses the rest.
 
 ## Security
 

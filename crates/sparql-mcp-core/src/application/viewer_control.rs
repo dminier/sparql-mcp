@@ -19,6 +19,16 @@ use serde_json::Value;
 pub enum ViewerOp {
     /// What the viewer shows now: graph, counts, camera, selection, filter.
     Status {},
+    /// Move the camera: frame everything, frame some nodes, or zoom.
+    Camera {
+        action: CameraAction,
+        iris: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        factor: Option<f64>,
+        duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        if_user_epoch: Option<u64>,
+    },
     /// Highlight nodes (or isolate them), and select one.
     Show {
         iris: Vec<String>,
@@ -43,6 +53,18 @@ pub enum ViewerOp {
     },
 }
 
+/// What `camera` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraAction {
+    /// Frame every node.
+    FrameAll,
+    /// Frame the nodes named in `iris`.
+    Frame,
+    /// Move closer or farther along the line of sight, by `factor`.
+    Zoom,
+}
+
 /// How `show` marks its nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,7 +81,13 @@ impl ViewerOp {
     pub fn is_idempotent(&self) -> bool {
         // Each of these sets a state rather than changing it by an amount.
         match self {
+            // A zoom is relative to where the camera is now: repeating it zooms again.
+            ViewerOp::Camera {
+                action: CameraAction::Zoom,
+                ..
+            } => false,
             ViewerOp::Status {}
+            | ViewerOp::Camera { .. }
             | ViewerOp::Show { .. }
             | ViewerOp::Clear { .. }
             | ViewerOp::Filter { .. } => true,
@@ -179,6 +207,44 @@ mod tests {
         .unwrap();
         assert_eq!(filter["args"]["show_untyped"], false);
         assert!(filter["args"].get("if_user_epoch").is_none());
+    }
+
+    #[test]
+    fn a_camera_op_serializes_and_only_a_zoom_is_not_repeatable() {
+        let frame = ViewerOp::Camera {
+            action: CameraAction::Frame,
+            iris: vec!["http://e/a".into()],
+            factor: None,
+            duration_ms: 600,
+            if_user_epoch: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({ "op": "camera", "args": {
+                "action": "frame", "iris": ["http://e/a"], "duration_ms": 600 } })
+        );
+        assert!(frame.is_idempotent());
+        let all = ViewerOp::Camera {
+            action: CameraAction::FrameAll,
+            iris: vec![],
+            factor: None,
+            duration_ms: 0,
+            if_user_epoch: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&all).unwrap()["args"]["action"],
+            "frame_all"
+        );
+        assert!(all.is_idempotent());
+        let zoom = ViewerOp::Camera {
+            action: CameraAction::Zoom,
+            iris: vec![],
+            factor: Some(2.0),
+            duration_ms: 600,
+            if_user_epoch: Some(3),
+        };
+        assert!(!zoom.is_idempotent(), "a retried zoom would zoom twice");
+        assert_eq!(serde_json::to_value(&zoom).unwrap()["args"]["factor"], 2.0);
     }
 
     #[test]

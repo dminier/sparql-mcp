@@ -325,4 +325,18 @@ async fn the_core_reads_the_status_of_a_real_headless_viewer_and_sees_its_own_wr
         ViewerOutcome::Rejected { code, .. } => assert_eq!(code, "unsupported_headless"),
         other => panic!("{other:?}"),
     }
+    let camera = ViewerOp::Camera {
+        action: sparql_mcp::application::viewer_control::CameraAction::FrameAll,
+        iris: vec![],
+        factor: None,
+        duration_ms: 0,
+        if_user_epoch: None,
+    };
+    match hub
+        .request(camera, Instant::now() + Duration::from_secs(5))
+        .await
+    {
+        ViewerOutcome::Rejected { code, .. } => assert_eq!(code, "unsupported_headless"),
+        other => panic!("{other:?}"),
+    }
 }

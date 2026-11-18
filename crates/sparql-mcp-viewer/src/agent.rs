@@ -26,10 +26,17 @@ use bevy::prelude::*;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
+use bevy::camera_controller::pan_orbit_camera::prelude::PanOrbitCamera;
+
+use crate::camera::{
+    bounding_sphere, estimate_look_at, fov_of, frame_pose, zoom_pose, CameraFocus, CameraMove,
+    CameraPose, PendingCameraMove, SceneCamera,
+};
 use crate::connection::{AgentRequest, AgentResponse, ConnState, ViewerMsg};
 use crate::graph::ViewerGraph;
 use crate::ingest::{ActivityFeed, AgentFeedOp, FeedKind};
 use crate::interact::{filter_entries, ClassFilter, Selection};
+use crate::layout::LayoutState;
 use crate::plugin::{ConnStatus, CoreSet, FrameMessages};
 
 /// The user counts as active for this long after the last input.
@@ -156,6 +163,12 @@ impl UserActivityTracker {
         }
     }
 
+    /// The user moved the camera (an orbit, a pan, a zoom, or `F`).
+    pub fn user_camera_moved(&mut self) {
+        self.epoch += 1;
+        self.overrode = true;
+    }
+
     /// The agent wrote `view`: that is not the user's doing.
     pub fn agent_wrote(&mut self, view: &ViewState) {
         self.known = Some(view.clone());
@@ -186,34 +199,75 @@ impl UserActivityTracker {
 #[derive(Resource, Default, Debug)]
 pub struct UserViewCheckpoint {
     pub saved: Option<ViewState>,
+    /// Where the camera was, if an agent command has moved it since.
+    pub camera: Option<Transform>,
 }
 
 impl UserViewCheckpoint {
     /// Save the view before an agent command changes it, unless the agent has
     /// been the only one changing it since the last save.
-    pub fn save_before_agent_change(&mut self, tracker: &UserActivityTracker, view: ViewState) {
+    ///
+    /// `camera` is the camera's pose when the command is about to move it. The
+    /// pose is kept only if the user's own pose is still what the camera has
+    /// (nothing of the agent's has moved it since the last save).
+    pub fn save_before_agent_change(
+        &mut self,
+        tracker: &UserActivityTracker,
+        view: ViewState,
+        camera: Option<Transform>,
+    ) {
         if self.saved.is_none() || tracker.user_moved_since_agent() {
             self.saved = Some(view);
+            self.camera = camera;
+        } else if self.camera.is_none() {
+            self.camera = camera;
         }
     }
 }
 
+/// What a restore gave back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Restored {
+    /// There was a restore point.
+    pub had_checkpoint: bool,
+    /// The pose to move the camera back to, if an agent command had moved it.
+    pub camera: Option<Transform>,
+}
+
+/// How long the camera takes to go back when the user's view is restored.
+pub const RESTORE_MS: u64 = 600;
+
+impl Restored {
+    /// The camera move that puts the camera back, if there is one.
+    pub fn camera_move(&self) -> Option<CameraMove> {
+        self.camera.map(|end| CameraMove {
+            end,
+            look_at: None,
+            duration_ms: RESTORE_MS,
+        })
+    }
+}
+
 /// Give the user's view back: drop the highlight, and return the selection and
-/// the filter to what the checkpoint holds. Consumes the checkpoint. Returns
-/// whether there was one.
+/// the filter to what the checkpoint holds. Consumes the checkpoint. The camera
+/// is not touched here: the pose to go back to is in the result.
 pub fn restore_view(
     selection: &mut Selection,
     filter: &mut ClassFilter,
     highlight: &mut AgentHighlight,
     checkpoint: &mut UserViewCheckpoint,
-) -> bool {
+) -> Restored {
     highlight.terms.clear();
+    let camera = checkpoint.camera.take();
     match checkpoint.saved.take() {
         Some(view) => {
             view.apply(selection, filter);
-            true
+            Restored {
+                had_checkpoint: true,
+                camera,
+            }
         }
-        None => false,
+        None => Restored::default(),
     }
 }
 
@@ -334,13 +388,71 @@ pub struct Ctx<'a> {
     pub highlight: &'a mut AgentHighlight,
     pub tracker: &'a mut UserActivityTracker,
     pub checkpoint: &'a mut UserViewCheckpoint,
+    /// The scene camera, when there is one (a viewer with a window).
+    pub camera: Option<CameraView<'a>>,
     pub now: Instant,
+}
+
+/// What the camera commands need to know, as plain values.
+pub struct CameraView<'a> {
+    pub transform: Transform,
+    pub fov_y: f32,
+    /// The user is orbiting, panning or zooming right now.
+    pub user_controlled: bool,
+    /// The point the viewer last framed, if the user has not moved since.
+    pub focus: Option<Vec3>,
+    /// Where each node is, by node id.
+    pub positions: &'a [Vec3],
+}
+
+impl CameraView<'_> {
+    fn all_positions(&self, graph: &ViewerGraph) -> Vec<Vec3> {
+        graph
+            .nodes
+            .iter()
+            .zip(self.positions)
+            .filter(|(node, _)| node.is_some())
+            .map(|(_, p)| *p)
+            .collect()
+    }
+
+    fn positions_of(&self, graph: &ViewerGraph, terms: &[String]) -> Vec<Vec3> {
+        terms
+            .iter()
+            .filter_map(|t| graph.index.get(t))
+            .filter_map(|id| self.positions.get(id.0 as usize).copied())
+            .collect()
+    }
+
+    /// The pose the camera has now.
+    fn pose(&self, graph: &ViewerGraph) -> CameraPose {
+        let centre = bounding_sphere(&self.all_positions(graph)).map(|(c, _)| c);
+        CameraPose {
+            position: self.transform.translation,
+            look_at: estimate_look_at(&self.transform, self.focus, centre),
+        }
+    }
+}
+
+fn vec3_json(v: Vec3) -> Value {
+    json!([v.x, v.y, v.z])
+}
+
+/// A pose as the answers show it.
+fn pose_json(pose: CameraPose) -> Value {
+    json!({
+        "position": vec3_json(pose.position),
+        "look_at": vec3_json(pose.look_at),
+        "distance": pose.distance(),
+    })
 }
 
 /// The answer, and what to show in the activity feed.
 pub struct Handled {
     pub response: AgentResponse,
     pub feed: Option<(AgentFeedOp, u64)>,
+    /// A camera move to start.
+    pub camera_move: Option<CameraMove>,
 }
 
 impl Handled {
@@ -348,6 +460,7 @@ impl Handled {
         Self {
             response,
             feed: None,
+            camera_move: None,
         }
     }
 
@@ -355,7 +468,13 @@ impl Handled {
         Self {
             response,
             feed: Some((op, count)),
+            camera_move: None,
         }
+    }
+
+    fn moving(mut self, camera_move: Option<CameraMove>) -> Self {
+        self.camera_move = camera_move;
+        self
     }
 }
 
@@ -411,12 +530,18 @@ pub fn handle_windowed(request: &AgentRequest, ctx: &mut Ctx) -> Handled {
                 "mode": ctx.highlight.mode.name(),
                 "count": ctx.highlight.terms.len(),
             });
-            result["has_restore_point"] = json!(ctx.checkpoint.saved.is_some());
+            result["has_restore_point"] =
+                json!(ctx.checkpoint.saved.is_some() || ctx.checkpoint.camera.is_some());
+            if let Some(cam) = &ctx.camera {
+                result["camera"] = pose_json(cam.pose(ctx.graph));
+                result["camera"]["user_controlling"] = json!(cam.user_controlled);
+            }
             Handled::answer(AgentResponse::ok(request.id, result, user))
         }
         "show" => show(request, ctx, user),
         "clear" => clear(request, ctx, user),
         "filter" => filter(request, ctx, user),
+        "camera" => camera(request, ctx, user),
         other => Handled::answer(AgentResponse::err(
             request.id,
             "unknown_op",
@@ -463,15 +588,45 @@ fn show(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
         }
     }
 
+    // The camera: frame what is shown, unless the user has it.
+    let mut camera_note: Option<&str> = None;
+    let mut camera_move = None;
+    let mut pose = None;
+    if focus {
+        match &ctx.camera {
+            None => camera_note = Some("camera_unavailable: this viewer has no camera"),
+            Some(cam) if cam.user_controlled => {
+                camera_note = Some("user_controlling_camera: the user is moving the camera");
+            }
+            Some(cam) => match frame_pose(
+                cam.transform.back().as_vec3(),
+                &cam.positions_of(ctx.graph, &found),
+                cam.fov_y,
+            ) {
+                Some(p) => {
+                    pose = Some(p);
+                    camera_move = Some(CameraMove::to(p, DEFAULT_MOVE_MS));
+                }
+                None => camera_note = Some("camera_not_moved: the nodes have no position yet"),
+            },
+        }
+    }
+
     // Everything is checked: now change things.
-    if select.is_some() {
+    if select.is_some() || camera_move.is_some() {
         let before = ViewState::capture(ctx.selection, ctx.filter);
-        ctx.checkpoint.save_before_agent_change(ctx.tracker, before);
+        let from = camera_move
+            .as_ref()
+            .and_then(|_| ctx.camera.as_ref().map(|c| c.transform));
+        ctx.checkpoint
+            .save_before_agent_change(ctx.tracker, before, from);
     }
     ctx.highlight.terms = found.iter().cloned().collect();
     ctx.highlight.mode = mode;
     if let Some(term) = &select {
         ctx.selection.0 = Some(term.clone());
+    }
+    if select.is_some() || camera_move.is_some() {
         ctx.tracker
             .agent_wrote(&ViewState::capture(ctx.selection, ctx.filter));
     }
@@ -481,26 +636,23 @@ fn show(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
         "missing": listed(&missing),
         "missing_count": missing.len(),
         "mode": mode.name(),
-        "camera_moved": false,
+        "camera_moved": camera_move.is_some(),
     });
     if let Some(term) = &select {
         result["selected"] = json!(iri_of(term));
     }
-    let response = if focus {
-        AgentResponse::ok_with_reason(
-            request.id,
-            result,
-            user,
-            "camera_not_moved: this build has no camera control yet",
-        )
-    } else {
-        AgentResponse::ok(request.id, result, user)
+    if let Some(p) = pose {
+        result["camera"] = pose_json(p);
+    }
+    let response = match camera_note {
+        Some(note) => AgentResponse::ok_with_reason(request.id, result, user, note),
+        None => AgentResponse::ok(request.id, result, user),
     };
     let op = match mode {
         HighlightMode::Highlight => AgentFeedOp::Highlight,
         HighlightMode::Isolate => AgentFeedOp::Isolate,
     };
-    Handled::with_feed(response, op, found.len() as u64)
+    Handled::with_feed(response, op, found.len() as u64).moving(camera_move)
 }
 
 fn clear(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
@@ -515,17 +667,29 @@ fn clear(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
         return Handled::with_feed(
             AgentResponse::ok(
                 request.id,
-                json!({ "cleared": had_highlight, "restored": false }),
+                json!({ "cleared": had_highlight, "restored": false, "camera_restored": false }),
                 user,
             ),
             AgentFeedOp::Clear,
             0,
         );
     }
-    let restored = restore_view(ctx.selection, ctx.filter, ctx.highlight, ctx.checkpoint);
+    let back = restore_view(ctx.selection, ctx.filter, ctx.highlight, ctx.checkpoint);
     ctx.tracker
         .agent_wrote(&ViewState::capture(ctx.selection, ctx.filter));
-    let result = json!({ "cleared": had_highlight, "restored": restored });
+    // The camera goes back too, unless the user has it in their hands.
+    let user_has_camera = ctx.camera.as_ref().is_some_and(|c| c.user_controlled);
+    let camera_move = if user_has_camera || ctx.camera.is_none() {
+        None
+    } else {
+        back.camera_move()
+    };
+    let restored = back.had_checkpoint;
+    let result = json!({
+        "cleared": had_highlight,
+        "restored": restored,
+        "camera_restored": camera_move.is_some(),
+    });
     let response = if restored {
         AgentResponse::ok(request.id, result, user)
     } else {
@@ -536,7 +700,111 @@ fn clear(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
             "no_restore_point: the agent had not changed the user's view",
         )
     };
-    Handled::with_feed(response, AgentFeedOp::Restore, 0)
+    Handled::with_feed(response, AgentFeedOp::Restore, 0).moving(camera_move)
+}
+
+/// How long a move takes when nobody says.
+pub const DEFAULT_MOVE_MS: u64 = 600;
+
+fn camera(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
+    if let Some(refusal) = stale(request, ctx.tracker) {
+        return Handled::answer(refusal);
+    }
+    let Some(cam) = ctx.camera.as_ref() else {
+        return Handled::answer(AgentResponse::err(
+            request.id,
+            "unsupported_headless",
+            "this viewer has no camera",
+        ));
+    };
+    if cam.user_controlled {
+        return Handled::answer(AgentResponse::err(
+            request.id,
+            "user_controlling_camera",
+            "the user is moving the camera; nothing was moved",
+        ));
+    }
+    let args = &request.args;
+    let duration_ms = args
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MOVE_MS);
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let back = cam.transform.back().as_vec3();
+    let (pose, framed) = match action {
+        "frame_all" => match frame_pose(back, &cam.all_positions(ctx.graph), cam.fov_y) {
+            Some(p) => (p, ctx.graph.index.len()),
+            None => {
+                return Handled::answer(AgentResponse::err(
+                    request.id,
+                    "nothing_drawn",
+                    "there is nothing to frame",
+                ))
+            }
+        },
+        "frame" => {
+            let iris = args_strings(args, "iris");
+            let (found, missing) = resolve_iris(ctx.graph, &iris);
+            if found.is_empty() {
+                return Handled::answer(AgentResponse::err(
+                    request.id,
+                    "not_drawn",
+                    &format!(
+                        "none of the {} IRIs is drawn (for example {:?}); the camera did not move",
+                        iris.len(),
+                        missing.first().map(String::as_str).unwrap_or("")
+                    ),
+                ));
+            }
+            match frame_pose(back, &cam.positions_of(ctx.graph, &found), cam.fov_y) {
+                Some(p) => (p, found.len()),
+                None => {
+                    return Handled::answer(AgentResponse::err(
+                        request.id,
+                        "nothing_drawn",
+                        "the nodes have no position yet",
+                    ))
+                }
+            }
+        }
+        "zoom" => {
+            let factor = args.get("factor").and_then(Value::as_f64).unwrap_or(0.0);
+            if !(factor.is_finite() && factor > 0.0) {
+                return Handled::answer(AgentResponse::err(
+                    request.id,
+                    "invalid_argument",
+                    "zoom needs a factor above 0",
+                ));
+            }
+            (zoom_pose(cam.pose(ctx.graph), factor as f32), 0)
+        }
+        other => {
+            return Handled::answer(AgentResponse::err(
+                request.id,
+                "invalid_argument",
+                &format!("unknown camera action {other:?}"),
+            ))
+        }
+    };
+
+    let from = cam.transform;
+    ctx.checkpoint.save_before_agent_change(
+        ctx.tracker,
+        ViewState::capture(ctx.selection, ctx.filter),
+        Some(from),
+    );
+    ctx.tracker
+        .agent_wrote(&ViewState::capture(ctx.selection, ctx.filter));
+    let mut result = json!({
+        "camera": pose_json(pose),
+        "duration_ms": duration_ms,
+        "camera_moved": true,
+    });
+    if framed > 0 {
+        result["framed"] = json!(framed);
+    }
+    Handled::answer(AgentResponse::ok(request.id, result, user))
+        .moving(Some(CameraMove::to(pose, duration_ms)))
 }
 
 fn filter(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
@@ -558,7 +826,8 @@ fn filter(request: &AgentRequest, ctx: &mut Ctx, user: Value) -> Handled {
     let (mut unknown, mut changed) = (Vec::new(), 0u64);
 
     let before = ViewState::capture(ctx.selection, ctx.filter);
-    ctx.checkpoint.save_before_agent_change(ctx.tracker, before);
+    ctx.checkpoint
+        .save_before_agent_change(ctx.tracker, before, None);
     if reset {
         ctx.filter.hidden.clear();
         ctx.filter.show_untyped = true;
@@ -645,7 +914,13 @@ pub fn handle_agent_requests(
     mut tracker: ResMut<UserActivityTracker>,
     mut checkpoint: ResMut<UserViewCheckpoint>,
     mut feed: ResMut<ActivityFeed>,
+    layout: Option<Res<LayoutState>>,
+    focus: Res<CameraFocus>,
+    camera: Query<(&Transform, &Projection, &PanOrbitCamera), With<SceneCamera>>,
+    mut pending: ResMut<PendingCameraMove>,
 ) {
+    let cam = camera.single().ok();
+    let positions: &[Vec3] = layout.as_deref().map_or(&[], |l| l.pos.as_slice());
     for msg in &frame.0 {
         let ViewerMsg::Request(request) = msg else {
             continue;
@@ -661,9 +936,19 @@ pub fn handle_agent_requests(
                 highlight: &mut highlight,
                 tracker: &mut tracker,
                 checkpoint: &mut checkpoint,
+                camera: cam.map(|(transform, projection, controller)| CameraView {
+                    transform: *transform,
+                    fov_y: fov_of(projection),
+                    user_controlled: controller.current_motion.is_user_controlled(),
+                    focus: focus.look_at,
+                    positions,
+                }),
                 now: Instant::now(),
             },
         );
+        if let Some(mv) = handled.camera_move {
+            pending.0 = Some(mv);
+        }
         if let Some((op, count)) = handled.feed {
             feed.push(FeedKind::Agent(op), count);
         }
@@ -674,6 +959,7 @@ pub fn handle_agent_requests(
 /// Notices what the user does: input (for `user.active`), and any change to the
 /// selection or the filter that the agent did not make (for `user.epoch`).
 /// Runs before the agent's systems, so a request sees the user's latest move.
+#[allow(clippy::too_many_arguments)]
 pub fn track_user_changes(
     selection: Res<Selection>,
     filter: Res<ClassFilter>,
@@ -682,8 +968,10 @@ pub fn track_user_changes(
     buttons: Option<Res<ButtonInput<MouseButton>>>,
     motion: Option<Res<bevy::input::mouse::AccumulatedMouseMotion>>,
     scroll: Option<Res<bevy::input::mouse::AccumulatedMouseScroll>>,
+    camera: Query<&PanOrbitCamera, With<SceneCamera>>,
+    mut was_moving: Local<bool>,
 ) {
-    let input = keys.is_some_and(|k| {
+    let input = keys.as_ref().is_some_and(|k| {
         k.get_just_pressed().next().is_some() || k.get_just_released().next().is_some()
     }) || buttons.is_some_and(|b| {
         b.get_pressed().next().is_some() || b.get_just_released().next().is_some()
@@ -692,6 +980,14 @@ pub fn track_user_changes(
     if input {
         tracker.note_input(Instant::now());
     }
+    // The user takes the camera (the start of an orbit, a pan or a zoom), or
+    // frames the graph with `F`: either is a change the agent should know of.
+    let moving = camera.iter().any(|c| c.current_motion.is_user_controlled());
+    let framed = keys.as_ref().is_some_and(|k| k.just_pressed(KeyCode::KeyF));
+    if (moving && !*was_moving) || framed {
+        tracker.user_camera_moved();
+    }
+    *was_moving = moving;
     if selection.is_changed() || filter.is_changed() || tracker.is_added() {
         tracker.observe(&ViewState::capture(&selection, &filter));
     }
@@ -705,6 +1001,7 @@ pub fn escape_chain(
     mut filter: ResMut<ClassFilter>,
     mut highlight: ResMut<AgentHighlight>,
     mut checkpoint: ResMut<UserViewCheckpoint>,
+    mut pending: ResMut<PendingCameraMove>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
         return;
@@ -712,7 +1009,8 @@ pub fn escape_chain(
     match escape_step(&selection, &checkpoint, &highlight) {
         EscapeStep::ClearSelection => selection.0 = None,
         EscapeStep::Restore => {
-            restore_view(&mut selection, &mut filter, &mut highlight, &mut checkpoint);
+            let back = restore_view(&mut selection, &mut filter, &mut highlight, &mut checkpoint);
+            pending.0 = back.camera_move();
         }
         EscapeStep::ClearHighlight => highlight.terms.clear(),
         EscapeStep::Nothing => {}
@@ -752,8 +1050,11 @@ fn spawn_restore_chip(mut commands: Commands) {
              mut selection: ResMut<Selection>,
              mut filter: ResMut<ClassFilter>,
              mut highlight: ResMut<AgentHighlight>,
-             mut checkpoint: ResMut<UserViewCheckpoint>| {
-                restore_view(&mut selection, &mut filter, &mut highlight, &mut checkpoint);
+             mut checkpoint: ResMut<UserViewCheckpoint>,
+             mut pending: ResMut<PendingCameraMove>| {
+                let back =
+                    restore_view(&mut selection, &mut filter, &mut highlight, &mut checkpoint);
+                pending.0 = back.camera_move();
             },
         );
 }
@@ -763,11 +1064,12 @@ fn update_restore_chip(
     checkpoint: Res<UserViewCheckpoint>,
     mut chip: Query<&mut Visibility, With<RestoreChip>>,
 ) {
-    let wanted = if highlight.is_active() || checkpoint.saved.is_some() {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
+    let wanted =
+        if highlight.is_active() || checkpoint.saved.is_some() || checkpoint.camera.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     for mut visibility in &mut chip {
         if *visibility != wanted {
             *visibility = wanted;
@@ -802,6 +1104,8 @@ impl Plugin for AgentViewPlugin {
             .init_resource::<AgentHighlight>()
             .init_resource::<UserActivityTracker>()
             .init_resource::<UserViewCheckpoint>()
+            .init_resource::<CameraFocus>()
+            .init_resource::<PendingCameraMove>()
             .add_systems(Startup, spawn_restore_chip)
             .add_systems(
                 Update,
@@ -859,9 +1163,38 @@ mod tests {
         highlight: AgentHighlight,
         tracker: UserActivityTracker,
         checkpoint: UserViewCheckpoint,
+        cam: Option<TestCamera>,
     }
 
+    /// A camera, as plain values.
+    struct TestCamera {
+        transform: Transform,
+        user_controlled: bool,
+        positions: Vec<Vec3>,
+    }
+
+    const FOV: f32 = std::f32::consts::FRAC_PI_4;
+
     impl World {
+        /// A camera 60 units from the origin, and nodes 10 apart along x.
+        fn with_camera(graph: &ViewerGraph) -> Self {
+            World {
+                cam: Some(TestCamera {
+                    transform: Transform::from_xyz(0.0, 0.0, 60.0).looking_at(Vec3::ZERO, Vec3::Y),
+                    user_controlled: false,
+                    positions: (0..graph.nodes.len())
+                        .map(|i| Vec3::new(10.0 * i as f32, 0.0, 0.0))
+                        .collect(),
+                }),
+                ..World::default()
+            }
+        }
+
+        fn position_of(&self, graph: &ViewerGraph, iri: &str) -> Vec3 {
+            let id = graph.index[&format!("<{iri}>")];
+            self.cam.as_ref().unwrap().positions[id.0 as usize]
+        }
+
         fn handle(&mut self, graph: &ViewerGraph, req: &AgentRequest) -> Handled {
             handle_windowed(
                 req,
@@ -874,6 +1207,13 @@ mod tests {
                     highlight: &mut self.highlight,
                     tracker: &mut self.tracker,
                     checkpoint: &mut self.checkpoint,
+                    camera: self.cam.as_ref().map(|c| CameraView {
+                        transform: c.transform,
+                        fov_y: FOV,
+                        user_controlled: c.user_controlled,
+                        focus: None,
+                        positions: &c.positions,
+                    }),
                     now: Instant::now(),
                 },
             )
@@ -984,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_a_camera_move_is_answered_honestly_for_now() {
+    fn a_viewer_with_no_camera_says_so_when_focus_is_asked() {
         let g = scene();
         let mut w = World::default();
         let h = w.handle(
@@ -995,7 +1335,8 @@ mod tests {
         assert!(body(&h)["reason"]
             .as_str()
             .unwrap()
-            .starts_with("camera_not_moved"));
+            .starts_with("camera_unavailable"));
+        assert!(h.camera_move.is_none());
     }
 
     #[test]
@@ -1213,7 +1554,7 @@ mod tests {
         let h = w.handle(&g, &request("clear", json!({})));
         assert_eq!(
             body(&h)["result"],
-            json!({ "cleared": true, "restored": false })
+            json!({ "cleared": true, "restored": false, "camera_restored": false })
         );
         assert!(!w.highlight.is_active());
         assert_eq!(w.selection.0.as_deref(), Some("<http://e/a1>"));
@@ -1285,6 +1626,7 @@ mod tests {
         let mut selection = Selection(Some("<http://e/a1>".into()));
         let mut checkpoint = UserViewCheckpoint {
             saved: Some(ViewState::default()),
+            camera: None,
         };
         let mut highlight = AgentHighlight {
             terms: ["<http://e/b1>".to_string()].into(),
@@ -1345,12 +1687,313 @@ mod tests {
     fn an_op_of_a_later_phase_is_refused_with_its_name() {
         let g = scene();
         let mut w = World::default();
-        let h = w.handle(&g, &request("camera", json!({})));
+        let h = w.handle(&g, &request("search_view", json!({})));
         assert_eq!(body(&h)["error"]["code"], "unknown_op");
         assert!(body(&h)["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("camera"));
+            .contains("search_view"));
+    }
+
+    // ── the camera ──
+
+    fn move_of(h: &Handled) -> &CameraMove {
+        h.camera_move.as_ref().expect("a camera move was expected")
+    }
+
+    fn look_at_of(h: &Handled) -> Vec3 {
+        let v = &body(h)["result"]["camera"]["look_at"];
+        Vec3::new(
+            v[0].as_f64().unwrap() as f32,
+            v[1].as_f64().unwrap() as f32,
+            v[2].as_f64().unwrap() as f32,
+        )
+    }
+
+    #[test]
+    fn frame_all_fits_every_drawn_node_and_keeps_the_viewing_direction() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let h = w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame_all", "duration_ms": 300 }),
+            ),
+        );
+        assert_eq!(body(&h)["ok"], true);
+        let mv = move_of(&h);
+        assert_eq!(mv.duration_ms, 300);
+        // The centre of every node (they sit 10 apart on x).
+        let n = g.nodes.iter().filter(|n| n.is_some()).count() as f32;
+        let centre = w
+            .cam
+            .as_ref()
+            .unwrap()
+            .positions
+            .iter()
+            .copied()
+            .sum::<Vec3>()
+            / n;
+        assert!(
+            (look_at_of(&h) - centre).length() < 1e-3,
+            "{:?} vs {centre:?}",
+            look_at_of(&h)
+        );
+        // Still looking along -z: the camera stays on the +z side of what it looks at.
+        assert!(mv.end.translation.z > centre.z);
+        assert_eq!(body(&h)["result"]["framed"], g.index.len());
+        assert!(h.feed.is_none(), "a camera move is not in the feed");
+    }
+
+    #[test]
+    fn frame_centres_on_the_named_nodes_only() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let h = w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({
+            "action": "frame", "iris": ["http://e/a1", "http://e/b1", "http://e/ghost"] }),
+            ),
+        );
+        let expected = (w.position_of(&g, "http://e/a1") + w.position_of(&g, "http://e/b1")) / 2.0;
+        assert!((look_at_of(&h) - expected).length() < 1e-3);
+        assert_eq!(body(&h)["result"]["framed"], 2);
+        assert!(move_of(&h).look_at.is_some());
+    }
+
+    #[test]
+    fn frame_of_nodes_that_are_not_drawn_does_not_move() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let h = w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame", "iris": ["http://e/ghost"] }),
+            ),
+        );
+        assert_eq!(body(&h)["error"]["code"], "not_drawn");
+        assert!(h.camera_move.is_none() && w.checkpoint.camera.is_none());
+    }
+
+    #[test]
+    fn zoom_scales_the_distance_to_what_the_camera_looks_at() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let before = w.cam.as_ref().unwrap().transform.translation;
+        let h = w.handle(
+            &g,
+            &request("camera", json!({ "action": "zoom", "factor": 2.0 })),
+        );
+        let after = move_of(&h).end.translation;
+        // The target is on the line of sight, so the camera moved straight along it.
+        let target = look_at_of(&h);
+        assert!(((after - target).length() * 2.0 - (before - target).length()).abs() < 1e-2);
+        let dir_before = (before - target).normalize();
+        let dir_after = (after - target).normalize();
+        assert!((dir_before - dir_after).length() < 1e-4);
+        let out = w.handle(
+            &g,
+            &request("camera", json!({ "action": "zoom", "factor": 0.5 })),
+        );
+        assert!(
+            move_of(&out).end.translation.distance(look_at_of(&out))
+                > before.distance(look_at_of(&out))
+        );
+    }
+
+    #[test]
+    fn the_user_having_the_camera_refuses_every_camera_command_and_changes_nothing() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        w.cam.as_mut().unwrap().user_controlled = true;
+        for args in [
+            json!({ "action": "frame_all" }),
+            json!({ "action": "frame", "iris": ["http://e/a1"] }),
+            json!({ "action": "zoom", "factor": 2 }),
+        ] {
+            let h = w.handle(&g, &request("camera", args));
+            assert_eq!(body(&h)["error"]["code"], "user_controlling_camera");
+            assert!(h.camera_move.is_none());
+        }
+        assert!(w.checkpoint.camera.is_none() && w.checkpoint.saved.is_none());
+    }
+
+    #[test]
+    fn a_camera_command_for_an_old_epoch_is_refused() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        w.user_clicks("<http://e/b1>");
+        let h = w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame_all", "if_user_epoch": 0 }),
+            ),
+        );
+        assert_eq!(body(&h)["error"]["code"], "user_changed");
+        assert!(h.camera_move.is_none());
+    }
+
+    #[test]
+    fn without_a_camera_the_camera_op_says_so() {
+        let g = scene();
+        let mut w = World::default();
+        let h = w.handle(&g, &request("camera", json!({ "action": "frame_all" })));
+        assert_eq!(body(&h)["error"]["code"], "unsupported_headless");
+    }
+
+    #[test]
+    fn show_with_focus_frames_what_it_shows_and_remembers_where_the_camera_was() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let from = w.cam.as_ref().unwrap().transform;
+        let h = w.handle(
+            &g,
+            &request("show", json!({ "iris": ["http://e/a1", "http://e/b1"] })),
+        );
+        assert_eq!(body(&h)["result"]["camera_moved"], true);
+        assert!(body(&h).get("reason").is_none());
+        let expected = (w.position_of(&g, "http://e/a1") + w.position_of(&g, "http://e/b1")) / 2.0;
+        assert!((look_at_of(&h) - expected).length() < 1e-3);
+        assert_eq!(move_of(&h).duration_ms, DEFAULT_MOVE_MS);
+        assert_eq!(
+            w.checkpoint.camera,
+            Some(from),
+            "the user's pose is the restore point"
+        );
+        assert!(w.highlight.is_active());
+    }
+
+    #[test]
+    fn show_with_focus_while_the_user_has_the_camera_highlights_but_does_not_move() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        w.cam.as_mut().unwrap().user_controlled = true;
+        let h = w.handle(&g, &request("show", json!({ "iris": ["http://e/a1"] })));
+        assert_eq!(body(&h)["ok"], true);
+        assert_eq!(body(&h)["result"]["camera_moved"], false);
+        assert!(body(&h)["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("user_controlling_camera"));
+        assert!(
+            w.highlight.is_active(),
+            "the part that is not the camera still applies"
+        );
+        assert!(h.camera_move.is_none() && w.checkpoint.camera.is_none());
+    }
+
+    #[test]
+    fn show_without_focus_leaves_the_camera_alone() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let h = w.handle(
+            &g,
+            &request("show", json!({ "iris": ["http://e/a1"], "focus": false })),
+        );
+        assert!(h.camera_move.is_none() && w.checkpoint.camera.is_none());
+        assert_eq!(body(&h)["result"]["camera_moved"], false);
+    }
+
+    #[test]
+    fn restoring_the_view_moves_the_camera_back_unless_the_user_has_it() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let from = w.cam.as_ref().unwrap().transform;
+        w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame", "iris": ["http://e/b1"] }),
+            ),
+        );
+        let h = w.handle(&g, &request("clear", json!({ "restore": true })));
+        assert_eq!(body(&h)["result"]["restored"], true);
+        assert_eq!(body(&h)["result"]["camera_restored"], true);
+        assert_eq!(move_of(&h).end, from);
+        assert!(
+            w.checkpoint.camera.is_none() && w.checkpoint.saved.is_none(),
+            "consumed"
+        );
+
+        // The user has the camera: the view comes back, the camera stays put.
+        let mut w = World::with_camera(&g);
+        w.handle(
+            &g,
+            &request(
+                "show",
+                json!({ "iris": ["http://e/b1"], "select": "http://e/b1" }),
+            ),
+        );
+        w.cam.as_mut().unwrap().user_controlled = true;
+        let h = w.handle(&g, &request("clear", json!({ "restore": true })));
+        assert_eq!(body(&h)["result"]["restored"], true);
+        assert_eq!(body(&h)["result"]["camera_restored"], false);
+        assert!(h.camera_move.is_none());
+    }
+
+    #[test]
+    fn two_agent_moves_keep_the_first_pose_but_a_user_move_in_between_saves_a_new_one() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let first = w.cam.as_ref().unwrap().transform;
+        w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame", "iris": ["http://e/a1"] }),
+            ),
+        );
+        // The camera is now elsewhere, put there by the agent.
+        w.cam.as_mut().unwrap().transform =
+            Transform::from_xyz(5.0, 5.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y);
+        w.handle(
+            &g,
+            &request(
+                "camera",
+                json!({ "action": "frame", "iris": ["http://e/b1"] }),
+            ),
+        );
+        assert_eq!(
+            w.checkpoint.camera,
+            Some(first),
+            "agent after agent: the user's own pose stays"
+        );
+
+        // The user takes the camera somewhere; the next agent move starts from there.
+        let theirs = Transform::from_xyz(-9.0, 2.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y);
+        w.cam.as_mut().unwrap().transform = theirs;
+        w.tracker.user_camera_moved();
+        w.handle(&g, &request("camera", json!({ "action": "frame_all" })));
+        assert_eq!(w.checkpoint.camera, Some(theirs));
+    }
+
+    #[test]
+    fn a_user_camera_move_counts_in_the_epoch_and_the_agent_hears_of_it() {
+        let mut t = UserActivityTracker::default();
+        t.user_camera_moved();
+        assert_eq!((t.epoch, t.overrode), (1, true));
+    }
+
+    #[test]
+    fn status_reports_the_camera_and_a_camera_only_restore_point() {
+        let g = scene();
+        let mut w = World::with_camera(&g);
+        let h = w.handle(&g, &request("status", Value::Null));
+        let cam = &body(&h)["result"]["camera"];
+        assert!(
+            (cam["distance"].as_f64().unwrap() - 60.0).abs() < 1.0,
+            "{cam}"
+        );
+        assert_eq!(cam["user_controlling"], false);
+        assert_eq!(body(&h)["result"]["has_restore_point"], false);
+        w.handle(&g, &request("camera", json!({ "action": "frame_all" })));
+        let h = w.handle(&g, &request("status", Value::Null));
+        assert_eq!(body(&h)["result"]["has_restore_point"], true);
     }
 }
 
@@ -1605,5 +2248,209 @@ mod system_tests {
         h.app.add_plugins(AgentPlugin); // the headless answerer, as `CorePlugin` adds it
         let answers = h.frame(vec![(1, "status", Value::Null)]);
         assert_eq!(answers.len(), 1, "answered once: {answers:?}");
+    }
+    // ── the camera, through the real systems ──
+
+    use crate::camera::{apply_camera_moves, run_camera_tween, CameraTween};
+    use crate::layout::LayoutState;
+    use bevy::camera_controller::pan_orbit_camera::controller::inputs::MotionInputs;
+    use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion;
+
+    /// The harness with a scene camera and node positions (10 apart on x), and a
+    /// clock that advances 200 ms per frame.
+    fn camera_harness() -> Harness {
+        let mut h = harness();
+        h.app
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(200),
+            ))
+            .add_systems(
+                Update,
+                (apply_camera_moves, run_camera_tween)
+                    .chain()
+                    .after(CoreSet::Ui),
+            );
+        let nodes = h.world().resource::<ViewerGraph>().nodes.len();
+        let mut layout = LayoutState::new(1);
+        layout.pos = (0..nodes)
+            .map(|i| Vec3::new(10.0 * i as f32, 0.0, 0.0))
+            .collect();
+        h.app.insert_resource(layout);
+        h.app.world_mut().spawn((
+            SceneCamera,
+            PanOrbitCamera::default(),
+            Projection::from(PerspectiveProjection::default()),
+            Transform::from_xyz(0.0, 0.0, 60.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+        h
+    }
+
+    fn camera_transform(h: &mut Harness) -> Transform {
+        let mut q = h
+            .app
+            .world_mut()
+            .query_filtered::<&Transform, With<SceneCamera>>();
+        *q.single(h.app.world()).unwrap()
+    }
+
+    fn tweening(h: &mut Harness) -> bool {
+        let mut q = h.app.world_mut().query::<&CameraTween>();
+        q.iter(h.app.world()).next().is_some()
+    }
+
+    fn node_position(h: &Harness, iri: &str) -> Vec3 {
+        let id = h.world().resource::<ViewerGraph>().index[&format!("<{iri}>")];
+        h.world().resource::<LayoutState>().pos[id.0 as usize]
+    }
+
+    fn run_until_still(h: &mut Harness) {
+        for _ in 0..20 {
+            h.frame(vec![]);
+            if !tweening(h) {
+                return;
+            }
+        }
+        panic!("the camera never stopped moving");
+    }
+
+    #[test]
+    fn show_with_focus_flies_the_camera_to_the_nodes_over_several_frames() {
+        let mut h = camera_harness();
+        let from = camera_transform(&mut h);
+        let answers = h.frame(vec![(1, "show", json!({ "iris": ["http://e/b1"] }))]);
+        assert_eq!(answers[0]["result"]["camera_moved"], true);
+        h.frame(vec![]);
+        assert!(tweening(&mut h), "the camera is on its way, not there");
+        assert_ne!(camera_transform(&mut h).translation, from.translation);
+        run_until_still(&mut h);
+
+        let at = camera_transform(&mut h);
+        let node = node_position(&h, "http://e/b1");
+        let to_node = (node - at.translation).normalize();
+        assert!(
+            to_node.dot(at.forward().as_vec3()) > 0.99,
+            "the node is dead ahead"
+        );
+        assert!(
+            at.translation.distance(node) < 10.0,
+            "and close: {}",
+            at.translation.distance(node)
+        );
+    }
+
+    #[test]
+    fn the_user_taking_the_camera_halfway_stops_the_move_and_counts_as_a_change() {
+        let mut h = camera_harness();
+        h.frame(vec![]); // the tracker records the start
+        h.frame(vec![(
+            1,
+            "camera",
+            json!({ "action": "frame", "iris": ["http://e/b1"], "duration_ms": 2000 }),
+        )]);
+        h.frame(vec![]);
+        assert!(tweening(&mut h));
+        let mid = camera_transform(&mut h);
+
+        {
+            let mut q = h.app.world_mut().query::<&mut PanOrbitCamera>();
+            q.single_mut(h.app.world_mut()).unwrap().current_motion =
+                CurrentMotion::UserControlled {
+                    anchor: bevy::math::DVec3::new(0.0, 0.0, -10.0),
+                    motion_inputs: MotionInputs::Zoom {
+                        zoom_inputs: Default::default(),
+                    },
+                };
+        }
+        h.frame(vec![]);
+        assert!(!tweening(&mut h), "the move is dropped");
+        assert_eq!(
+            camera_transform(&mut h).translation,
+            mid.translation,
+            "nothing is written over the user"
+        );
+
+        // The agent is told, and is refused while the user holds the camera.
+        let answers = h.frame(vec![
+            (2, "status", Value::Null),
+            (3, "camera", json!({ "action": "frame_all" })),
+        ]);
+        assert_eq!(answers[0]["user"]["epoch"], 1);
+        assert_eq!(answers[0]["user"]["overrode_last_agent_command"], true);
+        assert_eq!(answers[0]["result"]["camera"]["user_controlling"], true);
+        assert_eq!(answers[1]["error"]["code"], "user_controlling_camera");
+    }
+
+    #[test]
+    fn a_motion_that_goes_on_for_many_frames_is_one_change_not_one_per_frame() {
+        let mut h = camera_harness();
+        h.frame(vec![]);
+        {
+            let mut q = h.app.world_mut().query::<&mut PanOrbitCamera>();
+            q.single_mut(h.app.world_mut()).unwrap().current_motion =
+                CurrentMotion::UserControlled {
+                    anchor: bevy::math::DVec3::new(0.0, 0.0, -10.0),
+                    motion_inputs: MotionInputs::Zoom {
+                        zoom_inputs: Default::default(),
+                    },
+                };
+        }
+        for _ in 0..30 {
+            h.frame(vec![]);
+        }
+        let answers = h.frame(vec![(1, "status", Value::Null)]);
+        assert_eq!(answers[0]["user"]["epoch"], 1);
+    }
+
+    #[test]
+    fn escape_flies_the_camera_back_to_where_the_user_had_it() {
+        let mut h = camera_harness();
+        let from = camera_transform(&mut h);
+        h.frame(vec![]);
+        h.frame(vec![(
+            1,
+            "show",
+            json!({ "iris": ["http://e/b1"], "select": "http://e/b1" }),
+        )]);
+        run_until_still(&mut h);
+        assert_ne!(camera_transform(&mut h).translation, from.translation);
+
+        press_escape(&mut h); // the selection
+        press_escape(&mut h); // the user's view, camera included
+        run_until_still(&mut h);
+        let back = camera_transform(&mut h);
+        assert!(
+            back.translation.distance(from.translation) < 0.05,
+            "{:?} vs {:?}",
+            back.translation,
+            from.translation
+        );
+        assert!(back.forward().as_vec3().dot(from.forward().as_vec3()) > 0.999);
+    }
+
+    #[test]
+    fn clear_with_restore_flies_the_camera_back_too() {
+        let mut h = camera_harness();
+        let from = camera_transform(&mut h);
+        h.frame(vec![(
+            1,
+            "camera",
+            json!({ "action": "zoom", "factor": 4 }),
+        )]);
+        run_until_still(&mut h);
+        assert!(
+            camera_transform(&mut h)
+                .translation
+                .distance(from.translation)
+                > 5.0
+        );
+        let answers = h.frame(vec![(2, "clear", json!({ "restore": true }))]);
+        assert_eq!(answers[0]["result"]["camera_restored"], true);
+        run_until_still(&mut h);
+        assert!(
+            camera_transform(&mut h)
+                .translation
+                .distance(from.translation)
+                < 0.05
+        );
     }
 }

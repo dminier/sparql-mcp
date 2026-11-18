@@ -119,10 +119,13 @@ agent writes. Enable `[viewer]` in `sparql-mcp.toml`, then see
 The agent can also drive the viewer. With `[viewer]` enabled the server lists `viewer_status`
 (graph, counts, selection, class filter, and whether the user is moving things),
 `viewer_show` (highlight nodes, or isolate them and fade the rest, and select one),
-`viewer_clear` and `viewer_filter` (hide or show classes, as the user does in the class panel).
+`viewer_clear`, `viewer_filter` (hide or show classes, as the user does in the class panel) and
+`viewer_camera` (frame everything, frame some nodes, or zoom, as an animated move; `viewer_show`
+frames what it shows too).
 They answer plainly when no viewer is open. The user stays in charge: `Esc` or the *Restore my
-view* chip undoes the agent's changes, and a command can carry the last `user.epoch` it saw so
-that it does not overwrite something the user just did. Camera moves, search and screenshots are
+view* chip undoes the agent's changes (the camera flies back too), anything the user does with the
+camera stops a move in progress, and a command can carry the last `user.epoch` it saw so
+that it does not overwrite something the user just did. Search and screenshots are
 designed ([docs/designs/sparql-mcp-viewer-agent-control.md](docs/designs/sparql-mcp-viewer-agent-control.md))
 but not built yet.
 

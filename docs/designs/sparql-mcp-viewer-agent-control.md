@@ -810,8 +810,40 @@ Each phase starts only when the previous phase's exit criterion passes.
 
 ### Implementation status
 
-**Phases 1 and 2 are done.** Phases 3 to 6 (camera, search, screenshot, docs and skills) are not
-started: `camera`, `search_view` and `screenshot` are refused with `unknown_op`.
+**Phases 1 to 3 are done.** Phases 4 to 6 (search, screenshot, docs and skills) are not started:
+`search_view` and `screenshot` are refused with `unknown_op`.
+
+**Phase 3 (camera).** What it did, and where it differs from the plan:
+
+*   **Core.** `ViewerOp::Camera` (`frame_all`, `frame`, `zoom`; only a zoom is not repeatable) and
+    `viewer_camera`, with `duration_ms` (default 600, at most 10000) and a `factor` in 0.01 to 100.
+    `viewer_show`'s `focus` now frames the shown nodes.
+*   **Moves go through one door.** `PendingCameraMove` is what `F`, the agent and a restore all
+    write; `apply_camera_moves` makes a `CameraTween` (or places the camera at once for a duration of
+    0) and `run_camera_tween` advances it. Pure functions hold the arithmetic: `frame_pose` (keeps the
+    viewing direction, as `F` did), `zoom_pose` (clamped to 1.5 to 5000), `ease_in_out` (smoothstep),
+    `blend` (lerp and slerp).
+*   **The tween runs in `Update`, not `PreUpdate`.** The plan put it between the controller's input
+    and its position update; the code writes the camera `Transform` in `Update` as `F` always did,
+    and the controller reads it. A new move starts from where the camera is. Inserting a move sets
+    `current_motion` to `Stationary`, which stops momentum.
+*   **User wins.** If `current_motion.is_user_controlled()` the tween is removed without a write and
+    `CameraFocus` forgets its pivot; a move asked for while the user holds the camera is dropped;
+    `viewer_camera` answers `user_controlling_camera`, and `viewer_show` highlights but reports
+    `camera_moved: false` with that reason. A finished move sets `last_anchor_depth`, so the next
+    orbit pivots on the framed point.
+*   **Epoch.** The tracker counts the **start** of a user camera motion (not every frame, as the plan
+    said: a 2-second orbit would otherwise add 120 to the epoch), and `F`.
+*   **Look-at point.** `PanOrbitCamera` keeps none, so when the viewer has not framed anything the
+    point is where the scene's centre meets the line of sight, at least one unit ahead.
+*   **Restore.** The checkpoint also holds the camera pose, saved before the agent's first camera move
+    after the user last moved; `Esc`, the chip and `viewer_clear` with `restore` fly back to it.
+*   **Tested.** The pose arithmetic; the pure handler with a simulated camera; the tween and the
+    handlers in minimal Bevy apps over several frames, including a user taking the camera half way and
+    a restore flying back. Five mutations (user-wins check, per-frame epoch, no camera restore, pose
+    never saved, refusal while the user holds the camera) are each caught.
+*   **Checked on screen** with the real viewer driven by the scripted agent (`agent_e2e --viewer-demo`):
+    the calls succeed and the poses are as computed. Whether the motion *looks* right is for a person.
 
 **Phase 2 (show, clear, filter, highlight, restore, `Esc`).** What it did, and where it differs from
 the plan:
