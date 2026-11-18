@@ -1,0 +1,49 @@
+{
+  "name": "sparql-mcp",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "configureZshAsDefaultShell": false,
+      "upgradePackages": false
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12",
+      "installTools": false
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "vadimcn.vscode-lldb",
+        "ms-azuretools.vscode-docker",
+        "eamodio.gitlens",
+        "GitHub.vscode-pull-request-github",
+        "ms-python.python"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  },
+  "mounts": [
+    "source=sparql-mcp-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=sparql-mcp-cargo-registry,target=/usr/local/cargo/registry,type=volume"
+  ],
+  "remoteEnv": {
+    "RUST_LOG": "info",
+    "CARGO_TERM_COLOR": "always"
+  },
+  "postCreateCommand": ".devcontainer/post-create.sh",
+  "remoteUser": "vscode"
+}
