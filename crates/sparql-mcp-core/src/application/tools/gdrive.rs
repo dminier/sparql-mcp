@@ -1,6 +1,6 @@
 //! get_gdrive_config tool — returns GDrive sync configuration and store path.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use rmcp::model::{CallToolResult, Content, Tool};
 use rmcp::ErrorData as McpError;
@@ -20,7 +20,7 @@ pub fn tool_get_gdrive_config_def() -> Tool {
 
 pub fn get_gdrive_config(
     gdrive: &Option<GDriveConfig>,
-    store_path: &PathBuf,
+    store_path: &Path,
 ) -> Result<CallToolResult, McpError> {
     let payload = match gdrive {
         Some(gd) => json!({
@@ -56,7 +56,7 @@ mod tests {
             backup_retain: 3,
             sync_on_render: false,
         });
-        let result = get_gdrive_config(&gd, &PathBuf::from("/tmp/store")).unwrap();
+        let result = get_gdrive_config(&gd, Path::new("/tmp/store")).unwrap();
         let text = match &result.content[0].raw {
             RawContent::Text(t) => t.text.clone(),
             _ => panic!("expected text"),
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn returns_defaults_when_absent() {
-        let result = get_gdrive_config(&None, &PathBuf::from("/tmp/store")).unwrap();
+        let result = get_gdrive_config(&None, Path::new("/tmp/store")).unwrap();
         let text = match &result.content[0].raw {
             RawContent::Text(t) => t.text.clone(),
             _ => panic!("expected text"),
