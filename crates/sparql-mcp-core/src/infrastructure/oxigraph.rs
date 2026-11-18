@@ -17,13 +17,7 @@ use crate::domain::{
     QueryResult, RdfTerm, SolutionSet, SparqlStore, StoredQuad, UpdateOutcome,
 };
 
-// Named graph holding SHA-256 records for idempotent file loading.
-const META_GRAPH: &str = "urn:hkb:meta:loaded-files";
-const META_SHA256: &str = "urn:hkb:meta:sha256";
-const META_PATH: &str = "urn:hkb:meta:path";
-const META_FILE: &str = "urn:hkb:meta:LoadedFile";
-/// The graph a loaded file went into (empty string for the default graph).
-const META_TARGET: &str = "urn:hkb:meta:graph";
+use crate::domain::loaded_files::{META_FILE, META_GRAPH, META_PATH, META_SHA256, META_TARGET};
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 

@@ -4,6 +4,7 @@
 //! plain data struct.  Adapters in `crate::infrastructure` implement the traits.
 
 pub mod doc_store;
+pub mod loaded_files;
 pub mod sparql_store;
 
 pub use doc_store::DocStore;

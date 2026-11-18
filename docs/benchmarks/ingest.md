@@ -37,6 +37,8 @@ Do not run other heavy work at the same time: it changes the timings.
 | `--sizes` | 100000,250000,500000 | Staged job sizes whose commit and abort are measured |
 | `--replace-sizes` | 100000,250000,500000 | Target size = staged size for the replace step |
 | `--store-size` | 1,000,000 | Store size for the "does a write slow down" step |
+| `--file-triples` | 1,000,000 | Triples in the generated file of the `ingest_file` step (0 skips it) |
+| `--file-batch-triples` | 5,000 | `file_batch_triples` for that step |
 | `--markdown <file>` | none | Also write the tables to a file |
 
 ## What it measures
@@ -67,6 +69,12 @@ highest sample during the step minus the sample taken just before it.
     `INSERT DATA`, in an empty store and in a store of `--store-size` triples.
     The write path no longer scans the store on a ground write, so the two
     should be close.
+6.  **`ingest_file`.** A generated N-Triples file (about 115 bytes per triple)
+    loaded in direct mode into a RocksDB store, while a reader (an `ASK`, every
+    20 ms) and a writer (a one-triple `INSERT DATA` through the gated store,
+    every 100 ms) run beside it. It reports the hash and start time, the run
+    time, throughput, peak memory, and the 95th percentile and maximum latency
+    of the reader and the writer.
 
 ## How the numbers set the limits
 
@@ -177,10 +185,41 @@ A commit that moves the quads directly, without the SPARQL update machinery,
 might be faster; that is a possible optimisation, not done. The ceiling would
 then be raised only after rerunning this benchmark.
 
-**Not measured.** `ingest_file` (it does not exist yet), so the design's target
-of 50,000 triples/s for a file job is not checked; and reads during an
-ingestion (the design's target of a 95th percentile under 200 ms for
-`query_sparql` while a file job runs).
+### `ingest_file` (direct, RocksDB), with a reader and a writer running meanwhile
+
+Same machine and date as above, code at the commit that added `ingest_file`.
+
+| file | triples | batch | hash + start | run | throughput | peak memory | read p95 / max | write p95 / max |
+|---|---|---|---|---|---|---|---|---|
+| 34 MiB | 300,000 | 5,000 | 0.0 s | 7.8 s | 38,600 triples/s | 256 MiB | 0 / 0 ms | 48 / 82 ms |
+| 114 MiB | 1,000,000 | 2,000 | 0.1 s | 30.5 s | 32,800 triples/s | 833 MiB | 0 / 0 ms | 43 / 64 ms |
+| 114 MiB | 1,000,000 | 5,000 (default) | 0.1 s | 30.1 s | 33,200 triples/s | 836 MiB | 0 / 0 ms | 72 / 81 ms |
+| 114 MiB | 1,000,000 | 10,000 | 0.1 s | 31.1 s | 32,100 triples/s | 827 MiB | 0 / 0 ms | 226 / 244 ms |
+
+**The design's targets were not met, and the batch size does not change that.**
+
+*   **Throughput** is 32,000-39,000 triples/s against a target of 50,000. It is
+    the same for batches of 2,000, 5,000 and 10,000 triples, and close to the
+    44,000 triples/s of `ingest_batch` in the first table: the limit is the
+    transaction that writes the triples into the store, not the file reader.
+*   **Memory** is about 0.8 KiB per triple loaded (256 MiB for 300,000
+    triples, 833 MiB for 1,000,000), against a target of 512 MiB. It grows with
+    the triples loaded and not with the batch size, so it is the store's
+    (RocksDB write buffers and the pages it maps), not the runner's, which holds
+    one batch at a time. This benchmark does not tell whether the working set is
+    given back afterwards, or whether it levels off at a larger size.
+    **Consequence:** `max_job_triples_direct` (10,000,000) would take about
+    8 GiB of working set on this evidence. The ceiling is kept, because
+    the memory is not held by the job and may be reclaimable, but it is
+    **unconfirmed**; run the benchmark with a larger `--file-triples` before
+    loading files of that size on a small machine.
+*   **Other users are not affected.** Reads took under a millisecond throughout.
+    A write waited 72 ms at the 95th percentile with the default 5,000-triple
+    batches, because the gate is held for one batch at a time. With 10,000 the
+    write waits tripled (226 ms), which is why `file_batch_triples` defaults to
+    5,000.
+*   **Hashing the file before the job starts** took 0.1 s for 114 MiB, so for a
+    2 GiB file it is a few seconds before `ingest_file` returns.
 
 
 ## Limits of this benchmark

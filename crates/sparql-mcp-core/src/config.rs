@@ -129,6 +129,9 @@ pub struct IngestConfig {
     /// How often the ingestion maintenance expires idle jobs and purges old
     /// ones, in seconds.
     pub sweep_interval_secs: u64,
+    /// Triples per batch when `ingest_file` streams a file (also capped by
+    /// `max_batch_triples` and `max_batch_bytes`).
+    pub file_batch_triples: usize,
 }
 
 impl Default for IngestConfig {
@@ -155,6 +158,7 @@ impl Default for IngestConfig {
             event_max_triples: 5_000,
             event_changed_threshold: 50_000,
             sweep_interval_secs: 300,
+            file_batch_triples: 5_000,
         }
     }
 }

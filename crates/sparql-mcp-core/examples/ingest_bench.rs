@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::Parser;
 use sparql_mcp::application::event_sink::NullEventSink;
+use sparql_mcp::application::ingest::FileRequest;
 use sparql_mcp::application::ingest::{
     BatchRequest, BeginRequest, CommitRequest, IngestService, Mode,
 };
@@ -52,6 +53,12 @@ struct Args {
     /// Store size for the "does a write slow down" step.
     #[arg(long, default_value_t = 1_000_000)]
     store_size: usize,
+    /// Triples in the generated file of the `ingest_file` step (0 skips it).
+    #[arg(long, default_value_t = 1_000_000)]
+    file_triples: usize,
+    /// `file_batch_triples` for the `ingest_file` step.
+    #[arg(long, default_value_t = 5_000)]
+    file_batch_triples: usize,
     /// Also write the results as a markdown table to this file.
     #[arg(long)]
     markdown: Option<PathBuf>,
@@ -152,6 +159,7 @@ fn begin(svc: &IngestService, replace: bool) -> Result<(String, String)> {
         expected_batches: None,
         label: None,
         blank_nodes: "skolemize".into(),
+        file: None,
     })?;
     Ok((
         b["job_id"].as_str().unwrap().to_string(),
@@ -363,6 +371,121 @@ fn main() -> Result<()> {
         say(format!(
             "| store | per write |\n|---|---|\n| empty | {empty_ms:.2} ms |\n| {} triples | {big_ms:.2} ms |\n",
             args.store_size
+        ));
+    }
+
+    // ── 6. ingest_file: throughput, memory, and what other users feel ───────
+    if args.file_triples > 0 {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("bench.nt");
+        {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&file)?);
+            let per = 10_000;
+            for b in 0..args.file_triples.div_ceil(per) {
+                let n = per.min(args.file_triples - b * per);
+                out.write_all(payload(b, n.max(1)).as_bytes())?;
+                let _ = n;
+            }
+        }
+        let size = std::fs::metadata(&file)?.len();
+        let store_dir = tempfile::tempdir()?;
+        let raw: Arc<dyn SparqlStore> =
+            Arc::new(OxigraphAdapter::open(&store_dir.path().join("store"))?);
+        let (gated, privileged) =
+            build_stores(raw.clone(), WriteGate::new(Duration::from_secs(600)));
+        let svc = Arc::new(IngestService::new(
+            privileged,
+            Arc::new(RwLock::new(ACTIVE.to_string())),
+            IngestConfig {
+                file_roots: Some(vec![dir.path().to_path_buf()]),
+                max_job_triples_direct: 100_000_000,
+                max_job_batches: 100_000,
+                file_batch_triples: args.file_batch_triples,
+                max_batch_triples: args.file_batch_triples.max(10_000),
+                ..IngestConfig::default()
+            },
+            Arc::new(NullEventSink),
+        ));
+
+        let peak = Peak::start();
+        let started = Instant::now();
+        let b = svc.start_file(&FileRequest {
+            path: file.display().to_string(),
+            target_graph: None,
+            mode: Mode::Direct,
+            format: None,
+            resume_job: None,
+            force: false,
+        })?;
+        let hash_secs = started.elapsed().as_secs_f64();
+        let id = b["job_id"].as_str().unwrap().to_string();
+
+        // While the job runs: a reader and a writer, as other users would be.
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (raw, stop) = (raw.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut ms = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    let _ = raw.query(&format!(
+                        "ASK {{ GRAPH <{ACTIVE}> {{ <https://bench.example/entity/1> ?p ?o }} }}"
+                    ));
+                    ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                ms
+            })
+        };
+        let writer = {
+            let (gated, stop) = (gated.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut ms = Vec::new();
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    let _ = gated.update(&format!(
+                        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:probe:{n}> <urn:p> <urn:o> }} }}"
+                    ));
+                    ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                    n += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                ms
+            })
+        };
+        let run_started = Instant::now();
+        let status = loop {
+            let s = svc.status(Some(&id))?;
+            if s["state"] != "running" {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let run_secs = run_started.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+        let mut reads = reader.join().unwrap();
+        let mut writes = writer.join().unwrap();
+        reads.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        writes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mb = peak.finish();
+        let triples = status["triples"].as_u64().unwrap_or(0);
+        say(
+            "## ingest_file (direct, RocksDB), with a reader and a writer running meanwhile\n"
+                .to_string(),
+        );
+        say(format!(
+            "| file | state | triples | hash + start | run | throughput | peak memory | read p95 / max | write p95 / max | design target |\n|---|---|---|---|---|---|---|---|---|---|\n| {:.0} MiB | {} | {} | {:.1} s | {:.1} s | {:.0} triples/s | {:.0} MiB | {:.0} / {:.0} ms | {:.0} / {:.0} ms | >= 50,000 triples/s, < 512 MiB, read p95 < 200 ms |\n",
+            size as f64 / 1_048_576.0,
+            status["state"].as_str().unwrap_or("?"),
+            triples,
+            hash_secs,
+            run_secs,
+            triples as f64 / run_secs.max(0.001),
+            mb,
+            percentile(&reads, 0.95), reads[reads.len() - 1],
+            percentile(&writes, 0.95), writes[writes.len() - 1],
         ));
     }
 

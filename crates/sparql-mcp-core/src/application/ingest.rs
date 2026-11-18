@@ -16,8 +16,10 @@
 //! All text that comes from outside is put in SPARQL through
 //! [`string_literal`] and [`iri`].
 
+mod file;
 mod maintenance;
 mod validate;
+pub use file::FileRequest;
 pub use maintenance::{Maintenance, Recovery, SweepReport};
 pub use validate::{Check, ValidateRequest};
 
@@ -148,9 +150,19 @@ impl Mode {
     }
 }
 
+/// The file a job reads, hashed before the job starts.
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
 /// What `ingest_begin` asks for, already type-checked by the tool layer.
 #[derive(Debug, Clone)]
 pub struct BeginRequest {
+    /// Set by `ingest_file`: the job starts `running` and records the file.
+    pub file: Option<FileMeta>,
     pub target_graph: Option<String>,
     pub mode: Mode,
     pub replace: bool,
@@ -233,6 +245,8 @@ pub struct IngestService {
     /// When a `Changed` event was last sent for a direct job, to send at most
     /// one every [`CHANGED_EVERY`].
     last_changed: Mutex<HashMap<String, Instant>>,
+    /// File jobs whose runner thread is alive in this process.
+    runs: Mutex<HashMap<String, Arc<file::RunState>>>,
 }
 
 impl IngestService {
@@ -248,6 +262,7 @@ impl IngestService {
             cfg,
             events,
             last_changed: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -412,10 +427,15 @@ impl IngestService {
                 let job = job_iri(&id);
                 let now = iso_now();
                 let staging = (req.mode == Mode::Staged).then(|| staging_iri(&id));
+                let initial = if req.file.is_some() {
+                    JobState::Running
+                } else {
+                    JobState::Open
+                };
 
                 let mut triples = vec![
                     format!("<{job}> a {}", smj("Job")),
-                    format!("<{job}> {} <{}>", smj("state"), JobState::Open.iri()),
+                    format!("<{job}> {} <{}>", smj("state"), initial.iri()),
                     format!("<{job}> {} <{target}>", smj("target")),
                     format!(
                         "<{job}> {} {}",
@@ -452,6 +472,28 @@ impl IngestService {
                 if let Some(s) = &staging {
                     triples.push(format!("<{job}> {} <{s}>", smj("staging")));
                 }
+                if let Some(file) = &req.file {
+                    triples.push(format!(
+                        "<{job}> {} {}",
+                        smj("filePath"),
+                        string_literal(&file.path)
+                    ));
+                    triples.push(format!(
+                        "<{job}> {} {}",
+                        smj("fileSha256"),
+                        string_literal(&file.sha256)
+                    ));
+                    triples.push(format!(
+                        "<{job}> {} {}",
+                        smj("fileBytes"),
+                        typed(&file.bytes.to_string(), "long")
+                    ));
+                    triples.push(format!(
+                        "<{job}> {} {}",
+                        smj("checkpointBytes"),
+                        typed("0", "long")
+                    ));
+                }
                 if let Some(n) = req.expected_batches {
                     triples.push(format!(
                         "<{job}> {} {}",
@@ -474,7 +516,7 @@ impl IngestService {
 
                 let mut reply = json!({
                     "job_id": id,
-                    "state": JobState::Open.name(),
+                    "state": initial.name(),
                     "mode": req.mode.name(),
                     "target_graph": target,
                     "replace": req.replace,
@@ -623,6 +665,7 @@ impl IngestService {
         if let Some(n) = m.get("expectedBatches").and_then(|n| n.parse::<u32>().ok()) {
             out["expected_batches"] = json!(n);
         }
+        self.file_status(&m, id, triples, &mut out);
         Ok(out)
     }
 
@@ -709,22 +752,41 @@ impl IngestService {
     ///    paths only save work; this is the check that counts, so a retry that
     ///    overlaps the original cannot be accepted twice.
     pub fn batch(&self, req: &BatchRequest) -> Result<Value> {
-        let id = req.job_id.as_str();
+        self.accept(
+            &req.job_id,
+            req.seq,
+            req.data.as_bytes(),
+            req.format.as_deref(),
+            Accept::api(),
+        )
+    }
+
+    /// The write path of one batch, shared by `ingest_batch` (the job must be
+    /// open) and by the runner of an `ingest_file` job (it must be running,
+    /// and each batch also moves the checkpoint).
+    fn accept(
+        &self,
+        id: &str,
+        seq: u32,
+        data: &[u8],
+        format_override: Option<&str>,
+        how: Accept,
+    ) -> Result<Value> {
         if !is_job_id(id) {
             return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
         }
-        if req.seq == 0 || req.seq > self.cfg.max_job_batches {
+        if seq == 0 || seq > self.cfg.max_job_batches {
             return Err(coded(
                 "invalid_argument",
                 format!("seq must be between 1 and {}", self.cfg.max_job_batches),
                 Some(id),
             ));
         }
-        if req.data.len() > self.cfg.max_batch_bytes {
+        if data.len() > self.cfg.max_batch_bytes {
             return Err(ToolError::LimitExceeded {
                 limit_key: "max_batch_bytes".to_string(),
                 limit: self.cfg.max_batch_bytes as u64,
-                value: req.data.len() as u64,
+                value: data.len() as u64,
             }
             .into_anyhow());
         }
@@ -733,7 +795,7 @@ impl IngestService {
             return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
         };
         let state = m.get("state").and_then(|s| JobState::from_iri(s));
-        if !state.is_some_and(JobState::accepts_batches) {
+        if state != Some(how.required) {
             return Err(job_not_open(id, state));
         }
         let mode = m
@@ -745,9 +807,7 @@ impl IngestService {
             (Mode::Staged, Some(staging)) => staging.clone(),
             _ => target.clone(),
         };
-        let format = req
-            .format
-            .as_deref()
+        let format = format_override
             .or_else(|| m.get("format").map(String::as_str))
             .unwrap_or("ntriples");
         let format = match format {
@@ -762,10 +822,10 @@ impl IngestService {
             }
         };
         let reject_blank = m.get("blankNodes").is_some_and(|b| b == "reject");
-        let sha = format!("{:x}", Sha256::digest(req.data.as_bytes()));
+        let sha = format!("{:x}", Sha256::digest(data));
 
         // Fast path: this batch was already accepted.
-        if let Some(rec) = self.read_record(store, id, req.seq)? {
+        if let Some(rec) = self.read_record(store, id, seq)? {
             return if rec.sha256 == sha {
                 self.touch(id);
                 // `m` was read before this record was seen. The record and the
@@ -774,23 +834,21 @@ impl IngestService {
                 // (a retry that overlaps the original would report no triples).
                 let fresh = self.manifest(store, id)?.unwrap_or_else(|| m.clone());
                 let (batches, triples) = self.totals(&fresh);
-                Ok(self.batch_reply(id, req.seq, mode, &rec, true, (batches, triples)))
+                Ok(self.batch_reply(id, seq, mode, &rec, true, (batches, triples)))
             } else {
-                Err(seq_conflict(id, req.seq))
+                Err(seq_conflict(id, seq))
             };
         }
 
         // Parse completely, then check and skolemize. Nothing is written yet.
-        let parsed = store
-            .parse_rdf_raw(req.data.as_bytes(), format)
-            .map_err(|e| {
-                ToolError::ParseError {
-                    message: e.to_string(),
-                    line: None,
-                    column: None,
-                }
-                .into_anyhow()
-            })?;
+        let parsed = store.parse_rdf_raw(data, format).map_err(|e| {
+            ToolError::ParseError {
+                message: e.to_string(),
+                line: None,
+                column: None,
+            }
+            .into_anyhow()
+        })?;
         if parsed.len() > self.cfg.max_batch_triples {
             return Err(ToolError::LimitExceeded {
                 limit_key: "max_batch_triples".to_string(),
@@ -800,19 +858,19 @@ impl IngestService {
             .into_anyhow());
         }
         let parsed_count = parsed.len() as u64;
-        let quads = prepare_quads(parsed, id, req.seq, reject_blank, &graph, &self.cfg)
+        let quads = prepare_quads(parsed, id, seq, reject_blank, &graph, &self.cfg)
             .map_err(ToolError::into_anyhow)?;
 
         // The write, with its conditions, in one transaction.
         let job = job_iri(id);
-        let rec_iri = batch_iri(id, req.seq);
+        let rec_iri = batch_iri(id, seq);
         let identity = ledger_quad(&rec_iri, "sha256", &string_literal(&sha));
-        let write = BatchWrite {
+        let mut write = BatchWrite {
             quads: quads.clone(),
             ledger: vec![
                 ledger_quad(&rec_iri, "type_", &format!("<{SMJ}Batch>")),
                 ledger_quad(&rec_iri, "job", &format!("<{job}>")),
-                ledger_quad(&rec_iri, "seq", &typed(&req.seq.to_string(), "long")),
+                ledger_quad(&rec_iri, "seq", &typed(&seq.to_string(), "long")),
                 identity.clone(),
                 ledger_quad(
                     &rec_iri,
@@ -824,7 +882,7 @@ impl IngestService {
             require: vec![ledger_quad(
                 &job,
                 "state",
-                &format!("<{}>", JobState::Open.iri()),
+                &format!("<{}>", how.required.iri()),
             )],
             idempotency: Some(Idempotency {
                 subject: rec_iri.clone(),
@@ -861,6 +919,8 @@ impl IngestService {
             }),
         };
 
+        write.replace.extend(how.replace);
+        write.ledger.extend(how.ledger);
         match self.privileged.write_batch(&write)? {
             Ok(applied) => {
                 let (triples, batches) = (applied.counters[0], applied.counters[1]);
@@ -871,9 +931,9 @@ impl IngestService {
                     inserted_new: applied.inserted_new,
                     already_present: applied.already_present,
                 };
-                Ok(self.batch_reply(id, req.seq, mode, &rec, false, (batches, triples)))
+                Ok(self.batch_reply(id, seq, mode, &rec, false, (batches, triples)))
             }
-            Err(refusal) => self.refused_batch(store, id, req.seq, mode, &sha, refusal),
+            Err(refusal) => self.refused_batch(store, id, seq, mode, &sha, refusal),
         }
     }
 
@@ -1264,6 +1324,20 @@ impl IngestService {
                     return Err(coded("job_not_found", format!("no job {id}"), Some(&id)));
                 };
                 let state = m.get("state").and_then(|s| JobState::from_iri(s));
+                if state == Some(JobState::Running) {
+                    let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(run) = runs.get(&id) {
+                        run.cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(json!({
+                            "job_id": id,
+                            "state": JobState::Running.name(),
+                            "stopping": true,
+                            "message": "the file job was asked to stop after its current batch; \
+                                        it becomes interrupted, and ingest_abort then aborts it",
+                        }));
+                    }
+                }
                 match state {
                     Some(s) if s.can_abort() => {}
                     other => {
@@ -1299,6 +1373,26 @@ impl IngestService {
                 }
                 Ok(reply)
             })?
+    }
+}
+
+/// What differs between the callers of [`IngestService::accept`].
+struct Accept {
+    /// The state the job must be in when the batch is written.
+    required: JobState,
+    /// Extra single-valued properties to set in the same transaction.
+    replace: Vec<Replace>,
+    /// Extra ledger quads to write in the same transaction.
+    ledger: Vec<StoredQuad>,
+}
+
+impl Accept {
+    fn api() -> Self {
+        Self {
+            required: JobState::Open,
+            replace: Vec::new(),
+            ledger: Vec::new(),
+        }
     }
 }
 

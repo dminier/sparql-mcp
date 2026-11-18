@@ -746,9 +746,48 @@ time with the core off is not idle time, and jobs that were `running` become
 `interrupted`. `ingest_status` reports `idle_secs` and `expires_in_secs` for unfinished jobs.
 All of it takes the time as a parameter, so tests move the clock instead of sleeping.
 
+**File jobs (`ingest/file.rs`).** `ingest_file` is implemented as designed, with these
+differences and decisions:
+
+*   **N-Triples only.** A byte offset is a safe checkpoint only when lines are independent.
+    A `.ttl` file, or `format: turtle`, is refused (`invalid_argument`) with advice to
+    convert it or use `load_rdf_file`. The "Turtle restarts from the beginning" path of the
+    design is not built.
+*   **One write path.** The runner cuts the file at line boundaries
+    (`file_batch_triples`, 5,000 by default, also bounded by `max_batch_triples` and
+    `max_batch_bytes`) and calls the same `accept` as `ingest_batch`, with the job required
+    to be `running` and one extra `Replace` that moves `smj:checkpointBytes` in the same
+    transaction. The design's `checkpointTriples` is not stored: it would equal
+    `smj:triplesTotal`, which the same transaction already advances.
+*   **Loaded-file ledger.** The last batch of a *direct* job also writes the
+    `(hash, target)` entry of the existing loaded-file ledger (vocabulary moved to
+    `domain/loaded_files.rs`). A *staged* file job writes none, because its data is not in the
+    target until commit; `already_loaded` is therefore only enforced for direct loads.
+*   **Ends.** Direct: `committed` with `ended`. Staged: back to `open` (no `ended`, still swept
+    for idleness), then `ingest_validate` and `ingest_commit` as usual. A parse or limit error:
+    `failed`, with `smj:error`; the direct batches before it stay, and the checkpoint is the end
+    of the last good batch. A failed job cannot be resumed (`job_not_interrupted`).
+*   **Resume.** `resume_job` needs the path again, re-hashes the file, refuses a changed file
+    (`source_changed`, the job stays `interrupted`), and continues at the checkpoint with the next
+    seq.
+*   **Stopping (not in the design).** `ingest_abort` on a *running* job whose runner is alive
+    sets a stop flag; the runner stops after its current batch and the job becomes
+    `interrupted` (abort it again to close it). Without this a mistaken 2 GiB load could not
+    be stopped.
+*   **Refusals added to the design's list:** `file_not_found`, `job_not_interrupted`.
+*   **Progress.** `ingest_status` has `file: {path, bytes, bytes_read, percent}` and, while a
+    runner is alive in this process, `triples_per_sec` and `eta_secs`.
+
+**Measured** (`docs/benchmarks/ingest.md`): 32,000-39,000 triples/s (target 50,000), about
+0.8 KiB of working set per triple loaded (target: under 512 MiB for 1 GiB), reads unaffected,
+concurrent writes waiting 72 ms at the 95th percentile. **The throughput and memory targets of
+phase 3 are not met**; both are set by the store's write transaction, not by the reader.
+`max_job_triples_direct` is kept but unconfirmed above a few million triples.
+
 **Not yet done:** chunked staging drops for large graphs (a staged job above
 `max_job_triples_staged` is refused earlier, so abort and commit drop a bounded graph in
-one request); `ingest_file`.
+one request); Turtle file jobs; a restart test with a real process kill (the restart is
+simulated by leaving the ledger in `running` and calling `recover`).
 
 ### Target Files to Create/Modify
 

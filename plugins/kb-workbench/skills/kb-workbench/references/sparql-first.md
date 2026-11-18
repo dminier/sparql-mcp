@@ -48,6 +48,14 @@ document set, an export), do not loop over `update_sparql` / `load_ontology`:
    viewer if one is connected. `ingest_abort` discards the job.
 5. After a restart, `ingest_status` lists the received `seq`s: re-send the missing ones.
 
+For a **large N-Triples file already on disk** (a dump, an export), do not read it into the
+conversation: call `mcp__sparql-mcp__ingest_file` with its path (it must be inside the
+server's `file_roots`; `file_roots_unset` means ask the user to configure it). It returns a
+`job_id` at once and loads in the background; poll `ingest_status` (`file.percent`,
+`triples_per_sec`, `eta_secs`). After a restart the job is `interrupted`: call `ingest_file`
+again with the same `path` and `resume_job`. `already_loaded` means this exact file is
+already in that graph. Turtle files are not streamed: convert them to N-Triples first.
+
 Use `update_sparql` only for small, targeted edits.
 
 ## Order of operations for any write

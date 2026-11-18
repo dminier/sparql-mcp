@@ -6,12 +6,15 @@
 //! into an `isError` result with a JSON payload. Arguments of the wrong type
 //! are `invalid_params`, as for every tool.
 
+use std::sync::Arc;
+
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
 use crate::application::ingest::{
-    BatchRequest, BeginRequest, Check, CommitRequest, IngestService, Mode, ValidateRequest,
+    BatchRequest, BeginRequest, Check, CommitRequest, FileRequest, IngestService, Mode,
+    ValidateRequest,
 };
 use crate::application::limits::ToolError;
 
@@ -158,6 +161,34 @@ pub fn tool_ingest_validate_def() -> Tool {
     )
 }
 
+pub fn tool_ingest_file_def() -> Tool {
+    make_tool(
+        "ingest_file",
+        "Load a big N-Triples file that is on the server's disk (inside [ingest] file_roots, which \
+         must be set), without sending it through the conversation. The file is hashed, then \
+         streamed in the background in batches; this call returns a job_id at once. Follow it with \
+         ingest_status (bytes_read, percent, triples_per_sec, eta_secs). mode direct (default) \
+         writes the target as it goes and the job ends committed; mode staged (small files only) \
+         ends open, then use ingest_validate and ingest_commit. A file already loaded into the \
+         same graph is refused (already_loaded) unless force. If the server restarted, the job is \
+         interrupted: call ingest_file again with resume_job (and the same path) to continue \
+         from its checkpoint; a changed file is refused (source_changed). ingest_abort on a \
+         running job stops it after its current batch. Only N-Triples (.nt) is streamed.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path of the .nt file, inside file_roots." },
+                "target_graph": { "type": "string", "description": "The active graph or a created project. Default: the active graph." },
+                "mode": { "type": "string", "enum": ["direct", "staged"], "description": "Default direct." },
+                "format": { "type": "string", "enum": ["ntriples"] },
+                "resume_job": { "type": "string", "description": "The interrupted job to continue." },
+                "force": { "type": "boolean", "description": "Load even if this file was already loaded into the graph." }
+            },
+            "required": ["path"]
+        }),
+    )
+}
+
 // ── Implementations ───────────────────────────────────────────────────────────
 
 /// An optional string argument: absent is `None`, a non-string is an error.
@@ -223,6 +254,7 @@ pub fn ingest_begin(svc: &IngestService, args: &JsonObject) -> Result<CallToolRe
         blank_nodes: opt_str(args, "blank_nodes")?
             .unwrap_or("skolemize")
             .to_string(),
+        file: None,
     };
     reply(svc.begin(&request))
 }
@@ -257,6 +289,25 @@ pub fn ingest_status(svc: &IngestService, args: &JsonObject) -> Result<CallToolR
 
 pub fn ingest_abort(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {
     reply(svc.abort(require_str(args, "job_id")?))
+}
+
+pub fn ingest_file(
+    svc: &Arc<IngestService>,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let mode = match opt_str(args, "mode")? {
+        None => Mode::Direct,
+        Some(s) => Mode::parse(s)
+            .ok_or_else(|| McpError::invalid_params("mode must be 'staged' or 'direct'", None))?,
+    };
+    reply(svc.start_file(&FileRequest {
+        path: require_str(args, "path")?.to_string(),
+        target_graph: opt_str(args, "target_graph")?.map(str::to_string),
+        mode,
+        format: opt_str(args, "format")?.map(str::to_string),
+        resume_job: opt_str(args, "resume_job")?.map(str::to_string),
+        force: opt_bool(args, "force")?.unwrap_or(false),
+    }))
 }
 
 pub fn ingest_validate(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {

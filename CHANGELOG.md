@@ -60,7 +60,11 @@ of domain-specific content.
   `ingest_validate` runs named read-only `SELECT`/`ASK` checks (`{{staging}}`, `{{target}}`;
   cancelled after `validate_timeout_secs`; at most 16 checks, 20 rows each) and records the
   outcome for `ingest_commit` with `require_validation`.
-  Not yet available: `ingest_file`.
+  `ingest_file` streams a server-side N-Triples file (inside `file_roots`) in the background,
+  with a checkpoint per batch, `resume_job` after a restart, `already_loaded` / `force`, and
+  progress in `ingest_status`; `ingest_abort` stops a running one. Measured at 32-39k triples/s
+  (`docs/benchmarks/ingest.md`). `[ingest] file_batch_triples` (5000). Turtle files are not
+  streamed.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 
