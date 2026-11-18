@@ -481,8 +481,9 @@ This text goes into the `sparql-first` and `kb-workbench` skill guidance.
 ### Alternative C: Agent writes one file, then calls `ingest_file`
 
 *   **Pros:** It reuses the streaming path, with a single call.
-*   **Cons:** The agent needs write access to a shared path, which is
-    awkward across WSL and Windows. A late error is found only after
+*   **Cons:** The agent needs write access to a directory inside
+    `file_roots`, and must produce the whole file before anything is checked.
+    A late error is found only after
     everything was produced, and nothing is validated before landing.
 *   **Partly adopted:** `ingest_file` exists for dumps. Agent-produced data
     uses batches.

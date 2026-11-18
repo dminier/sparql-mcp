@@ -173,7 +173,7 @@ as that design requires.
 ### Control path
 
 ```text
-Claude Code ──stdio MCP──▶ sparql-mcp-core (WSL)
+Claude Code ──stdio MCP──▶ sparql-mcp-core (native Windows)
                               │  viewer_* tool
                               │    ├─ store-side work (SPARQL search) runs here
                               │    └─ ViewerControl::request(op) ──┐
@@ -181,7 +181,7 @@ Claude Code ──stdio MCP──▶ sparql-mcp-core (WSL)
                               │                  ViewerHub (registry + pending ids)
                               │                                    │ {"request":…}
                               ▼                                    ▼
-                       viewer_channel  ◀══ loopback TCP (existing) ══▶ sparql-mcp-viewer (Windows)
+                       viewer_channel  ◀══ loopback TCP (existing) ══▶ sparql-mcp-viewer (native Windows)
                               ▲                                    │ connection thread
                               │ {"response":…}                     ▼
                               └──────────── AgentInbox ─▶ agent systems (Bevy) ─▶ camera / highlight /
@@ -191,8 +191,10 @@ Claude Code ──stdio MCP──▶ sparql-mcp-core (WSL)
 
 The core already holds the agent's MCP session and an accepted TCP
 connection to the viewer. Control reuses both. The TCP connection direction
-does not change: the viewer still connects to the core, through the same WSL2
-localhost forwarding the base design already relies on.
+does not change: the viewer still connects to the core on `127.0.0.1`. Both
+processes run natively on the same Windows machine, so there is no cross-OS
+step. Nothing in this design is Windows-specific, so the same
+single-binary-per-OS layout carries over to a future native Linux build.
 
 ### Wire protocol additions
 
@@ -439,11 +441,10 @@ and Claude Code would connect to it as a second MCP server.
 
 *   **Pros:** The viewer is controllable without `sparql-mcp-core`. No change
     to the side-channel.
-*   **Cons:** It adds a second MCP server to configure per project. Claude
-    Code runs in WSL, so it would need WSL → Windows networking (host IP or
-    mirrored mode), the opposite direction of the path already proven. The
-    tools would vanish or fail whenever the window is closed, which goes
-    against the no-op goal. The agent would combine two servers to do
+*   **Cons:** It adds a second MCP server to configure per project, plus a
+    second loopback port for the viewer to bind. That port is lost if the
+    viewer crashes or starts twice. The tools would vanish or fail whenever
+    the window is closed, which goes against the no-op goal. The agent would combine two servers to do
     `query → show`, and store search would need the viewer to query the
     store through a new path.
 *   **Rejected:** It costs more setup and is less robust, for no gain in
@@ -457,9 +458,9 @@ This is the design above.
 
 The core would connect to a second TCP port on the viewer for commands.
 
-*   **Cons:** Same WSL → Windows reachability problem as Alternative A. Two
-    connections would have to be kept consistent (which viewer goes with
-    which stream).
+*   **Cons:** The viewer would have to bind a second port. Two connections
+    would have to be kept consistent (which viewer goes with which stream),
+    and the core would need to discover the viewer's port.
 *   **Rejected:** The existing connection already carries all the needed
     context.
 
@@ -664,8 +665,8 @@ headless viewer attached. Assert `viewer_status` counts and a
 *   `cargo build --workspace`, `cargo test --workspace`,
     `cargo clippy --workspace -- -D warnings`, `cargo fmt --check`.
 *   Core integration tests (file 7) and the headless e2e (file 15) run in CI.
-*   Manual runs of CUJs 1–5 on the author's machine: core in WSL, viewer on
-    Windows, Claude Code driving. CUJ 5 is checked by closing the viewer
+*   Manual runs of CUJs 1–5 on the author's machine: core and viewer both
+    native on Windows, Claude Code driving. CUJ 5 is checked by closing the viewer
     mid-session.
 *   Compatibility: run the previous release's viewer against the new core,
     and the new viewer against the previous core. Both stream normally, and
