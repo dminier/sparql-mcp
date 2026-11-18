@@ -660,8 +660,9 @@ criterion passes.
     `parse_rdf` renames them per call, which would make a retry non-idempotent);
 *   `ingest_batch`: cheap checks and an idempotency fast path outside the gate,
     then parse, skolemize and check, then `write_batch`. Labelled blank nodes become
-    `<urn:sparql-mcp:genid:{job}:{label}>`; parser-generated ones (32 hexadecimal
-    digits) become `<urn:sparql-mcp:genid:{job}:{seq}:a{n}>` by order of first
+    `<urn:sparql-mcp:genid:{job}:{label}>`; parser-generated ones (28 to 32 lowercase hexadecimal
+    digits starting with a letter: Oxigraph drops the leading zeros of its random id, so about
+    6 in 100 have 31) become `<urn:sparql-mcp:genid:{job}:{seq}:a{n}>` by order of first
     appearance, so a retried Turtle batch gets the same IRIs. IRIs in
     `urn:sparql-mcp:` are `reserved_iri`; IRI and literal sizes are limited
     (`max_iri_bytes`, `max_literal_bytes`); `blank_nodes: reject` is honoured;

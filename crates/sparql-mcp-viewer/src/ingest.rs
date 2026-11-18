@@ -16,6 +16,16 @@ pub const FEED_CAPACITY: usize = 50;
 /// How many of the most recent feed entries the panel shows.
 const FEED_VISIBLE: usize = 12;
 
+/// What the agent did, as the feed lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentFeedOp {
+    Highlight,
+    Isolate,
+    Clear,
+    Filter,
+    Restore,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedKind {
     Snapshot,
@@ -24,6 +34,8 @@ pub enum FeedKind {
     Changed,
     Resync,
     OtherGraph,
+    /// A command of the agent that was applied.
+    Agent(AgentFeedOp),
 }
 
 impl FeedKind {
@@ -35,6 +47,21 @@ impl FeedKind {
             Self::Changed => "changed",
             Self::Resync => "resync",
             Self::OtherGraph => "other graph",
+            Self::Agent(AgentFeedOp::Highlight) => "agent highlight",
+            Self::Agent(AgentFeedOp::Isolate) => "agent isolate",
+            Self::Agent(AgentFeedOp::Clear) => "agent clear",
+            Self::Agent(AgentFeedOp::Filter) => "agent filter",
+            Self::Agent(AgentFeedOp::Restore) => "agent restore",
+        }
+    }
+
+    /// What the entry's count counts.
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::Agent(AgentFeedOp::Highlight | AgentFeedOp::Isolate) => "nodes",
+            Self::Agent(AgentFeedOp::Filter) => "changes",
+            Self::Agent(AgentFeedOp::Clear | AgentFeedOp::Restore) => "",
+            _ => "triples",
         }
     }
 }
@@ -235,10 +262,11 @@ fn update_feed_panel(feed: Res<ActivityFeed>, mut text: Query<&mut Text, With<Fe
     let mut lines = vec!["activity".to_string()];
     for entry in feed.0.iter().rev().take(FEED_VISIBLE) {
         lines.push(format!(
-            "{:>5.1}s ago  {:<11} {:>6} triples",
+            "{:>5.1}s ago  {:<15} {:>6} {}",
             entry.received_at.elapsed().as_secs_f32(),
             entry.kind.label(),
-            entry.triple_count
+            entry.triple_count,
+            entry.kind.unit()
         ));
     }
     if feed.0.is_empty() {
@@ -288,6 +316,17 @@ mod tests {
     use sparql_mcp::application::event_sink::Snapshot;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn an_agent_entry_has_its_own_label_and_unit() {
+        let k = FeedKind::Agent(AgentFeedOp::Isolate);
+        assert_eq!((k.label(), k.unit()), ("agent isolate", "nodes"));
+        assert_eq!(FeedKind::Agent(AgentFeedOp::Filter).unit(), "changes");
+        assert_eq!(FeedKind::Insert.unit(), "triples");
+        assert!(FeedKind::Agent(AgentFeedOp::Restore)
+            .label()
+            .starts_with("agent "));
+    }
 
     #[test]
     fn feed_is_a_ring_buffer_of_50() {

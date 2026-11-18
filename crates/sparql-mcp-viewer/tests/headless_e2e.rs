@@ -309,4 +309,20 @@ async fn the_core_reads_the_status_of_a_real_headless_viewer_and_sees_its_own_wr
         }
         other => panic!("{other:?}"),
     }
+
+    // A headless viewer has no window to highlight in, and says so.
+    let show = ViewerOp::Show {
+        iris: vec!["urn:project:q1".into()],
+        mode: sparql_mcp::application::viewer_control::ShowMode::Highlight,
+        focus: false,
+        select: None,
+        if_user_epoch: None,
+    };
+    match hub
+        .request(show, Instant::now() + Duration::from_secs(5))
+        .await
+    {
+        ViewerOutcome::Rejected { code, .. } => assert_eq!(code, "unsupported_headless"),
+        other => panic!("{other:?}"),
+    }
 }

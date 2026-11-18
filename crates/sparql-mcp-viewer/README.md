@@ -96,8 +96,25 @@ resyncs from a fresh snapshot.
 | `F` | Frame the whole graph |
 | Click a node | Select it: label, IRI (with a copy button), attributes, incoming and outgoing edges |
 | Click an edge in the panel | Select the node at its other end |
-| `Escape` | Clear the selection |
+| `Escape` | One step per press: clear the selection; else give back the view the agent changed; else clear the agent's highlight |
+| *Agent view · Restore my view* (top left, shown while the agent has something up) | Clear the agent's highlight and give back the selection and class filter you had |
 | Class panel (top left) | Toggle which classes' instances are shown; filtered-out nodes fade but keep their place |
+
+## Controlled by the agent
+
+With `[viewer] enabled` the server's `viewer_*` tools reach this viewer over the side-channel
+(`docs/designs/sparql-mcp-viewer-agent-control.md`):
+
+*   `viewer_show` makes nodes glow cyan. In *isolate* mode everything else fades, as do the edges that
+    do not join two of them. It can also select a node, which opens its panel.
+*   `viewer_filter` changes the same class filter as the panel on the right, so you can undo it there.
+*   `viewer_clear` drops the highlight, and with `restore` gives your view back.
+*   The activity feed lists each applied command as `agent highlight`, `agent isolate`,
+    `agent filter`, `agent clear` or `agent restore`.
+
+The agent never locks the interface. What you change is counted (`user.epoch`) and reported to the
+agent, which is told to pass it back so that it does not overwrite your last move. Camera moves,
+search and screenshots are not built yet. A `--headless` viewer answers `status` and refuses the rest.
 
 ## Security
 

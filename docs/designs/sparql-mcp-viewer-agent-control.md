@@ -810,10 +810,38 @@ Each phase starts only when the previous phase's exit criterion passes.
 
 ### Implementation status
 
-**Phase 1 is done** (the core integration test, `crates/sparql-mcp-core/tests/viewer_control.rs`,
-and a headless end-to-end test that starts the real viewer binary). Phases 2 to 6 are not started:
-the tools are `viewer_status` only, and the viewer answers `status` and refuses every other op
-with `unknown_op`.
+**Phases 1 and 2 are done.** Phases 3 to 6 (camera, search, screenshot, docs and skills) are not
+started: `camera`, `search_view` and `screenshot` are refused with `unknown_op`.
+
+**Phase 2 (show, clear, filter, highlight, restore, `Esc`).** What it did, and where it differs from
+the plan:
+
+*   **Core.** `ViewerOp::{Show, Clear, Filter}`, and the tools `viewer_show`, `viewer_clear` and
+    `viewer_filter` with their argument checks (`invalid_params` before the viewer is asked: at most
+    5000 IRIs, IRIs bare or in angle brackets, blank nodes refused, `filter` needs something to do).
+*   **Viewer, pure.** `agent::handle_windowed` takes plain values (`Ctx`), so every decision is a unit
+    test: `show` with no IRI drawn or an undrawn `select` changes nothing (`not_drawn`); a stale
+    `if_user_epoch` is refused (`user_changed`); `filter` toggles only classes that type a drawn
+    instance and lists the others as `unknown`; the restore point is taken before the agent's first
+    change to the selection or the filter and again only after the user moved; `clear` with
+    `restore` consumes it.
+*   **Viewer, Bevy.** `AgentHighlight`, `UserActivityTracker`, `UserViewCheckpoint`, the cyan
+    `agent_highlight_material`, `node_material_choice` (selected, highlighted, faded, pulse, kind),
+    isolate fading of edges, `escape_chain` in place of `clear_selection_on_escape`, the *Restore my
+    view* chip, and `FeedKind::Agent(AgentFeedOp)`. `AgentViewPlugin` (added by `ViewerPlugin`) sets
+    a `WindowedAgent` marker so that `answer_core_requests` stands down and a request is answered
+    once. The systems are tested in a minimal Bevy app, without a window.
+*   **User tracking.** The tracker compares the selection and the filter with what it saw last; the
+    agent's own writes are recorded so they do not count. `user.active` is any key, mouse button, wheel
+    or pointer move in the last 3 s. Camera input is not tracked yet (phase 3).
+*   **`focus`.** The camera does not move in this phase: `show` with `focus` answers
+    `camera_moved: false` with `reason: camera_not_moved: …`, and the tool description says so.
+*   **The restore does not move the camera** (nothing moves it yet).
+*   **Not checked on screen.** The colours, the fading of edges and the chip are covered by the
+    precedence tests, not by looking at them: that needs a person with the window open.
+
+**Phase 1** (the core integration test, `crates/sparql-mcp-core/tests/viewer_control.rs`,
+and a headless end-to-end test that starts the real viewer binary):
 
 What phase 1 did, and where it differs from the plan above:
 

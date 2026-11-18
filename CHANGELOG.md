@@ -32,6 +32,10 @@ of domain-specific content.
 - `viewer_load` example — load generator for the viewer, no agent needed.
 
 ### Fixed
+- **Turtle `[]` nodes in an ingestion job.** Oxigraph writes the random id of a generated blank node
+  without leading zeros, so about 6 in 100 have 31 digits, and the job took them for labels the agent
+  had written (so `blank_nodes: reject` could refuse a valid Turtle batch). Generated labels are now
+  recognised at 28 to 32 digits.
 - Idempotent file loading (`load_ontology_file`) failed on any Windows path:
   the path was embedded unescaped in a Turtle literal, and `\` is a Turtle
   escape character.
@@ -73,6 +77,14 @@ of domain-specific content.
   response lines on the side-channel, separate reader and writer tasks, an 8 MiB line cap, and a
   resync on the same connection after `changed` or a lag. A viewer without `control` in its first
   line (an older one) behaves as before.
+- **Viewer control, phase 2.** `viewer_show` (highlight or isolate nodes, select one), `viewer_clear`
+  (with `restore` to give the user's view back) and `viewer_filter` (the class filter the user sees).
+  The agent writes the same selection and filter the user clicks on, so the user can undo it in the
+  same panels; `Esc` now clears the selection, then restores the user's view, then clears the
+  highlight, one step per press; an *Agent view · Restore my view* chip shows while the agent has
+  something up; the activity feed lists what the agent did; the response's `user` block says
+  whether the user is active and how many times they changed the view, and `if_user_epoch` refuses a
+  stale command (`user_changed`). A headless viewer answers `unsupported_headless`.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 

@@ -166,6 +166,9 @@ impl Plugin for InteractPlugin {
         app.init_resource::<Selection>()
             .init_resource::<HoveredNode>()
             .init_resource::<ClassFilter>()
+            // `escape_chain` reads them; `AgentViewPlugin` adds the same ones.
+            .init_resource::<crate::agent::AgentHighlight>()
+            .init_resource::<crate::agent::UserViewCheckpoint>()
             .add_observer(on_node_click)
             .add_observer(on_node_over)
             .add_observer(on_node_out)
@@ -173,7 +176,7 @@ impl Plugin for InteractPlugin {
             .add_systems(
                 Update,
                 (
-                    clear_selection_on_escape,
+                    crate::agent::escape_chain,
                     update_selection_panel,
                     update_filter_panel,
                     update_labels,
@@ -213,12 +216,6 @@ fn on_node_out(out: On<PointerOut>, nodes: Query<&NodeRef>, mut hovered: ResMut<
         if hovered.0 == Some(node_ref.0) {
             hovered.0 = None;
         }
-    }
-}
-
-fn clear_selection_on_escape(keys: Res<ButtonInput<KeyCode>>, mut selection: ResMut<Selection>) {
-    if keys.just_pressed(KeyCode::Escape) && selection.0.is_some() {
-        selection.0 = None;
     }
 }
 

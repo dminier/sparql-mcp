@@ -11,6 +11,7 @@ use bevy::mesh::PrimitiveTopology;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 
+use crate::agent::AgentHighlight;
 use crate::arrow::edge_segments;
 use crate::graph::{EdgeStyle, NodeId, NodeKind, ViewerGraph};
 use crate::ingest::LastBatch;
@@ -33,6 +34,8 @@ pub struct ViewerStyle {
     pub selected_material: Handle<StandardMaterial>,
     pub faded_material: Handle<StandardMaterial>,
     pub last_batch_material: Handle<StandardMaterial>,
+    /// The nodes the agent points at: an emissive cyan, unlike any other.
+    pub agent_highlight_material: Handle<StandardMaterial>,
     /// How long the last batch pulses.
     pub pulse_secs: f32,
 }
@@ -116,6 +119,11 @@ fn setup_style(
         last_batch_material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.4, 1.0, 0.55),
             emissive: LinearRgba::rgb(0.4, 1.6, 0.6),
+            ..default()
+        }),
+        agent_highlight_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.2, 0.95, 1.0),
+            emissive: LinearRgba::rgb(0.3, 2.2, 2.6),
             ..default()
         }),
         pulse_secs: 2.0,
@@ -317,11 +325,13 @@ pub struct DirectedPairs(Option<u64>, std::collections::HashSet<(NodeId, NodeId)
 
 /// Rewrite the edge meshes' vertex positions. Only does work while the
 /// layout is awake, the graph changed, or the class filter changed.
+#[allow(clippy::too_many_arguments)]
 pub fn update_edge_meshes(
     graph: Res<ViewerGraph>,
     layout: Res<LayoutState>,
     edges: Option<Res<EdgeMeshes>>,
     filter: Option<Res<ClassFilter>>,
+    agent: Option<Res<AgentHighlight>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_generation: Local<Option<u64>>,
     mut pairs: Local<DirectedPairs>,
@@ -329,7 +339,8 @@ pub fn update_edge_meshes(
     let Some(edges) = edges else { return };
     let graph_changed = *last_generation != Some(graph.generation);
     let filter_changed = filter.as_ref().is_some_and(|f| f.is_changed());
-    if !layout.awake && !graph_changed && !filter_changed {
+    let agent_changed = agent.as_ref().is_some_and(|a| a.is_changed());
+    if !layout.awake && !graph_changed && !filter_changed && !agent_changed {
         return;
     }
     *last_generation = Some(graph.generation);
@@ -337,6 +348,12 @@ pub fn update_edge_meshes(
     let visible = |id: NodeId| match (&filter, graph.nodes.get(id.0 as usize)) {
         (Some(filter), Some(Some(node))) => filter.is_visible(node),
         _ => true,
+    };
+    // In isolate mode an edge stays lit only when both its ends are.
+    let isolating = agent.as_ref().is_some_and(|a| a.isolates());
+    let lit = |id: NodeId| match (&agent, graph.nodes.get(id.0 as usize)) {
+        (Some(agent), Some(Some(node))) => agent.contains(&node.term),
+        _ => false,
     };
     // The directed pairs, rebuilt only when the graph changes: a pair linked
     // both ways is drawn once, with a head at each end.
@@ -362,7 +379,9 @@ pub fn update_edge_meshes(
         if reverse && edge.from > edge.to {
             continue;
         }
-        let faded = !visible(edge.from) || !visible(edge.to);
+        let faded = !visible(edge.from)
+            || !visible(edge.to)
+            || (isolating && !(lit(edge.from) && lit(edge.to)));
         let bucket = &mut buckets[edge_slot(edge.style, faded)];
         for [p, q] in edge_segments(*a, *b, radius(edge.from), radius(edge.to), true, reverse) {
             bucket.push(p.to_array());
@@ -387,6 +406,44 @@ pub fn pulse_scale(t: f32) -> f32 {
     1.0 + PULSE_AMPLITUDE * (0.5 - 0.5 * phase)
 }
 
+/// Which of the shared materials a node gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialChoice {
+    Selected,
+    AgentHighlight,
+    Faded,
+    LastBatch,
+    Class,
+    Instance,
+}
+
+/// The order of precedence: selected, then pointed at by the agent, then faded
+/// (filtered out, or left out of an isolation), then the last-batch pulse, then
+/// the node's kind.
+pub fn node_material_choice(
+    selected: bool,
+    highlighted: bool,
+    filtered_out: bool,
+    isolate_faded: bool,
+    pulsing: bool,
+    kind: NodeKind,
+) -> MaterialChoice {
+    if selected {
+        MaterialChoice::Selected
+    } else if highlighted {
+        MaterialChoice::AgentHighlight
+    } else if filtered_out || isolate_faded {
+        MaterialChoice::Faded
+    } else if pulsing {
+        MaterialChoice::LastBatch
+    } else {
+        match kind {
+            NodeKind::Class => MaterialChoice::Class,
+            NodeKind::Instance => MaterialChoice::Instance,
+        }
+    }
+}
+
 /// Pick each node's shared material — selected, then faded (filtered out),
 /// then last batch, then its kind — and drive the last-batch pulse on
 /// `Transform.scale`. Handles and scales are only written when they change.
@@ -396,6 +453,7 @@ pub fn apply_node_materials(
     style: Option<Res<ViewerStyle>>,
     selection: Option<Res<Selection>>,
     filter: Option<Res<ClassFilter>>,
+    agent: Option<Res<AgentHighlight>>,
     last_batch: Option<Res<LastBatch>>,
     mut nodes: Query<
         (
@@ -423,17 +481,22 @@ pub fn apply_node_materials(
         };
         let pulsing = pulse_t.filter(|(seq, _)| node.last_touched == *seq);
         let filtered_out = filter.as_ref().is_some_and(|f| !f.is_visible(node));
-        let wanted = if selected == Some(node_ref.0) {
-            &style.selected_material
-        } else if filtered_out {
-            &style.faded_material
-        } else if pulsing.is_some() {
-            &style.last_batch_material
-        } else {
-            match node.kind {
-                NodeKind::Class => &style.class_material,
-                NodeKind::Instance => &style.instance_material,
-            }
+        let highlighted = agent.as_ref().is_some_and(|a| a.contains(&node.term));
+        let isolate_faded = agent.as_ref().is_some_and(|a| a.isolates()) && !highlighted;
+        let wanted = match node_material_choice(
+            selected == Some(node_ref.0),
+            highlighted,
+            filtered_out,
+            isolate_faded,
+            pulsing.is_some(),
+            node.kind,
+        ) {
+            MaterialChoice::Selected => &style.selected_material,
+            MaterialChoice::AgentHighlight => &style.agent_highlight_material,
+            MaterialChoice::Faded => &style.faded_material,
+            MaterialChoice::LastBatch => &style.last_batch_material,
+            MaterialChoice::Class => &style.class_material,
+            MaterialChoice::Instance => &style.instance_material,
         };
         if material.0 != *wanted {
             material.0 = wanted.clone();
@@ -449,6 +512,41 @@ pub fn apply_node_materials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn material_precedence_is_selected_highlighted_faded_pulse_kind() {
+        use MaterialChoice::*;
+        let k = NodeKind::Instance;
+        // (selected, highlighted, filtered_out, isolate_faded, pulsing)
+        assert_eq!(
+            node_material_choice(true, true, true, true, true, k),
+            Selected
+        );
+        assert_eq!(
+            node_material_choice(false, true, true, true, true, k),
+            AgentHighlight
+        );
+        assert_eq!(
+            node_material_choice(false, false, true, false, true, k),
+            Faded
+        );
+        assert_eq!(
+            node_material_choice(false, false, false, true, true, k),
+            Faded
+        );
+        assert_eq!(
+            node_material_choice(false, false, false, false, true, k),
+            LastBatch
+        );
+        assert_eq!(
+            node_material_choice(false, false, false, false, false, k),
+            Instance
+        );
+        assert_eq!(
+            node_material_choice(false, false, false, false, false, NodeKind::Class),
+            Class
+        );
+    }
 
     #[test]
     fn pulse_starts_at_rest_and_stays_between_1_and_1_3() {

@@ -83,7 +83,7 @@ ingestion job instead of looping over `load_ontology`:
    `validate_timeout_secs`). `ingest_commit` with `require_validation: true` then refuses
    unless the last validation passed and no batch arrived since.
 4. `ingest_commit`: the staged triples move into the target in one transaction.
-   The reply lists `new_subjects` (for `viewer_show`, once that tool exists: see *Live 3D viewer*).
+   The reply lists `new_subjects` (for `viewer_show`: see *Live 3D viewer*).
    `ingest_abort` discards the job instead.
 
 For a big N-Triples file on the server's disk, `ingest_file` streams it in the background
@@ -116,10 +116,14 @@ Configuration: [`sparql-mcp.toml`](sparql-mcp.toml).
 agent writes. Enable `[viewer]` in `sparql-mcp.toml`, then see
 [its README](crates/sparql-mcp-viewer/README.md).
 
-The agent can also look at the viewer: with `[viewer]` enabled, `viewer_status` returns the
-connected viewer's graph, node and edge counts (and says plainly when no viewer is open).
-Camera, filtering, search, highlighting and screenshots are designed
-([docs/designs/sparql-mcp-viewer-agent-control.md](docs/designs/sparql-mcp-viewer-agent-control.md))
+The agent can also drive the viewer. With `[viewer]` enabled the server lists `viewer_status`
+(graph, counts, selection, class filter, and whether the user is moving things),
+`viewer_show` (highlight nodes, or isolate them and fade the rest, and select one),
+`viewer_clear` and `viewer_filter` (hide or show classes, as the user does in the class panel).
+They answer plainly when no viewer is open. The user stays in charge: `Esc` or the *Restore my
+view* chip undoes the agent's changes, and a command can carry the last `user.epoch` it saw so
+that it does not overwrite something the user just did. Camera moves, search and screenshots are
+designed ([docs/designs/sparql-mcp-viewer-agent-control.md](docs/designs/sparql-mcp-viewer-agent-control.md))
 but not built yet.
 
 ## Claude Code plugin

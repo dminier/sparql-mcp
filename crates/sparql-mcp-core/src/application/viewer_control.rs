@@ -19,14 +19,50 @@ use serde_json::Value;
 pub enum ViewerOp {
     /// What the viewer shows now: graph, counts, camera, selection, filter.
     Status {},
+    /// Highlight nodes (or isolate them), and select one.
+    Show {
+        iris: Vec<String>,
+        mode: ShowMode,
+        focus: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        if_user_epoch: Option<u64>,
+    },
+    /// Drop the agent's highlight; with `restore`, give the user's view back.
+    Clear { restore: bool },
+    /// Edit the class filter the user sees in its panel.
+    Filter {
+        hide_classes: Vec<String>,
+        show_classes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        show_untyped: Option<bool>,
+        reset: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        if_user_epoch: Option<u64>,
+    },
+}
+
+/// How `show` marks its nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowMode {
+    /// The nodes glow; everything else is left as it was.
+    Highlight,
+    /// The nodes glow and everything else fades.
+    Isolate,
 }
 
 impl ViewerOp {
     /// Whether sending the same command twice leaves the viewer as sending it
     /// once, so that the core may repeat it after a lost connection.
     pub fn is_idempotent(&self) -> bool {
+        // Each of these sets a state rather than changing it by an amount.
         match self {
-            ViewerOp::Status {} => true,
+            ViewerOp::Status {}
+            | ViewerOp::Show { .. }
+            | ViewerOp::Clear { .. }
+            | ViewerOp::Filter { .. } => true,
         }
     }
 }
@@ -112,6 +148,38 @@ impl ViewerControl for NullViewerControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mutating_ops_serialize_with_their_arguments_and_skip_the_absent_ones() {
+        let show = serde_json::to_value(ViewerOp::Show {
+            iris: vec!["http://e/a".into()],
+            mode: ShowMode::Isolate,
+            focus: true,
+            select: None,
+            if_user_epoch: Some(4),
+        })
+        .unwrap();
+        assert_eq!(
+            show,
+            serde_json::json!({ "op": "show", "args": {
+                "iris": ["http://e/a"], "mode": "isolate", "focus": true, "if_user_epoch": 4 } })
+        );
+        let clear = serde_json::to_value(ViewerOp::Clear { restore: true }).unwrap();
+        assert_eq!(
+            clear,
+            serde_json::json!({ "op": "clear", "args": { "restore": true } })
+        );
+        let filter = serde_json::to_value(ViewerOp::Filter {
+            hide_classes: vec![],
+            show_classes: vec!["http://e/C".into()],
+            show_untyped: Some(false),
+            reset: false,
+            if_user_epoch: None,
+        })
+        .unwrap();
+        assert_eq!(filter["args"]["show_untyped"], false);
+        assert!(filter["args"].get("if_user_epoch").is_none());
+    }
 
     #[test]
     fn an_op_serializes_as_op_and_args() {

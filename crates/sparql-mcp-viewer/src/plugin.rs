@@ -112,6 +112,7 @@ impl Plugin for ViewerPlugin {
             InteractPlugin,
             IngestPlugin,
             EdgeHoverPlugin,
+            crate::agent::AgentViewPlugin,
         ))
         .add_systems(
             Update,
@@ -130,7 +131,7 @@ impl Plugin for ViewerPlugin {
 }
 
 /// Moves every pending message from [`Inbox`] into [`FrameMessages`].
-fn drain_inbox(inbox: Res<Inbox>, mut frame: ResMut<FrameMessages>) {
+pub fn drain_inbox(inbox: Res<Inbox>, mut frame: ResMut<FrameMessages>) {
     frame.0.clear();
     while let Ok(msg) = inbox.0.try_recv() {
         frame.0.push(msg);
