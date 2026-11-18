@@ -222,15 +222,13 @@ fn load_rdf_file_idempotent() {
         ..Default::default()
     };
     let r1 = s.load_rdf_file(&path, opts.clone(), false).unwrap();
-    let n1 = r1.triples_after - r1.triples_before;
-    assert!(n1 > 0);
+    assert!(r1.inserted_new > 0);
 
     // Second load — same hash → skip
     let r2 = s.load_rdf_file(&path, opts, false).unwrap();
     assert_eq!(
-        r2.triples_after - r2.triples_before,
-        0,
-        "expected 0 triples on idempotent re-load"
+        r2.inserted_new, 0,
+        "expected 0 new triples on idempotent re-load"
     );
     assert!(r2.skipped, "expected skipped=true on re-load");
 }

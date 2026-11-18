@@ -43,9 +43,24 @@ Named graphs: `<urn:project:<slug>>` per project, `<urn:meta>` for project metad
   `EventSink` it receives. Skip it and the viewer silently drifts from the store.
 - **RocksDB takes an exclusive lock.** CLI commands touching `./store`
   (`stats`, `load-file`, …) fail while a `serve` process holds it. Tests use
-  `OxigraphAdapter::open_in_memory()`.
+  `OxigraphAdapter::open_in_memory()` — except tests about concurrency
+  (`tests/write_path_hardening.rs`), which need `OxigraphAdapter::open` on a
+  `tempfile` directory: the in-memory store serializes writers by itself and
+  would hide a missing write gate.
+- **Writes go through `GatedStore` or `PrivilegedStore`** (`application::build_stores`),
+  never straight to the adapter. They take the write gate, which is **not
+  reentrant**: never call `WriteGate::run`/`run_blocking` around a store method,
+  and use `PrivilegedStore::exclusive` for several calls in one critical
+  section. Store methods block: call them from `spawn_blocking`.
+- **Ground writes must not scan the store.** `Store::len` is a full scan; only
+  `OxigraphAdapter::store_len` calls it, and pattern updates are its only
+  users on the write path. Count with `contains`.
+- **Refusals are `ToolError`s**, raised with `ToolError::into_anyhow()` (or
+  `limits::refuse` in a tool) so the agent gets an `isError` JSON result, not a
+  JSON-RPC error.
 - **Paths embedded in Turtle must be escaped** (`\` is a Turtle escape char —
-  this broke every Windows path once).
+  this broke every Windows path once). Prefer building RDF terms directly, as
+  the loaded-file ledger does, over formatting Turtle text.
 - The `recording` feature gates three tools; CI builds with `--all-features`,
   so feature-gated code must compile and pass clippy.
 

@@ -44,6 +44,25 @@ needed — there is no daemon. See [getting started](docs/getting-started.md).
 The `recording` feature adds `import_recording_navigations`,
 `import_recording_network` and `materialize_recording` (Playwright captures).
 
+## Write safety
+
+Every store write is serialized by one write gate, so a long import never
+blocks reads, and guarded for every caller, plugins included. See the
+`[ingest]` section of [`sparql-mcp.toml`](sparql-mcp.toml).
+
+- Internal graphs (`urn:meta`, `urn:hkb:meta:*`, `urn:sparql-mcp:jobs`,
+  `urn:sparql-mcp:staging:*`) cannot be
+  written through `update_sparql`, `load_ontology*` or `cbm_load_graph`.
+- `LOAD`, `DROP ALL` and `CLEAR ALL` are always refused. `DROP`, `CLEAR`,
+  `MOVE`/`COPY` onto a graph and `DELETE { ?s ?p ?o }` need
+  `allow_destructive_updates = true`. `update_sparql` with `dry_run: true`
+  reports whether a request would be refused, without running it.
+- Requests and payloads are size-limited, loads are atomic, and
+  `file_roots` can confine file access.
+- Refusals come back as `isError` results with a JSON `code` (`write_busy`,
+  `limit_exceeded`, `graph_protected`, `destructive_update_forbidden`,
+  `path_outside_roots`, …) so an agent can react to them.
+
 ## CLI
 
 ```text

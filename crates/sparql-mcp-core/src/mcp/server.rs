@@ -18,10 +18,11 @@ use rmcp::service::{RequestContext, RoleServer, RunningService};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
+use crate::application::limits::{clear_captured, take_captured};
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
 use crate::application::tools::{cbm, doc, export, gdrive, ontology, project, sparql};
-use crate::application::{EventSink, NullEventSink};
+use crate::application::{EventSink, NullEventSink, PrivilegedStore};
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -29,7 +30,11 @@ use crate::plugin::{PluginContext, ToolPlugin};
 
 #[derive(Clone)]
 pub struct SparqlMcpServer {
+    /// Write-gated store handle: what every tool and plugin receives.
     store: Arc<dyn SparqlStore>,
+    /// Handle for core modules that own the registry and ledger graphs
+    /// (`project_create`, recording imports).
+    privileged: Arc<PrivilegedStore>,
     doc_store: Arc<dyn DocStore>,
     ontology_dir: PathBuf,
     /// Shared with `infrastructure::viewer_channel`: `project_switch`
@@ -43,8 +48,12 @@ pub struct SparqlMcpServer {
 }
 
 impl SparqlMcpServer {
+    /// `gated` is the handle every tool and plugin receives. `privileged`
+    /// is for the tools that own the registry and ledger graphs. Both come
+    /// from `application::build_stores`, so they share one write gate.
     pub fn new(
-        store: Arc<dyn SparqlStore>,
+        gated: Arc<dyn SparqlStore>,
+        privileged: Arc<PrivilegedStore>,
         doc_store: Arc<dyn DocStore>,
         ontology_dir: PathBuf,
         active_graph: Arc<RwLock<String>>,
@@ -52,7 +61,8 @@ impl SparqlMcpServer {
         store_path: PathBuf,
     ) -> Self {
         Self {
-            store,
+            store: gated,
+            privileged,
             doc_store,
             ontology_dir,
             active_graph,
@@ -96,7 +106,38 @@ impl SparqlMcpServer {
 
     // ── Core tool dispatch ────────────────────────────────────────────────────
 
-    pub(crate) fn dispatch_core(
+    /// Run a core tool on a blocking thread, so store work (reads and
+    /// writes) never occupies a Tokio worker. Returns `None` for a name that
+    /// is not a core tool.
+    ///
+    /// A refusal raised below the tool (`write_busy`, …) comes back as an
+    /// `isError: true` result with a JSON payload, not a JSON-RPC error.
+    #[doc(hidden)] // public only so integration tests can drive tools without an MCP peer
+    pub async fn dispatch_core(
+        &self,
+        name: &str,
+        args: &JsonObject,
+    ) -> Option<Result<CallToolResult, McpError>> {
+        let me = self.clone();
+        let name = name.to_string();
+        let args = args.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            clear_captured();
+            let result = me.dispatch_core_blocking(&name, &args);
+            refusal_as_result(result)
+        })
+        .await;
+        match joined {
+            Ok(result) => result,
+            Err(e) => Some(Err(McpError::internal_error(
+                format!("tool task failed: {e}"),
+                None,
+            ))),
+        }
+    }
+
+    /// The synchronous dispatch table. Only called from a blocking thread.
+    fn dispatch_core_blocking(
         &self,
         name: &str,
         args: &JsonObject,
@@ -121,26 +162,75 @@ impl SparqlMcpServer {
                 &self.active_graph,
                 self.event_sink.as_ref(),
             ),
-            "cbm_load_graph" => cbm::cbm_load_graph(&self.store, args),
+            "cbm_load_graph" => cbm::cbm_load_graph(
+                &self.store,
+                args,
+                &self.active_graph,
+                self.event_sink.as_ref(),
+            ),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),
-            "project_create" => project::project_create(&self.store, args),
+            "project_create" => {
+                let privileged: Arc<dyn SparqlStore> = self.privileged.clone();
+                project::project_create(&privileged, args)
+            }
             "project_list" => project::project_list(&self.store),
             "project_switch" => project::project_switch(&self.active_graph, args),
             "write_doc" => doc::write_doc(&self.doc_store, args),
             "get_gdrive_config" => gdrive::get_gdrive_config(&self.gdrive_config, &self.store_path),
+            // Recording imports run a `CLEAR` followed by loads: hold the gate
+            // once for the whole import so other writers cannot interleave.
             #[cfg(feature = "recording")]
-            "import_recording_navigations" => {
-                recording::import_recording_navigations(&self.store, args)
+            "import_recording_navigations" => flatten_exclusive(
+                self.privileged
+                    .exclusive("import_recording_navigations", |store| {
+                        recording::import_recording_navigations(store, args)
+                    }),
+            ),
+            #[cfg(feature = "recording")]
+            "import_recording_network" => flatten_exclusive(
+                self.privileged
+                    .exclusive("import_recording_network", |store| {
+                        recording::import_recording_network(store, args)
+                    }),
+            ),
+            #[cfg(feature = "recording")]
+            "materialize_recording" => {
+                flatten_exclusive(self.privileged.exclusive("materialize_recording", |store| {
+                    recording::materialize_recording(store, args)
+                }))
             }
-            #[cfg(feature = "recording")]
-            "import_recording_network" => recording::import_recording_network(&self.store, args),
-            #[cfg(feature = "recording")]
-            "materialize_recording" => recording::materialize_recording(&self.store, args),
             _ => return None,
         };
         Some(result)
+    }
+}
+
+/// Turn a refusal raised below the tool into an `isError` tool result.
+/// `result` is what the tool returned; if it failed and a `ToolError` was
+/// recorded on this thread meanwhile, that error wins.
+fn refusal_as_result(
+    result: Option<Result<CallToolResult, McpError>>,
+) -> Option<Result<CallToolResult, McpError>> {
+    match result {
+        Some(Err(e)) => match take_captured() {
+            Some(refusal) => Some(Ok(refusal.to_result())),
+            None => Some(Err(e)),
+        },
+        other => other,
+    }
+}
+
+/// Flatten the result of `PrivilegedStore::exclusive`: the outer error is the
+/// gate failing (`write_busy`), the inner one is the tool's own.
+#[cfg(feature = "recording")]
+fn flatten_exclusive(
+    outcome: anyhow::Result<Result<CallToolResult, McpError>>,
+) -> Result<CallToolResult, McpError> {
+    match outcome {
+        Ok(tool_result) => tool_result,
+        Err(gate_error) => Err(McpError::internal_error(gate_error.to_string(), None)),
     }
 }
 
@@ -187,22 +277,34 @@ impl ServerHandler for SparqlMcpServer {
         let name = request.name.as_ref();
 
         // Core tools take priority.
-        if let Some(result) = self.dispatch_core(name, args) {
+        if let Some(result) = self.dispatch_core(name, args).await {
             return result;
         }
 
-        // Plugin dispatch — first match wins.
+        // Plugin dispatch — first match wins. Plugins call the (gated) store
+        // synchronously, so the whole loop runs on one blocking thread.
+        let plugins = self.plugins.clone();
         let ctx = self.plugin_ctx();
-        for plugin in self.plugins.iter() {
-            if let Some(result) = plugin.call(name, args, &ctx) {
-                return result;
-            }
+        let (plugin_name, plugin_args) = (name.to_string(), args.clone());
+        let joined = tokio::task::spawn_blocking(move || {
+            clear_captured();
+            let result = plugins
+                .iter()
+                .find_map(|plugin| plugin.call(&plugin_name, &plugin_args, &ctx));
+            refusal_as_result(result)
+        })
+        .await;
+        match joined {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(McpError::invalid_params(
+                format!("unknown tool: {name}"),
+                None,
+            )),
+            Err(e) => Err(McpError::internal_error(
+                format!("plugin task failed: {e}"),
+                None,
+            )),
         }
-
-        Err(McpError::invalid_params(
-            format!("unknown tool: {name}"),
-            None,
-        ))
     }
 
     async fn list_resources(
@@ -332,10 +434,13 @@ mod dispatch_tests {
     use std::sync::Arc;
 
     fn build_server() -> SparqlMcpServer {
-        let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+        let raw: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+        let gate = crate::application::WriteGate::new(std::time::Duration::from_secs(5));
+        let (gated, privileged) = crate::application::build_stores(raw, gate);
         let doc_store = Arc::new(FsDocStore::new(std::env::temp_dir().join("smcp-disp")));
         SparqlMcpServer::new(
-            store,
+            gated,
+            privileged,
             doc_store,
             std::path::PathBuf::from("./ontology"),
             Arc::new(RwLock::new("urn:project:default".into())),
@@ -344,20 +449,17 @@ mod dispatch_tests {
         )
     }
 
-    #[test]
-    fn every_declared_tool_has_a_dispatch_arm() {
+    #[tokio::test]
+    async fn every_declared_tool_has_a_dispatch_arm() {
         let server = build_server();
         let empty = object!({});
-        let missing: Vec<String> = core_tool_defs()
-            .iter()
-            .filter_map(|t| {
-                let name = t.name.as_ref();
-                match server.dispatch_core(name, &empty) {
-                    Some(_) => None,
-                    None => Some(name.to_string()),
-                }
-            })
-            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        for t in core_tool_defs() {
+            let name = t.name.as_ref();
+            if server.dispatch_core(name, &empty).await.is_none() {
+                missing.push(name.to_string());
+            }
+        }
         assert!(
             missing.is_empty(),
             "these tools are listed by list_tools but have no dispatch_core arm: {missing:?}"

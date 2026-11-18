@@ -7,7 +7,9 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::event_sink::{classify_subjects, EventSink, StoreEvent};
+use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange, StoreEvent};
+use crate::application::guards::classify_sparql;
+use crate::application::limits::{refuse, take_captured, ToolError};
 use crate::domain::{QueryResult, RdfTerm, SolutionSet, SparqlStore, UpdateOutcome};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -75,23 +77,34 @@ pub fn update_sparql(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Always validate syntax.
-    // For dry_run we still need to parse; the domain trait does it on execute.
-    // We do a lightweight check by attempting to parse, then skipping execution.
     if dry_run {
-        // Validate by calling update on a quick parse — if the store's
-        // update() returns an error on a bad query the caller sees it.
-        // We rely on the adapter to reject bad syntax at parse time.
-        let triples = store
-            .triple_count()
-            .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
+        // Parse and classify without running anything. A syntax error is a
+        // `parse_error`; a request this handle would refuse is reported under
+        // `refused` instead of being run.
+        let class = classify_sparql(sparql).map_err(refuse)?;
+        let refused = match store.check_update(sparql) {
+            Ok(()) => None,
+            Err(e) => {
+                // The refusal is reported as data here, not raised.
+                let _ = take_captured();
+                Some(
+                    e.downcast_ref::<ToolError>()
+                        .map(ToolError::to_json)
+                        .unwrap_or_else(|| json!({ "code": "error", "message": e.to_string() })),
+                )
+            }
+        };
+        let graphs: Vec<&str> = class.graphs.iter().map(String::as_str).collect();
         return Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "dry_run": true,
-                "triples_before": triples,
-                "triples_after": triples,
-                "delta": 0,
+                "operations": class.operations,
+                // "" is the default graph.
+                "graphs": graphs,
+                "all_graphs": class.all_graphs,
+                "destructive": class.destructive,
+                "refused": refused,
             }))
             .unwrap(),
         )]));
@@ -109,24 +122,15 @@ pub fn update_sparql(
     // This is an explicit, documented limitation, not a silent gap:
     // pattern-based updates do not get node-level detail in the viewer in
     // v1 — only ground INSERT DATA / DELETE DATA produce a precise event.
+    // Ground events name the graph each quad actually went to, which is not
+    // necessarily the active one.
     match &outcome {
         UpdateOutcome::Ground {
             inserted, deleted, ..
         } => {
-            if !inserted.is_empty() {
-                event_sink.emit(StoreEvent::Insert {
-                    graph: graph.clone(),
-                    kinds: classify_subjects(inserted),
-                    triples: inserted.clone(),
-                });
-            }
-            if !deleted.is_empty() {
-                event_sink.emit(StoreEvent::Delete {
-                    graph: graph.clone(),
-                    kinds: classify_subjects(deleted),
-                    triples: deleted.clone(),
-                });
-            }
+            let limits = EventLimits::default();
+            emit_quads(event_sink, QuadChange::Inserted, inserted, limits);
+            emit_quads(event_sink, QuadChange::Deleted, deleted, limits);
         }
         UpdateOutcome::Pattern {
             triples_before,
@@ -140,16 +144,26 @@ pub fn update_sparql(
         }
     }
 
-    let before = outcome.triples_before();
-    let after = outcome.triples_after();
+    // `triples_before` / `triples_after` are whole-store sizes: only a
+    // pattern update has them (it already scanned), and they are `null` for a
+    // ground update, which no longer scans. `delta` is exact in both cases.
+    let mut payload = json!({
+        "status": "ok",
+        "triples_before": outcome.triples_before(),
+        "triples_after": outcome.triples_after(),
+        "delta": outcome.delta(),
+    });
+    if let UpdateOutcome::Ground {
+        inserted_new,
+        removed_existing,
+        ..
+    } = &outcome
+    {
+        payload["inserted_new"] = json!(inserted_new);
+        payload["removed_existing"] = json!(removed_existing);
+    }
     Ok(CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(&json!({
-            "status": "ok",
-            "triples_before": before,
-            "triples_after": after,
-            "delta": after as i64 - before as i64,
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&payload).unwrap(),
     )]))
 }
 
@@ -206,37 +220,6 @@ fn render_term(term: RdfTerm) -> Value {
             Value::Object(obj)
         }
     }
-}
-
-/// Wrap a store mutation in before/after triple counts and return JSON.
-pub fn with_delta<F>(
-    store: &Arc<dyn SparqlStore>,
-    extra: Value,
-    f: F,
-) -> Result<CallToolResult, McpError>
-where
-    F: FnOnce(&Value) -> Result<(), McpError>,
-{
-    let before = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
-    f(&extra)?;
-    let after = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
-
-    let mut payload = json!({
-        "status": "ok",
-        "triples_before": before,
-        "triples_after": after,
-        "delta": after as i64 - before as i64,
-    });
-    if let (Value::Object(p), Value::Object(e)) = (&mut payload, extra) {
-        p.extend(e);
-    }
-    Ok(CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(&payload).unwrap(),
-    )]))
 }
 
 // ── Shared small helpers ──────────────────────────────────────────────────────

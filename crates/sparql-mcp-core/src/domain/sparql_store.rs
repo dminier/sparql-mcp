@@ -95,13 +95,40 @@ pub enum QueryResult {
 /// A pattern-based update (`INSERT/DELETE … WHERE`, `LOAD`, `CLEAR`, …)
 /// only reports aggregate counts — the literal triples bound by the
 /// pattern are not cheaply knowable.
+/// One RDF quad with each term in its N-Triples encoding (`<iri>`, `_:b0`,
+/// `"lit"^^<dt>`). `g` is the named graph IRI **without** angle brackets, or
+/// `None` for the default graph.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoredQuad {
+    pub s: String,
+    pub p: String,
+    pub o: String,
+    pub g: Option<String>,
+}
+
+impl StoredQuad {
+    /// The subject/predicate/object triple, as used by event payloads.
+    pub fn triple(&self) -> [String; 3] {
+        [self.s.clone(), self.p.clone(), self.o.clone()]
+    }
+}
+
+/// What a SPARQL update changed.
+///
+/// A ground update (`INSERT DATA` / `DELETE DATA` only) reports exactly the
+/// quads involved, with counts that cost no whole-store scan. A pattern
+/// update (`INSERT/DELETE … WHERE`, `LOAD`, `CLEAR`, …) only reports
+/// aggregate store sizes, which cost a full scan and are therefore only
+/// computed for pattern updates.
 #[derive(Debug, Clone)]
 pub enum UpdateOutcome {
     Ground {
-        inserted: Vec<[String; 3]>,
-        deleted: Vec<[String; 3]>,
-        triples_before: u64,
-        triples_after: u64,
+        inserted: Vec<StoredQuad>,
+        deleted: Vec<StoredQuad>,
+        /// Inserted quads that were not in the store before.
+        inserted_new: u64,
+        /// Deleted quads that were in the store before.
+        removed_existing: u64,
     },
     Pattern {
         triples_before: u64,
@@ -110,19 +137,36 @@ pub enum UpdateOutcome {
 }
 
 impl UpdateOutcome {
-    pub fn triples_before(&self) -> u64 {
+    /// Store size before the update. `None` for a ground update, which does
+    /// not scan the store.
+    pub fn triples_before(&self) -> Option<u64> {
         match self {
-            Self::Ground { triples_before, .. } | Self::Pattern { triples_before, .. } => {
-                *triples_before
-            }
+            Self::Ground { .. } => None,
+            Self::Pattern { triples_before, .. } => Some(*triples_before),
         }
     }
 
-    pub fn triples_after(&self) -> u64 {
+    /// Store size after the update. `None` for a ground update.
+    pub fn triples_after(&self) -> Option<u64> {
         match self {
-            Self::Ground { triples_after, .. } | Self::Pattern { triples_after, .. } => {
-                *triples_after
-            }
+            Self::Ground { .. } => None,
+            Self::Pattern { triples_after, .. } => Some(*triples_after),
+        }
+    }
+
+    /// Net change in quads: exact for a ground update, a difference of store
+    /// sizes for a pattern update.
+    pub fn delta(&self) -> i64 {
+        match self {
+            Self::Ground {
+                inserted_new,
+                removed_existing,
+                ..
+            } => *inserted_new as i64 - *removed_existing as i64,
+            Self::Pattern {
+                triples_before,
+                triples_after,
+            } => *triples_after as i64 - *triples_before as i64,
         }
     }
 }
@@ -134,17 +178,16 @@ pub struct FileLoadResult {
     pub bytes_read: usize,
     pub sha256: String,
     pub skipped: bool,
-    pub triples_before: u64,
-    pub triples_after: u64,
-    /// Triples parsed from the file, N-Triples-encoded (empty when
-    /// `skipped` is `true`) — the exact data a `StoreEvent::Insert` for
-    /// this load reports.
-    pub triples: Vec<[String; 3]>,
+    /// Quads parsed from the file that were not in the store before.
+    pub inserted_new: u64,
+    /// Quads parsed from the file (empty when `skipped` is `true`): the
+    /// exact data a `StoreEvent::Insert` for this load reports.
+    pub triples: Vec<StoredQuad>,
 }
 
 impl FileLoadResult {
     pub fn delta(&self) -> i64 {
-        self.triples_after as i64 - self.triples_before as i64
+        self.inserted_new as i64
     }
 }
 
@@ -177,7 +220,24 @@ pub trait SparqlStore: Send + Sync {
         &self,
         content: &[u8],
         opts: LoadOpts,
-    ) -> Result<(u64, Vec<[String; 3]>)>;
+    ) -> Result<(u64, Vec<StoredQuad>)>;
+
+    /// Parse RDF into quads **without touching the store**: pure CPU work that
+    /// takes no write gate. Blank nodes are renamed per call, as in
+    /// [`Self::load_rdf`]. Pair it with [`Self::write_quads`] to load a large
+    /// payload in bounded chunks, releasing the write gate between them.
+    fn parse_rdf(&self, content: &[u8], opts: &LoadOpts) -> Result<Vec<StoredQuad>>;
+
+    /// Write `quads` in one transaction. Returns how many were not in the
+    /// store before; the count costs no whole-store scan.
+    fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64>;
+
+    /// Whether `update` would be refused for this handle's caller, without
+    /// running it: too large, a syntax error, a protected graph, or a
+    /// destructive operation. A plain store never refuses.
+    fn check_update(&self, _sparql: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Load an RDF file from disk, with SHA-256 idempotence.
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult>;

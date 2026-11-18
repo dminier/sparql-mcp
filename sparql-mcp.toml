@@ -21,3 +21,22 @@ folder_id = "<your-google-drive-folder-id>"
 # default — enabling it costs one extra loopback TCP listener, nothing else.
 enabled = false
 bind    = "127.0.0.1:7878"
+
+[ingest]
+# Write safety limits and guards. Every key is optional; the values below are
+# the defaults, except `file_roots`, which is unset by default.
+#
+# write_wait_timeout_secs   = 30         # wait for the write gate before `write_busy`
+# max_update_bytes          = 1048576    # largest update_sparql request
+# max_batch_bytes           = 1048576    # largest inline RDF payload (load_ontology)
+# max_load_file_bytes       = 67108864   # largest file for load_ontology_file
+#
+# DROP / CLEAR / MOVE / COPY onto a graph, `DELETE { ?s ?p ?o }` and
+# INSERT over a variable graph are refused unless this is true. Writes to the
+# internal graphs, LOAD, and DROP ALL / CLEAR ALL stay refused either way.
+# allow_destructive_updates = false
+#
+# Confine load_ontology_file and export_graph to these directories. Use TOML
+# literal (single-quoted) strings so Windows backslashes are kept. A root that
+# does not exist stops the server at startup.
+# file_roots = ['C:\data\rdf', 'D:/dumps']

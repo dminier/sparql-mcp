@@ -339,3 +339,87 @@ fn node_properties_preserved_in_sparql() {
     assert_eq!(sol.rows.len(), 1);
     assert_eq!(sol.rows[0]["complexity"].as_value_str(), "5");
 }
+
+// ── cbm_load_graph tool (hardening 0b) ────────────────────────────────────────
+
+use sparql_mcp::application::event_sink::{EventSink, StoreEvent};
+use sparql_mcp::application::tools::cbm::cbm_load_graph;
+
+#[derive(Default)]
+struct Collect(std::sync::Mutex<Vec<StoreEvent>>);
+
+impl EventSink for Collect {
+    fn emit(&self, event: StoreEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[test]
+fn cbm_load_graph_goes_to_the_active_graph_in_chunks_and_emits_events() {
+    let db = cbm_fixture();
+    let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+    let active = Arc::new(std::sync::RwLock::new("urn:project:code".to_string()));
+    let sink = Collect::default();
+    let args = serde_json::json!({ "cbm_db_path": db.path().display().to_string() });
+
+    let res = cbm_load_graph(&store, args.as_object().unwrap(), &active, &sink).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(res.content[0].as_text().unwrap().text.as_str()).unwrap();
+
+    // No graph_iri argument: the data lands in the active graph.
+    assert_eq!(body["graph_iri"], "urn:project:code");
+    let inserted = body["inserted_new"].as_u64().unwrap();
+    assert!(inserted > 0);
+    assert_eq!(body["delta"].as_u64().unwrap(), inserted);
+    assert!(body["chunks"].as_u64().unwrap() >= 1);
+    assert!(
+        body["triples_after"].is_null(),
+        "the whole-store scan is gone"
+    );
+
+    // Every write reports a StoreEvent naming that graph (the invariant that
+    // keeps the viewer from drifting from the store).
+    let events = sink.0.lock().unwrap();
+    assert!(!events.is_empty(), "cbm_load_graph emitted no StoreEvent");
+    let mut reported = 0usize;
+    for e in events.iter() {
+        match e {
+            StoreEvent::Insert { graph, triples, .. } => {
+                assert_eq!(graph, "urn:project:code");
+                reported += triples.len();
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert_eq!(reported as u64, body["parsed"].as_u64().unwrap());
+
+    // And it is queryable in that graph, not in the default graph.
+    let ask = store
+        .query("ASK { GRAPH <urn:project:code> { ?s ?p ?o } }")
+        .unwrap();
+    assert!(matches!(ask, QueryResult::Boolean(true)));
+    let none = store.query("ASK { ?s ?p ?o }").unwrap();
+    assert!(matches!(none, QueryResult::Boolean(false)));
+}
+
+#[test]
+fn cbm_load_graph_twice_adds_nothing_new() {
+    let db = cbm_fixture();
+    let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+    let active = Arc::new(std::sync::RwLock::new("urn:project:code".to_string()));
+    let args = serde_json::json!({ "cbm_db_path": db.path().display().to_string() });
+    let run = || {
+        let res = cbm_load_graph(
+            &store,
+            args.as_object().unwrap(),
+            &active,
+            &Collect::default(),
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(res.content[0].as_text().unwrap().text.as_str()).unwrap();
+        body["inserted_new"].as_u64().unwrap()
+    };
+    assert!(run() > 0);
+    assert_eq!(run(), 0, "the second import re-inserted existing triples");
+}

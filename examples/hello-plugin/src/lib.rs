@@ -6,8 +6,13 @@
 //! use sparql_mcp::mcp::server::SparqlMcpServer;
 //! use hello_plugin::HelloPlugin;
 //!
-//! let server = SparqlMcpServer::new(store, doc_store, ontology_dir, active_graph)
-//!     .with_plugins(vec![Box::new(HelloPlugin)]);
+//! // `build_stores` returns the write-gated handle that plugins receive in
+//! // `PluginContext::store`, and a privileged one for the core's own tools.
+//! let (gated, privileged) = sparql_mcp::application::build_stores(raw_store, gate);
+//! let server = SparqlMcpServer::new(
+//!     gated, privileged, doc_store, ontology_dir, active_graph, None, store_path,
+//! )
+//! .with_plugins(vec![Box::new(HelloPlugin)]);
 //! server.serve_stdio().await?;
 //! ```
 

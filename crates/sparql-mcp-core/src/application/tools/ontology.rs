@@ -7,7 +7,7 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::event_sink::{classify_subjects, EventSink, StoreEvent};
+use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange};
 use crate::domain::{InputFormat, LoadOpts, SparqlStore};
 
 use super::sparql::{make_tool, require_str};
@@ -18,8 +18,9 @@ pub fn tool_load_ontology_def() -> Tool {
     make_tool(
         "load_ontology",
         "Parse an inline RDF payload (Turtle by default; also N-Triples / RDF-XML) \
-         and insert it into the store. Optional graph_iri targets a named graph. \
-         Returns triple counts + delta.",
+         and insert it into the store. Optional graph_iri targets a named graph; \
+         it defaults to the active project graph. Returns inserted_new (the quads \
+         that were not already present) and delta.",
         json!({
             "type": "object",
             "properties": {
@@ -32,7 +33,7 @@ pub fn tool_load_ontology_def() -> Tool {
                 "base_iri": { "type": "string" },
                 "graph_iri": {
                     "type": "string",
-                    "description": "Target named graph IRI. Omit to load into the default graph."
+                    "description": "Target named graph IRI. Omit to load into the active project graph."
                 }
             },
             "required": ["turtle"]
@@ -77,40 +78,42 @@ pub fn load_ontology(
         .and_then(Value::as_str)
         .unwrap_or("turtle");
     let format = parse_format(format_label)?;
-    let graph_iri = args.get("graph_iri").and_then(Value::as_str);
+    let graph_iri = target_graph(args, active_graph)?;
 
     let opts = LoadOpts {
         format,
-        graph_iri: graph_iri.map(str::to_string),
+        graph_iri: Some(graph_iri.clone()),
         base_iri: args
             .get("base_iri")
             .and_then(Value::as_str)
             .map(str::to_string),
     };
-    let content = turtle.as_bytes().to_vec();
 
-    let before = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
-    let (_delta, triples) = store
-        .load_rdf_with_triples(&content, opts)
+    // The load is atomic and costs no whole-store scan: it reports how many
+    // of the parsed quads were new.
+    let (inserted_new, triples) = store
+        .load_rdf_with_triples(turtle.as_bytes(), opts)
         .map_err(|e| McpError::invalid_params(format!("parse/load error: {e}"), None))?;
-    let after = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
 
-    emit_insert(active_graph, event_sink, &triples)?;
+    emit_quads(
+        event_sink,
+        QuadChange::Inserted,
+        &triples,
+        EventLimits::default(),
+    );
 
-    let mut payload = json!({
+    let payload = json!({
         "status": "ok",
-        "triples_before": before,
-        "triples_after": after,
-        "delta": after as i64 - before as i64,
+        // Deprecated: whole-store sizes cost a full scan, so they are no
+        // longer computed. Use `inserted_new` / `delta`.
+        "triples_before": null,
+        "triples_after": null,
+        "delta": inserted_new,
+        "inserted_new": inserted_new,
+        "parsed": triples.len(),
         "format": format_label,
+        "graph_iri": graph_iri,
     });
-    if let Some(iri) = graph_iri {
-        payload["graph_iri"] = json!(iri);
-    }
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&payload).unwrap(),
     )]))
@@ -128,12 +131,12 @@ pub fn load_ontology_file(
         .and_then(Value::as_str)
         .and_then(InputFormat::from_label)
         .unwrap_or_else(|| InputFormat::guess_from_path(path_str));
-    let graph_iri = args.get("graph_iri").and_then(Value::as_str);
+    let graph_iri = target_graph(args, active_graph)?;
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
     let opts = LoadOpts {
         format,
-        graph_iri: graph_iri.map(str::to_string),
+        graph_iri: Some(graph_iri.clone()),
         base_iri: args
             .get("base_iri")
             .and_then(Value::as_str)
@@ -145,7 +148,12 @@ pub fn load_ontology_file(
         .map_err(|e| McpError::invalid_params(format!("load file: {e}"), None))?;
 
     if !result.skipped {
-        emit_insert(active_graph, event_sink, &result.triples)?;
+        emit_quads(
+            event_sink,
+            QuadChange::Inserted,
+            &result.triples,
+            EventLimits::default(),
+        );
     }
 
     let mut payload = json!({
@@ -154,16 +162,16 @@ pub fn load_ontology_file(
         "format": result.format.as_label(),
         "bytes_read": result.bytes_read,
         "sha256": result.sha256,
-        "triples_before": result.triples_before,
-        "triples_after": result.triples_after,
+        // Deprecated, see `load_ontology`.
+        "triples_before": null,
+        "triples_after": null,
         "delta": result.delta(),
+        "inserted_new": result.inserted_new,
+        "graph_iri": graph_iri,
     });
     if result.skipped {
         payload["skipped"] = json!(true);
         payload["reason"] = json!("file already loaded (same SHA-256)");
-    }
-    if let Some(iri) = graph_iri {
-        payload["graph_iri"] = json!(iri);
     }
 
     Ok(CallToolResult::success(vec![Content::text(
@@ -171,27 +179,17 @@ pub fn load_ontology_file(
     )]))
 }
 
-/// Both `load_ontology` and `load_ontology_file` load ground data, so both
-/// can always emit a precise `StoreEvent::Insert` — unlike `update_sparql`,
-/// there is no pattern-based case here.
-fn emit_insert(
-    active_graph: &Arc<RwLock<String>>,
-    event_sink: &dyn EventSink,
-    triples: &[[String; 3]],
-) -> Result<(), McpError> {
-    if triples.is_empty() {
-        return Ok(());
+/// The graph a load goes into: the `graph_iri` argument, or else the active
+/// project graph (as the CLI `load-file` does). Loading into the default
+/// graph, which no viewer shows, is no longer the silent fallback.
+fn target_graph(args: &JsonObject, active_graph: &Arc<RwLock<String>>) -> Result<String, McpError> {
+    if let Some(iri) = args.get("graph_iri").and_then(Value::as_str) {
+        return Ok(iri.to_string());
     }
-    let graph = active_graph
+    Ok(active_graph
         .read()
         .map_err(|_| McpError::internal_error("active_graph lock poisoned", None))?
-        .clone();
-    event_sink.emit(StoreEvent::Insert {
-        graph,
-        kinds: classify_subjects(triples),
-        triples: triples.to_vec(),
-    });
-    Ok(())
+        .clone())
 }
 
 fn parse_format(label: &str) -> Result<InputFormat, McpError> {

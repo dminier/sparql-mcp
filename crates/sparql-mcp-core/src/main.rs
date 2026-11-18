@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use sparql_mcp::application::BroadcastEventSink;
+use sparql_mcp::application::{build_stores_with, BroadcastEventSink, GuardConfig, WriteGate};
 use sparql_mcp::cbm::{db as cbm_db, turtle as cbm_turtle};
 use sparql_mcp::config::{Config, McpServer, DEFAULT_CONFIG_FILE, DEFAULT_MCP_JSON_FILE};
 use sparql_mcp::domain::{InputFormat, LoadOpts, SparqlStore};
@@ -203,7 +203,10 @@ async fn run(cli: Cli) -> Result<()> {
         tracing::info!(project = %kg.project.name, nodes = kg.nodes.len(), edges = kg.edges.len(), "loaded CBM graph");
         let turtle = cbm_turtle::graph_to_turtle_with(
             &kg,
-            cbm_turtle::ExportOptions { with_source, max_source_bytes },
+            cbm_turtle::ExportOptions {
+                with_source,
+                max_source_bytes,
+            },
         );
         let slug: String = kg
             .project
@@ -232,8 +235,18 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open(&store_path)?);
-    store.load_ontology_dir(&ontology_path)?;
+    // One raw adapter, two write-gated handles that share one gate:
+    // `store` for tools, plugins and the CLI; `privileged` for the code that
+    // owns the registry and ledger graphs. The viewer channel only reads, so
+    // it keeps the raw adapter.
+    let raw: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open(&store_path)?);
+    let gate = WriteGate::new(std::time::Duration::from_secs(
+        cfg.ingest.write_wait_timeout_secs,
+    ));
+    let (gated, privileged) =
+        build_stores_with(raw.clone(), gate, GuardConfig::from_config(&cfg.ingest)?);
+    let store: Arc<dyn SparqlStore> = gated.clone();
+    privileged.load_ontology_dir(&ontology_path)?;
 
     match cli.cmd {
         Cmd::Tools(mcp) => {
@@ -282,7 +295,10 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let turtle = cbm_turtle::graph_to_turtle_with(
                 &kg,
-                cbm_turtle::ExportOptions { with_source, max_source_bytes },
+                cbm_turtle::ExportOptions {
+                    with_source,
+                    max_source_bytes,
+                },
             );
             let slug: String = kg
                 .project
@@ -345,7 +361,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{result:?}");
         }
         Cmd::ReloadOntology => {
-            let n = store.load_ontology_dir(&ontology_path)?;
+            let n = privileged.load_ontology_dir(&ontology_path)?;
             println!(
                 "reloaded {n} ontology file(s); triples: {}",
                 store.triple_count()?
@@ -356,7 +372,8 @@ async fn run(cli: Cli) -> Result<()> {
             let active_graph = Arc::new(RwLock::new(cli.active_graph));
 
             let mut srv = SparqlMcpServer::new(
-                store.clone(),
+                gated.clone(),
+                privileged.clone(),
                 doc_store,
                 ontology_path,
                 active_graph.clone(),
@@ -369,7 +386,7 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok(bind) => {
                         let (tx, rx) = tokio::sync::broadcast::channel(1024);
                         srv = srv.with_event_sink(Arc::new(BroadcastEventSink(tx)));
-                        tokio::spawn(spawn_viewer_channel(bind, store, active_graph, rx));
+                        tokio::spawn(spawn_viewer_channel(bind, raw, active_graph, rx));
                     }
                     Err(e) => {
                         tracing::warn!(

@@ -66,6 +66,46 @@ pub struct Config {
     /// Live 3D viewer side-channel configuration.
     #[serde(default)]
     pub viewer: Option<ViewerConfig>,
+
+    /// Write-path limits and guards. The whole section is optional.
+    #[serde(default)]
+    pub ingest: IngestConfig,
+}
+
+/// `[ingest]` — write-path hardening settings (see
+/// `docs/designs/sparql-mcp-write-path-hardening.md`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IngestConfig {
+    /// How long a write waits for the write gate before failing with
+    /// `write_busy`, in seconds.
+    pub write_wait_timeout_secs: u64,
+    /// Allow `DROP`, `CLEAR`, and delete templates of three variables in
+    /// `update_sparql`. Writes to protected graphs and `DROP ALL` stay refused.
+    pub allow_destructive_updates: bool,
+    /// Largest `update_sparql` request, in bytes.
+    pub max_update_bytes: usize,
+    /// Largest inline RDF payload (`load_ontology`), in bytes.
+    pub max_batch_bytes: usize,
+    /// Largest file `load_ontology_file` loads in one transaction, in bytes.
+    pub max_load_file_bytes: u64,
+    /// Directories that file reads (`load_ontology_file`) and writes
+    /// (`export_graph`) are confined to. Unset keeps the old behaviour (any
+    /// path) and logs a warning. Each root must exist.
+    pub file_roots: Option<Vec<PathBuf>>,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            write_wait_timeout_secs: 30,
+            allow_destructive_updates: false,
+            max_update_bytes: 1_048_576,
+            max_batch_bytes: 1_048_576,
+            max_load_file_bytes: 67_108_864,
+            file_roots: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -90,8 +130,12 @@ pub struct McpServer {
     pub env: BTreeMap<String, String>,
 }
 
-fn default_backup_retain() -> usize { 5 }
-fn default_true() -> bool { true }
+fn default_backup_retain() -> usize {
+    5
+}
+fn default_true() -> bool {
+    true
+}
 
 fn default_viewer_bind() -> String {
     "127.0.0.1:7878".to_string()
@@ -259,5 +303,41 @@ sync_on_render = false
         let cfg: Config = toml::from_str(toml).unwrap();
         let viewer = cfg.viewer.unwrap();
         assert_eq!(viewer.bind, "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn ingest_section_absent_uses_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 30);
+    }
+
+    #[test]
+    fn ingest_section_partial_and_explicit() {
+        let cfg: Config = toml::from_str("[ingest]\n").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 30);
+        let cfg: Config = toml::from_str("[ingest]\nwrite_wait_timeout_secs = 5\n").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 5);
+        assert_eq!(cfg.ingest.max_update_bytes, 1_048_576);
+        assert!(!cfg.ingest.allow_destructive_updates);
+        let cfg: Config = toml::from_str(
+            "[ingest]
+allow_destructive_updates = true
+max_update_bytes = 10
+",
+        )
+        .unwrap();
+        assert!(cfg.ingest.allow_destructive_updates);
+        assert_eq!(cfg.ingest.max_update_bytes, 10);
+        assert!(cfg.ingest.file_roots.is_none());
+        // TOML literal strings (single quotes) keep Windows backslashes.
+        let cfg: Config = toml::from_str(
+            r"[ingest]
+file_roots = ['C:\data\rdf', 'D:/dumps']
+",
+        )
+        .unwrap();
+        let roots = cfg.ingest.file_roots.unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[1], PathBuf::from("D:/dumps"));
     }
 }

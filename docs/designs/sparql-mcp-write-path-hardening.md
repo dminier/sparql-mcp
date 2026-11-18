@@ -172,7 +172,8 @@ core internals (registry, load ledger, ingestion jobs) ──▶ PrivilegedStore
     | Port method | Class in `GatedStore` |
     |---|---|
     | `update`, `update_with_outcome`, `load_rdf`, `load_rdf_with_triples`, `load_rdf_file`, `load_ontology_dir` | gated write |
-    | `query`, `export_graph` (a store read; the file check is in the tool), `list_graphs`, `triple_count`, `graph_size` (added in 0b) | pass-through |
+    | `write_quads` (0b, one transaction; used by chunked loads) | gated write |
+    | `query`, `parse_rdf` (0b, pure CPU, no store access), `export_graph` (a store read; the file check is in the tool), `list_graphs`, `triple_count`, `graph_size` (0b) | pass-through |
 
     Methods added later (the batch-ingestion `write_batch`, `commit_job` and
     `stream_file`) are added to this table by the change that adds them.
@@ -220,27 +221,30 @@ core internals (registry, load ledger, ingestion jobs) ──▶ PrivilegedStore
     writer wins with no error. The gate is therefore the only thing that
     keeps new-versus-duplicate counts exact and stops ledger updates from
     being lost.
-*   **Shape.** `WriteGate` is `Clone` and wraps
-    `Arc<tokio::sync::Mutex<GateHolder>>`, with
+*   **Shape (as implemented in 0a).** `WriteGate` is `Clone`. It is a binary
+    lock built on `std::sync::Mutex` + `Condvar`, not a tokio mutex, so it
+    needs no runtime and cannot panic when called on an async worker. A
+    waiter blocks its own thread. The current holder is
     `GateHolder { label: &'static str, since: Instant }`. It has two entry
     points:
     *   `fn run_blocking<T>(&self, label: &'static str, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T>`
-        takes the lock with
-        `Handle::current().block_on(tokio::time::timeout(wait, mutex.clone().lock_owned()))`
-        and runs `f` on the current thread. The write methods of
-        `GatedStore` and `PrivilegedStore` use it.
-    *   `async fn run<T: Send + 'static>(&self, label: &'static str, f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T>`
-        takes the lock, then moves the owned guard into `spawn_blocking`.
-        It is for callers that hold no store handle.
+        waits for the lock up to `write_wait_timeout_secs`, then runs `f` on
+        the current thread. Waiters are served first come, first served. The write methods of `GatedStore` and
+        `PrivilegedStore` use it.
+    *   `async fn run<T: Send + 'static>(&self, label, f) -> anyhow::Result<T>`
+        does the same inside `spawn_blocking`. It is for callers that hold no
+        store handle.
 
-    If the waiting time runs out, both return `ToolError::WriteBusy` with the
-    label of the current holder.
-*   **Calling rule.** Gated and privileged store methods are only called from
-    a blocking thread, because `block_on` panics on an async worker.
-    `dispatch_core`, plugin dispatch and every CLI write wrap their call in
-    `tokio::task::spawn_blocking`. The gate is not reentrant, so
-    `WriteGate::run` and `run_blocking` are never wrapped around a
-    `GatedStore` or `PrivilegedStore` call: that would deadlock.
+    If the waiting time runs out, both return `ToolError::WriteBusy`. Its
+    `holder` is the label of the **store method** that holds the gate (for
+    example `update_with_outcome`), not the tool name.
+*   **Calling rule.** Store work runs on a blocking thread: `dispatch_core`,
+    plugin dispatch and the CLI wrap their calls in
+    `tokio::task::spawn_blocking`, so waiting for the gate never occupies a
+    Tokio worker. The gate is not reentrant. A thread that already holds it
+    and asks again gets an immediate error instead of waiting for the
+    timeout, so `WriteGate::run` and `run_blocking` are never wrapped around a
+    `GatedStore` or `PrivilegedStore` call.
 *   **Cancellation.** The guard lives on the blocking thread that runs the
     store work, so dropping the request future does not release the gate. It
     is released only when the store work ends.
@@ -340,7 +344,8 @@ also take the gate, on the blocking thread (see the calling rule above).
 | `InsertData` / `DeleteData` | each quad's graph | no | protected graph: always |
 | `DeleteInsert` with constant template graphs | the template graphs | only if a delete template is fully variable (`?s ?p ?o`) | protected: always; destructive: unless allowed |
 | `DeleteInsert` with any `GRAPH ?g` template, or a `WITH`/`USING` that leaves the graph variable | **all graphs** | yes | unless allowed; always if the WHERE clause could bind a protected graph |
-| `Drop` / `Clear` (graph, `DEFAULT`, `NAMED`, `ALL`); also `ADD`/`MOVE`/`COPY` after rewriting | the target | yes | unless allowed; protected: always |
+| `Drop` / `Clear` of a graph or `DEFAULT`; also `ADD`/`MOVE`/`COPY` after rewriting | the target | yes | unless allowed; protected: always |
+| `Drop` / `Clear` of `NAMED` or `ALL` | every graph | yes | always (`graph_protected`): it would wipe protected graphs |
 | `Create` | the target | no | protected: always |
 | `Load` (also `SILENT`) | the target | n/a | always (`load_forbidden`) |
 
@@ -348,13 +353,15 @@ also take the gate, on the blocking thread (see the calling rule above).
     *   A delete template is *fully variable* when its subject, predicate and
         object are all variables. `DELETE { ?s ?p ?o } WHERE { ?s a :X }` is
         destructive, whatever its `WHERE` clause.
-    *   A template graph is *variable* when it is `GRAPH ?g`, or when it has no
-        `GRAPH`, no `WITH` fixes it, and `USING NAMED` is present.
+    *   A template graph is *variable* only when it is `GRAPH ?g`. A template
+        without `GRAPH` writes to the default graph (or to the `WITH` graph);
+        `USING` and `USING NAMED` only change what the `WHERE` clause reads.
     *   A variable graph counts as touching every graph, protected ones
-        included. It is refused unless `allow_destructive_updates` is set.
-        Even then, it is refused when the update has a delete template, unless
-        `?g` is bound to constants by a top-level `VALUES` or by
-        `FILTER(?g = <iri>)`.
+        included. An insert template with a variable graph is refused unless
+        `allow_destructive_updates` is set. A delete template with a variable
+        graph is always refused (there is no exemption for a `?g` bound by
+        `VALUES` or `FILTER`: the classifier does not look at the `WHERE`
+        clause).
     *   The classifier never tries to decide statically whether a `WHERE`
         clause could bind a protected graph. A variable graph is refused or
         allowed as a whole.
@@ -431,9 +438,15 @@ design adds its own job keys to the same section.
     refusal raised below the tool would surface as a JSON-RPC error string.
     `limits.rs` therefore defines
     `pub enum ToolError { LimitExceeded{..}, ParseError{..}, GraphProtected{graph}, ReservedIri{iri}, DestructiveUpdateForbidden, LoadForbidden, PathOutsideRoots{path}, PathRejected{path}, WriteBusy{holder: String, waited_secs: u64} }`.
-    *   Store-level refusals are returned as `anyhow::Error::new(ToolError::…)`.
-    *   Each tool's error mapping first tries `e.downcast_ref::<ToolError>()`.
-        On a match, it returns `Ok(CallToolResult { is_error: Some(true), content: [json] })`.
+    *   Store-level refusals are raised with `ToolError::into_anyhow()`. It
+        wraps the error (so `downcast_ref::<ToolError>()` works) and also
+        records it in a thread-local slot.
+    *   **As implemented in 0a:** tools keep their own `map_err(McpError…)`,
+        which would hide the `ToolError`. Tools run synchronously on one
+        blocking thread, so the dispatcher clears the slot before the tool and
+        takes it after the tool returns an error. A recorded refusal replaces
+        the error with `Ok(CallToolResult { is_error: Some(true), content: [json] })`.
+        This needs no edit to each tool's error mapping.
     *   Missing or ill-typed arguments stay `McpError::invalid_params`.
     *   `holder` is the `GateHolder.label`, which is the tool or method name.
     *   `ToolError` exists from Phase 0a, because `write_busy` needs it.
@@ -536,10 +549,10 @@ store serializes writers by itself.
 
 | Phase | Scope | Files | Exit criterion |
 |---|---|---|---|
-| 0a | `WriteGate` with `run` and `run_blocking`; `GatedStore` (gate only) and `PrivilegedStore`, with their wiring; `ToolError` and the error channel; `spawn_blocking` everywhere; async `dispatch_core` | 1, 2 (`write_wait_timeout_secs`), 3 (`ToolError`), 4, 5, 9, 10, 12 | In `tests/write_path_hardening.rs`, on `#[tokio::test(flavor = "current_thread")]`, with a `SlowStore` double wrapping `OxigraphAdapter::open(tempdir)` whose `update` sleeps 2 s: (a) `dispatch_core("query_sparql")` completes within 200 ms while `dispatch_core("update_sparql")` is running; (b) two concurrent writes never overlap, with an `AtomicUsize` of concurrent entries that peaks at 1; (c) the first write's future is dropped by `timeout(50 ms)`, then a second write with `write_wait_timeout_secs = 1` gets `write_busy` with holder `update_sparql`, and succeeds after the first write ends. All existing tests pass. |
-| 0b | Atomic scan-free loads, `StoredQuad` and the new outcome types, per-graph split events, blank-node renaming, load-ledger key and cleanup, chunked `cbm_load_graph` with events | 6, 7, 10, 11, 12 (`tools_sparql.rs`, `store.rs`, bench) | CUJs 1 and 4. F3: a `#[cfg(test)]` counter behind a private `OxigraphAdapter::store_len()`, which replaces every `self.store.len()`, stays at 0 across `load_rdf`, `INSERT DATA` and `DELETE DATA`. F10: `_:b0` in two calls gives two nodes. CUJ 5: a `query_sparql` and a second write both complete while a 300,000-triple `cbm_load_graph` runs. The tests listed under [Compatibility](#compatibility) are updated in this phase. |
-| 0c | Limits, `GatedStore` guard checks, `classify_update`, real `dry_run`, `file_roots` | 1, 2, 3, 5 (guards), 7, 8, 9, 10, 12 | CUJs 2 and 3. Each row of the guard table, and each of the *Rules*. F6: `dry_run` on invalid SPARQL returns `parse_error`. F8: a path outside `file_roots` and a junction escape are refused. |
-| 0d | Docs, skills, CHANGELOG | 12 (docs) | `kb-workbench` SKILL.md uses the new fields. Every existing test passes. |
+| 0a | `WriteGate` with `run` and `run_blocking`; `GatedStore` (gate only) and `PrivilegedStore`, with their wiring; `ToolError` and the error channel; `spawn_blocking` everywhere; async `dispatch_core` | 1, 2 (`write_wait_timeout_secs`), 3 (`ToolError`), 4, 5, 9, 10, 12 | In `tests/write_path_hardening.rs`, on `#[tokio::test(flavor = "current_thread")]`, with a `SlowStore` double wrapping `OxigraphAdapter::open(tempdir)` whose `update` sleeps 2 s: (a) `dispatch_core("query_sparql")` completes within 200 ms while `dispatch_core("update_sparql")` is running; (b) two concurrent writes never overlap, with an `AtomicUsize` of concurrent entries that peaks at 1; (c) the first write's future is dropped by `timeout(50 ms)`, then a second write with `write_wait_timeout_secs = 1` gets `write_busy` with holder `update_with_outcome`, and succeeds after the first write ends. `dispatch_core` is `#[doc(hidden)] pub` so integration tests can call it. All existing tests pass. **Done (2026-11-18):** the tests pass, and (b) and (c) fail when the gate is bypassed on `update_with_outcome`. |
+| 0b | Atomic scan-free loads, `StoredQuad` and the new outcome types, per-graph split events, blank-node renaming, load-ledger key and cleanup, chunked `cbm_load_graph` with events | 6, 7, 10, 11, 12 (`tools_sparql.rs`, `store.rs`, bench) | CUJs 1 and 4. F3: a `#[cfg(test)]` counter behind a private `OxigraphAdapter::store_len()`, which replaces every `self.store.len()`, stays at 0 across `load_rdf`, `INSERT DATA` and `DELETE DATA`. F10: `_:b0` in two calls gives two nodes. CUJ 5: a `query_sparql` and a second write both complete while a 300,000-triple `cbm_load_graph` runs. The tests listed under [Compatibility](#compatibility) are updated in this phase. **Status (2026-11-18), 0b-1 done:** atomic loads in one transaction (F2); no `len()` on loads and ground updates, with a `#[cfg(test)]` scan counter in `OxigraphAdapter::store_len` (F3); `rename_blank_nodes` (F10); `StoredQuad` and the new outcome types; per-graph, split events with `emit_quads` (F4, F5); the load ledger keyed by (file hash, graph) and written in the data transaction; `load_ontology` and `load_ontology_file` default to the active graph. **Also done (0b-2):** `cbm_load_graph` parses once (`parse_rdf`, no gate), writes chunks of 10,000 triples (`write_quads`, one gated transaction each, so the gate is released between chunks), is capped at 1,000,000 triples (`max_cbm_triples`, a constant until 0c) and emits events; `with_delta` is removed, and recording imports count with `load_rdf`'s `inserted_new`. The write gate is now a FIFO queue: without it, a chunk loop that re-acquires at once starved a waiting writer for 714 ms in a test. **Not yet done:** `graph_size` and real `Changed` counts (today `Changed` above the threshold carries the size of the change, `0 → n` or `n → 0`, not graph sizes), `[ingest]` keys for the event limits and `max_cbm_triples` (defaults in code for now), the ledger cleanup on `DROP`/`CLEAR`, and `examples/ingest_bench.rs`. |
+| 0c | Limits, `GatedStore` guard checks, `classify_update`, real `dry_run`, `file_roots` | 1, 2, 3, 5 (guards), 7, 8, 9, 10, 12 | CUJs 2 and 3. Each row of the guard table, and each of the *Rules*. F6: `dry_run` on invalid SPARQL returns `parse_error`. F8: a path outside `file_roots` and a junction escape are refused. **Status (2026-11-18), 0c-1 done:** `guards.rs` (`classify_update`, `check_update`, protected graphs, 11 unit tests including `ADD`/`COPY`/`MOVE` in rewritten form); `GatedStore` enforces the guards and the size limits (`max_update_bytes`, `max_batch_bytes`, `max_load_file_bytes`, protected target graphs, `write_quads`), so plugins are covered too; `PrivilegedStore` applies none; `check_update` on the port; a real `dry_run`; the four keys in `[ingest]`. **0c-2 done: `file_roots` (F8).** `path_guard.rs` resolves the path (symlinks, junctions, `..`) and the roots with `canonicalize`, compares component by component, and the caller opens the resolved path. UNC, device, non-drive verbatim paths and alternate data streams are refused before any resolution (verified: refusing `\attacker.invalidshare` is immediate). Tested on Windows with a real directory junction, a verbatim `\?C:` path, and a differently-cased path. `GatedStore` applies it to `load_ontology_file` (read) and `export_graph` (write); unset roots keep the old behaviour with a one-time warning. **Deviation from the design:** no `GetFinalPathNameByHandleW` and no `windows-sys` dependency, because `canonicalize` already follows junctions and symlinks; the cost is a small window between the check and the open (a link swapped in that window), which an open-handle check would close. **Not yet done:** the `cbm_db_path` check in `cbm_load_graph`, term-size limits (`max_iri_bytes`, `max_literal_bytes`) and `max_batch_triples`, `reserved_iri` at parse time, the `[ingest]` keys for event limits and `max_cbm_triples`, the `instructions` sentence. |
+| 0d | Docs, skills, CHANGELOG | 12 (docs) | `kb-workbench` SKILL.md uses the new fields. Every existing test passes. **Done (2026-11-18):** CHANGELOG (Security, Changed), `[ingest]` in `sparql-mcp.toml`, a README "Write safety" section, `AGENTS.md` invariants (write gate, no scan on ground writes, `ToolError`, RocksDB tests for concurrency), the `hello-plugin` example, and the skills: `sparql-first-code` (cbm output fields), `purge-protocol.md` and `ingestion.md` (`DROP GRAPH` and `MOVE` need `allow_destructive_updates`; check with `dry_run`), `sparql-first.md` (refusals, `urn:meta`, default graph). |
 
 ### Target Files to Create/Modify
 
@@ -548,8 +561,7 @@ Bullets are tagged with the phase that makes the change.
 #### 1. `crates/sparql-mcp-core/Cargo.toml` (Modify)
 
 *   [0a] Add `"time"` to the tokio features in `[dependencies]`.
-*   [0c] Add `windows-sys` (feature `Win32_Storage_FileSystem`), for
-    `GetFinalPathNameByHandleW`, under `[target.'cfg(windows)'.dependencies]`.
+*   [0c] Not needed: `file_roots` uses `std::fs::canonicalize` (see the status of Phase 0c). Add `windows-sys` only if the open-handle check is adopted.
 
 #### 2. `crates/sparql-mcp-core/src/config.rs` (Modify)
 
