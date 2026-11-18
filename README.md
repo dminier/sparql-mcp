@@ -3,132 +3,86 @@
 [![CI](https://github.com/dminier/sparql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dminier/sparql-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-**A generic semantic knowledge base for AI coding agents.**
-`sparql-mcp` is a single-binary MCP server wrapping an
-[Oxigraph](https://github.com/oxigraph/oxigraph) SPARQL 1.1 store, plus a
-Claude Code plugin and skill that teach agents the single contract:
+A semantic knowledge base for AI coding agents: a single-binary MCP server
+over an [Oxigraph](https://github.com/oxigraph/oxigraph) SPARQL 1.1 store.
+Agents store what they learn as RDF in per-project named graphs and query it
+back with SPARQL instead of re-reading files.
 
-> **SPARQL is the source of truth. Obsidian is its human face.**
+![The live 3D viewer while an agent writes 400 instances](docs/assets/viewer.png)
 
-Install once on your workstation, use it across every project you touch.
+## Install
 
-## Quick start
-
-### One-line install (macOS / Linux)
+macOS / Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dminier/sparql-mcp/main/install.sh | bash
 ```
 
-The installer downloads the right static binary for your platform, drops it
-into `~/.local/bin/sparql-mcp`, verifies its SHA-256 checksum, then runs
-`sparql-mcp install -y` which auto-patches each detected agent's MCP config
-(Claude Code, Codex CLI, Gemini CLI).
+Windows: download the archive from the
+[latest release](https://github.com/dminier/sparql-mcp/releases/latest), put
+`sparql-mcp.exe` on your `PATH`, then run `sparql-mcp.exe install -y`.
 
-Flags: `--dir=<path>` (install location), `--skip-config` (don't patch
-agents). Environment: `SPARQL_MCP_VERSION=v0.1.0` to pin a release.
+From source: `cargo build --release && ./target/release/sparql-mcp install -y`.
 
-### Windows (PowerShell)
+`install` registers the server in every detected agent (Claude Code, Codex CLI,
+Gemini CLI). Restart the agent: it spawns `sparql-mcp serve` over STDIO when
+needed — there is no daemon. See [getting started](docs/getting-started.md).
 
-```powershell
-# 1. Download the archive for your platform from the latest release:
-#    https://github.com/dminier/sparql-mcp/releases/latest
-# 2. Extract sparql-mcp.exe somewhere on PATH
-# 3. Register MCP entries:
-sparql-mcp.exe install -y
-```
-
-### Manual / from source
-
-```bash
-git clone https://github.com/dminier/sparql-mcp
-cd sparql-mcp
-cargo build --release
-./target/release/sparql-mcp install -y     # patch agent configs
-```
-
-After install, restart your coding agent. `sparql-mcp` is now a STDIO MCP
-server the agent spawns on demand — nothing to keep running.
-
-## Why a single-binary STDIO server
-
-- **Zero dependencies** — no Docker, no daemon, no background process.
-- **One install, every project** — the binary lives in `~/.local/bin`; every
-  agent session spawns its own child process and talks to it over stdin/stdout.
-- **Multi-project** (roadmap v0.2) — flip `per_project_store = true` in the
-  config and each project opens its own RocksDB store, so several agents can
-  work on different projects in parallel without contending for the same
-  database lock.
-
-## What's in this repo
-
-```
-sparql-mcp/
-├── crates/sparql-mcp-core/        # Rust: MCP server + Oxigraph core
-├── crates/sparql-mcp-viewer/      # Rust: optional live 3D graph viewer (Bevy)
-├── plugins/kb-workbench/          # Claude Code plugin (skill only)
-├── .claude/skills/kb-workbench/   # Symlink to the skill
-├── ontology/1-smc.ttl             # Core RDF vocabulary (smc:)
-├── sparql-mcp.toml                # Sample config
-├── server.json                    # MCP registry manifest
-├── install.sh                     # One-line installer
-└── docs/getting-started.md
-```
-
-## MCP tools exposed
+## MCP tools
 
 | Tool | Purpose |
 |---|---|
 | `query_sparql` | SELECT / ASK / CONSTRUCT / DESCRIBE |
-| `update_sparql` | INSERT DATA / DELETE / LOAD / CLEAR (SPARQL 1.1 Update) |
-| `load_ontology`, `load_ontology_file` | Push TTL into a named graph (SHA-256 idempotent) |
-| `export_graph` | Dump a named graph to Turtle on disk |
-| `project_create`, `project_list`, `project_switch` | Manage `smc:Project` isolation |
-| `write_doc` | Persist agent-generated markdown to the configured docs root |
-| `stats`, `list_graphs` | Introspection |
+| `update_sparql` | SPARQL 1.1 Update |
+| `load_ontology`, `load_ontology_file` | Load Turtle into a named graph (idempotent, SHA-256) |
+| `export_graph`, `list_graphs`, `stats` | Export to Turtle, introspection |
+| `project_create`, `project_list`, `project_switch` | One named graph per project: `<urn:project:<slug>>` |
+| `cbm_load_graph` | Import a codebase-memory-mcp code graph |
+| `write_doc` | Write markdown under the configured docs root |
+| `get_gdrive_config` | Expose the `[gdrive]` sync settings to the agent |
 
-Named graph convention: `<urn:project:<slug>>`.
+The `recording` feature adds `import_recording_navigations`,
+`import_recording_network` and `materialize_recording` (Playwright captures).
 
 ## CLI
 
+```text
+sparql-mcp serve              run as an MCP STDIO server
+sparql-mcp install            register the server in detected agent configs
+sparql-mcp stats              triple and graph counts
+sparql-mcp reload-ontology    re-load ontology/ into the store
+sparql-mcp load-file --path   load a Turtle / N-Triples / RDF-XML file
+sparql-mcp code-import --db   import a codebase-memory-mcp SQLite graph
 ```
-sparql-mcp serve                # run as MCP STDIO server (default for agents)
-sparql-mcp install              # register MCP entries in detected agent configs
-sparql-mcp stats                # triple / graph counts
-sparql-mcp reload-ontology      # re-parse ontology/ into the store
-sparql-mcp load-file --path …   # load Turtle / NTriples / RDF-XML
-sparql-mcp code-import --db …   # ingest a codebase-memory-mcp SQLite graph
-```
 
-## Live 3D viewer (optional)
+Configuration: [`sparql-mcp.toml`](sparql-mcp.toml).
 
-`sparql-mcp-viewer` is a separate native Windows app that shows the active
-project graph in 3D and grows it live as the agent writes — classes and
-instances, `rdf:type` edges, the latest batch highlighted, an activity feed,
-and node inspection on click. It reads from a loopback side-channel that is
-off by default (`[viewer] enabled = true` in `sparql-mcp.toml`). See
-[`crates/sparql-mcp-viewer/README.md`](crates/sparql-mcp-viewer/README.md).
+## Live 3D viewer
 
-## Install the Claude Code plugin (skill)
+`sparql-mcp-viewer` shows the active project graph in 3D and grows it as the
+agent writes. Enable `[viewer]` in `sparql-mcp.toml`, then see
+[its README](crates/sparql-mcp-viewer/README.md).
 
-The MCP server itself is installed as a binary (above). The `kb-workbench`
-plugin adds the matching Claude Code **skill** — the workflow that teaches
-an agent how to ingest / audit / render a knowledge base:
+## Claude Code plugin
+
+The `kb-workbench` plugin adds the skills that teach an agent to ingest,
+audit and render a knowledge base with this server:
 
 ```text
 /plugin marketplace add dminier/sparql-mcp
 /plugin install kb-workbench@sparql-mcp
 ```
 
-## Development
+## Contributing
 
 ```bash
-make build         # cargo build --release
-cargo test --all
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --all-features
 ```
+
+Architecture and conventions: [AGENTS.md](AGENTS.md).
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](LICENSE).
