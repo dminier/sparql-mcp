@@ -13,7 +13,10 @@
 ## Verified code facts (2026-11-18)
 *   Oxigraph 0.5.7: `Store::len()` doc says "This function executes a full scan".
     `Store::insert` opens one transaction per call. `Store::extend` is a memory-heavy
-    transaction. `BulkLoader` is non-transactional.
+    transaction. `BulkLoader` commits atomically by default (`without_atomicity()`
+    is opt-in) — corrected after review round 1 (finding M1); it was wrongly
+    noted here as non-transactional.
+*   RocksDB transactions in Oxigraph have no conflict detection (last writer wins).
 *   No `oxhttp` in `Cargo.lock`: Oxigraph's HTTP client (needed by `LOAD <http…>`) is not compiled.
 *   Write tools: `crates/sparql-mcp-core/src/application/tools/{sparql,ontology}.rs`;
     adapter: `crates/sparql-mcp-core/src/infrastructure/oxigraph.rs`; port:
