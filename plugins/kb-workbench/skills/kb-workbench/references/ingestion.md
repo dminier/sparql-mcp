@@ -72,6 +72,13 @@ Every adapter writes to `<urn:staging:<source>:<ts>>`. After ingest:
    - **discard** — `DROP GRAPH <urn:staging:...>`
 3. Only after promotion does the vault render pick up the new data.
 
+> `MOVE` and `DROP GRAPH` are destructive (MOVE empties the destination
+> first), so the server refuses them unless
+> `[ingest] allow_destructive_updates = true`. Run the update with
+> `dry_run=true` first: its `refused` field says whether it would be refused.
+> If it is, ask the user to enable the setting; do not retry or rewrite the
+> request to get around it.
+
 This is the generic data-discipline rule ("Store first, then
 persist") applied to every source.
 

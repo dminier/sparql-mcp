@@ -33,7 +33,13 @@ TTL snapshots, capture dumps); it lags and can be partial.
 2. **Display the full payload** in the response before sending.
 3. Push via `mcp__sparql-mcp__update_sparql` (or `load_ontology` for
    schema-level triples).
-4. **Verify** with a SELECT or ASK that the triples landed.
+4. **Verify** with a SELECT or ASK that the triples landed. The write reply
+   gives `inserted_new` (quads that were not already there) and `delta`;
+   `triples_before`/`triples_after` are `null` for `INSERT DATA`/`DELETE DATA`.
+   A refusal comes back as an error result with a JSON `code`
+   (`graph_protected`, `limit_exceeded`, `write_busy`, …): read it, do not retry
+   blindly. `load_ontology` without `graph_iri` writes to the active project
+   graph.
 5. **Ask the user** before writing a versioned TTL export / snapshot to
    disk — the user may prefer to keep it ephemeral.
 
@@ -45,7 +51,8 @@ patterns (e.g. "which components appear across multiple projects?")
 but writes go to one graph only.
 
 Metadata about projects themselves (onboarding date, scope, owners) lives
-in `<urn:meta>`.
+in `<urn:meta>`. Read it freely, but it is written only by `project_create`:
+`update_sparql` and the load tools refuse `<urn:meta>`.
 
 ## Prefix discipline
 

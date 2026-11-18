@@ -4,6 +4,16 @@ Code ingestions are never purged automatically. The user must explicitly say
 *"purge le code de plus de N jours"* / *"drop ingestions older than N months"*
 with a duration. Without a duration, ask for one — do not guess.
 
+## Prerequisite — destructive updates are opt-in
+
+`DROP GRAPH` is refused unless the server runs with
+`[ingest] allow_destructive_updates = true` in `sparql-mcp.toml`. Check first
+without running anything: `mcp__sparql-mcp__update_sparql(update=<DROP …>, dry_run=true)`
+returns `refused` (`destructive_update_forbidden` when the setting is off). If
+it is refused, tell the user which setting to enable and wait; never try to work
+around the refusal. `DROP ALL`, `CLEAR ALL` and any write to `urn:meta` or
+`urn:hkb:meta:*` are refused whatever the setting.
+
 ## Flow
 
 1. **Build the SELECT** for candidates:
