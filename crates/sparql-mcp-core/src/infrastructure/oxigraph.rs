@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::domain::{
-    FileLoadResult, InputFormat, LoadOpts, QueryResult, RdfTerm, SolutionSet, SparqlStore,
-    StoredQuad, UpdateOutcome,
+    BatchApplied, BatchRefusal, BatchWrite, FileLoadResult, InputFormat, LoadOpts, QueryResult,
+    RdfTerm, SolutionSet, SparqlStore, StoredQuad, UpdateOutcome,
 };
 
 // Named graph holding SHA-256 records for idempotent file loading.
@@ -24,6 +24,7 @@ const META_PATH: &str = "urn:hkb:meta:path";
 const META_FILE: &str = "urn:hkb:meta:LoadedFile";
 /// The graph a loaded file went into (empty string for the default graph).
 const META_TARGET: &str = "urn:hkb:meta:graph";
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
@@ -165,6 +166,137 @@ impl SparqlStore for OxigraphAdapter {
 
     fn parse_rdf(&self, content: &[u8], opts: &LoadOpts) -> Result<Vec<StoredQuad>> {
         Ok(parse_quads(content, opts)?.iter().map(to_stored).collect())
+    }
+
+    fn parse_rdf_raw(&self, content: &[u8], format: InputFormat) -> Result<Vec<StoredQuad>> {
+        let parser = RdfParser::from_format(to_oxigraph_format(format));
+        let quads: Vec<Quad> = parser
+            .for_reader(content)
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(quads.iter().map(to_stored).collect())
+    }
+
+    fn write_batch(
+        &self,
+        write: &BatchWrite,
+    ) -> Result<std::result::Result<BatchApplied, BatchRefusal>> {
+        let quads: Vec<Quad> = write.quads.iter().map(from_stored).collect::<Result<_>>()?;
+        let ledger: Vec<Quad> = write
+            .ledger
+            .iter()
+            .map(from_stored)
+            .collect::<Result<_>>()?;
+        let mut tx = self.store.start_transaction()?;
+
+        // 1. The conditions, evaluated against what is in the store *now*, in
+        //    the same transaction as the write.
+        for (i, required) in write.require.iter().enumerate() {
+            if !tx.contains(&from_stored(required)?)? {
+                return Ok(Err(BatchRefusal::RequirementNotMet(i)));
+            }
+        }
+        if let Some(idem) = &write.idempotency {
+            if tx.contains(&from_stored(&idem.identity)?)? {
+                return Ok(Err(BatchRefusal::Duplicate));
+            }
+            let subject = NamedNode::new(&idem.subject)?;
+            let graph = GraphName::NamedNode(NamedNode::new(&idem.graph)?);
+            let recorded = tx
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    None,
+                    None,
+                    Some(graph.as_ref()),
+                )
+                .next()
+                .transpose()?
+                .is_some();
+            if recorded {
+                return Ok(Err(BatchRefusal::Conflict));
+            }
+        }
+
+        // 2. The counters: read each, check its ceiling, replace it.
+        let long = NamedNode::new(format!("{XSD}long"))?;
+        let mut counters = Vec::with_capacity(write.counters.len());
+        let mut counter_updates: Vec<(Quad, Quad)> = Vec::new();
+        for (i, c) in write.counters.iter().enumerate() {
+            let subject = NamedNode::new(&c.subject)?;
+            let predicate = NamedNode::new(&c.predicate)?;
+            let graph = GraphName::NamedNode(NamedNode::new(&c.graph)?);
+            let current = tx
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    Some(predicate.as_ref()),
+                    None,
+                    Some(graph.as_ref()),
+                )
+                .next()
+                .transpose()?;
+            let before: u64 = match &current {
+                Some(q) => match &q.object {
+                    Term::Literal(l) => l.value().parse().unwrap_or(0),
+                    _ => 0,
+                },
+                None => 0,
+            };
+            let after = before.saturating_add(c.add);
+            if let Some(max) = c.max {
+                if after > max {
+                    return Ok(Err(BatchRefusal::CounterLimit {
+                        counter: i,
+                        limit: max,
+                        value: after,
+                    }));
+                }
+            }
+            let new_quad = Quad::new(
+                subject,
+                predicate,
+                Literal::new_typed_literal(after.to_string(), long.clone()),
+                graph,
+            );
+            counter_updates.push((current.unwrap_or_else(|| new_quad.clone()), new_quad));
+            counters.push(after);
+        }
+
+        // 3. The write: the data, counted with `contains`, then the ledger.
+        let mut inserted_new = 0u64;
+        for q in &quads {
+            if !tx.contains(q)? {
+                inserted_new += 1;
+            }
+            tx.insert(q);
+        }
+        let already_present = (quads.len() as u64).saturating_sub(inserted_new);
+        for q in &ledger {
+            tx.insert(q);
+        }
+        for (old, new) in &counter_updates {
+            tx.remove(old);
+            tx.insert(new);
+        }
+        if let Some(rc) = &write.record_counts {
+            let subject = NamedNode::new(&rc.subject)?;
+            let graph = GraphName::NamedNode(NamedNode::new(&rc.graph)?);
+            for (predicate, n) in [
+                (&rc.inserted_new_predicate, inserted_new),
+                (&rc.already_present_predicate, already_present),
+            ] {
+                tx.insert(&Quad::new(
+                    subject.clone(),
+                    NamedNode::new(predicate)?,
+                    Literal::new_typed_literal(n.to_string(), long.clone()),
+                    graph.clone(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(Ok(BatchApplied {
+            inserted_new,
+            already_present,
+            counters,
+        }))
     }
 
     fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64> {
@@ -676,5 +808,206 @@ mod tests {
         );
         assert_eq!(second.inserted_new, 1);
         assert_eq!(scans(&a), 0);
+    }
+
+    // ── write_batch: conditions and the write in one transaction ──────────────
+
+    use crate::domain::{BatchRefusal, BatchWrite, Counter, Idempotency, RecordCounts};
+
+    const JG: &str = "urn:test:jobs";
+    const LONG: &str = "http://www.w3.org/2001/XMLSchema#long";
+
+    fn q(s: &str, p: &str, o: &str, g: Option<&str>) -> StoredQuad {
+        StoredQuad {
+            s: format!("<{s}>"),
+            p: format!("<{p}>"),
+            o: if o.starts_with('"') {
+                o.to_string()
+            } else {
+                format!("<{o}>")
+            },
+            g: g.map(str::to_string),
+        }
+    }
+
+    fn long(n: u64) -> String {
+        format!("\"{n}\"^^<{LONG}>")
+    }
+
+    fn present(a: &OxigraphAdapter, quad: &StoredQuad) -> bool {
+        a.store.contains(&from_stored(quad).unwrap()).unwrap()
+    }
+
+    /// A batch of one data quad, guarded by an "open" requirement, an
+    /// idempotency record and a counter with a ceiling of 10.
+    fn batch(n: u32, add: u64) -> BatchWrite {
+        let rec = format!("urn:test:rec{n}");
+        BatchWrite {
+            quads: vec![q(&format!("urn:d:{n}"), "urn:p", "urn:o", Some("urn:data"))],
+            ledger: vec![q(&rec, "urn:sha", "\"abc\"", Some(JG))],
+            require: vec![q("urn:job", "urn:state", "urn:open", Some(JG))],
+            idempotency: Some(Idempotency {
+                subject: rec.clone(),
+                graph: JG.into(),
+                identity: q(&rec, "urn:sha", "\"abc\"", Some(JG)),
+            }),
+            counters: vec![Counter {
+                subject: "urn:job".into(),
+                predicate: "urn:total".into(),
+                graph: JG.into(),
+                add,
+                max: Some(10),
+            }],
+            record_counts: Some(RecordCounts {
+                subject: rec,
+                graph: JG.into(),
+                inserted_new_predicate: "urn:new".into(),
+                already_present_predicate: "urn:dup".into(),
+            }),
+        }
+    }
+
+    fn open_job(a: &OxigraphAdapter) {
+        a.write_quads(&[q("urn:job", "urn:state", "urn:open", Some(JG))])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_batch_writes_data_ledger_counters_and_counts_together() {
+        let a = adapter();
+        open_job(&a);
+        let applied = a.write_batch(&batch(1, 4)).unwrap().unwrap();
+        assert_eq!((applied.inserted_new, applied.already_present), (1, 0));
+        assert_eq!(applied.counters, vec![4]);
+        assert!(present(
+            &a,
+            &q("urn:d:1", "urn:p", "urn:o", Some("urn:data"))
+        ));
+        assert!(present(
+            &a,
+            &q("urn:test:rec1", "urn:sha", "\"abc\"", Some(JG))
+        ));
+        assert!(present(&a, &q("urn:job", "urn:total", &long(4), Some(JG))));
+        assert!(present(
+            &a,
+            &q("urn:test:rec1", "urn:new", &long(1), Some(JG))
+        ));
+        assert!(present(
+            &a,
+            &q("urn:test:rec1", "urn:dup", &long(0), Some(JG))
+        ));
+
+        // The counter is advanced, not duplicated: one quad, the new value.
+        a.write_batch(&batch(2, 3)).unwrap().unwrap();
+        assert!(present(&a, &q("urn:job", "urn:total", &long(7), Some(JG))));
+        assert!(!present(&a, &q("urn:job", "urn:total", &long(4), Some(JG))));
+    }
+
+    #[test]
+    fn a_requirement_that_is_not_met_writes_nothing() {
+        let a = adapter(); // no open job
+        let before = a.store.len().unwrap();
+        let refused = a.write_batch(&batch(1, 1)).unwrap().unwrap_err();
+        assert_eq!(refused, BatchRefusal::RequirementNotMet(0));
+        assert_eq!(
+            a.store.len().unwrap(),
+            before,
+            "a refused batch wrote something"
+        );
+    }
+
+    #[test]
+    fn the_same_batch_twice_is_a_duplicate_and_a_different_one_a_conflict() {
+        let a = adapter();
+        open_job(&a);
+        a.write_batch(&batch(1, 1)).unwrap().unwrap();
+        let len = a.store.len().unwrap();
+
+        // Same record, same identity: the write was already accepted.
+        assert_eq!(
+            a.write_batch(&batch(1, 1)).unwrap().unwrap_err(),
+            BatchRefusal::Duplicate
+        );
+
+        // Same record subject, a different identity: refused as a conflict.
+        let mut other = batch(1, 1);
+        other.idempotency.as_mut().unwrap().identity =
+            q("urn:test:rec1", "urn:sha", "\"different\"", Some(JG));
+        assert_eq!(
+            a.write_batch(&other).unwrap().unwrap_err(),
+            BatchRefusal::Conflict
+        );
+
+        assert_eq!(
+            a.store.len().unwrap(),
+            len,
+            "a refused retry wrote something"
+        );
+        assert!(present(&a, &q("urn:job", "urn:total", &long(1), Some(JG))));
+    }
+
+    #[test]
+    fn a_counter_ceiling_refuses_the_whole_batch() {
+        let a = adapter();
+        open_job(&a);
+        a.write_batch(&batch(1, 8)).unwrap().unwrap();
+        let len = a.store.len().unwrap();
+        // 8 + 3 = 11 > 10: refused, and neither the data nor the counter moved.
+        let refused = a.write_batch(&batch(2, 3)).unwrap().unwrap_err();
+        assert_eq!(
+            refused,
+            BatchRefusal::CounterLimit {
+                counter: 0,
+                limit: 10,
+                value: 11
+            }
+        );
+        assert_eq!(a.store.len().unwrap(), len);
+        assert!(!present(
+            &a,
+            &q("urn:d:2", "urn:p", "urn:o", Some("urn:data"))
+        ));
+        assert!(present(&a, &q("urn:job", "urn:total", &long(8), Some(JG))));
+        // Exactly the ceiling is allowed.
+        a.write_batch(&batch(3, 2)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn quads_already_in_the_store_are_counted_as_present() {
+        let a = adapter();
+        open_job(&a);
+        a.write_quads(&[q("urn:d:1", "urn:p", "urn:o", Some("urn:data"))])
+            .unwrap();
+        let applied = a.write_batch(&batch(1, 1)).unwrap().unwrap();
+        assert_eq!((applied.inserted_new, applied.already_present), (0, 1));
+        assert!(present(
+            &a,
+            &q("urn:test:rec1", "urn:dup", &long(1), Some(JG))
+        ));
+    }
+
+    #[test]
+    fn raw_parsing_keeps_labels_and_a_batch_is_deterministic() {
+        let a = adapter();
+        let nt = b"_:a <urn:p> _:b .\n_:a <urn:q> \"x\" .\n";
+        let first = a.parse_rdf_raw(nt, InputFormat::NTriples).unwrap();
+        let second = a.parse_rdf_raw(nt, InputFormat::NTriples).unwrap();
+        assert_eq!(
+            first, second,
+            "the same N-Triples must parse to the same quads"
+        );
+        assert_eq!(first[0].s, "_:a");
+        assert_eq!(first[0].o, "_:b");
+
+        // What a Turtle `[]` looks like: the skolemization relies on it.
+        let ttl = b"<urn:s> <urn:p> [ <urn:q> <urn:o> ] .";
+        let quads = a.parse_rdf_raw(ttl, InputFormat::Turtle).unwrap();
+        let anon = quads.iter().find(|q| q.o.starts_with("_:")).unwrap();
+        println!("generated blank node: {}", anon.o);
+        let id = anon.o.trim_start_matches("_:");
+        assert!(
+            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+            "unexpected generated blank node shape: {id}"
+        );
     }
 }

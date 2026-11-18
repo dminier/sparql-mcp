@@ -28,7 +28,8 @@ use crate::application::path_guard;
 use crate::application::write_gate::WriteGate;
 use crate::config::IngestConfig;
 use crate::domain::{
-    FileLoadResult, LoadOpts, QueryResult, SparqlStore, StoredQuad, UpdateOutcome,
+    BatchApplied, BatchRefusal, BatchWrite, FileLoadResult, InputFormat, LoadOpts, QueryResult,
+    SparqlStore, StoredQuad, UpdateOutcome,
 };
 
 /// What [`GatedStore`] enforces.
@@ -318,6 +319,26 @@ macro_rules! gated_impl {
                 self.policy_quads(quads)?;
                 self.gate
                     .run_blocking("write_quads", || self.inner.write_quads(quads))
+            }
+
+            fn write_batch(
+                &self,
+                write: &BatchWrite,
+            ) -> Result<std::result::Result<BatchApplied, BatchRefusal>> {
+                // The data and the ledger are both checked: a non-privileged
+                // caller cannot write a protected graph through this method.
+                self.policy_quads(&write.quads)?;
+                self.policy_quads(&write.ledger)?;
+                self.gate
+                    .run_blocking("write_batch", || self.inner.write_batch(write))
+            }
+
+            fn parse_rdf_raw(
+                &self,
+                content: &[u8],
+                format: InputFormat,
+            ) -> Result<Vec<StoredQuad>> {
+                self.inner.parse_rdf_raw(content, format)
             }
 
             // Pure CPU work: no store access, so no gate.

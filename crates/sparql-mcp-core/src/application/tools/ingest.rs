@@ -10,7 +10,7 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::ingest::{BeginRequest, IngestService, Mode};
+use crate::application::ingest::{BatchRequest, BeginRequest, IngestService, Mode};
 use crate::application::limits::ToolError;
 
 use super::sparql::{make_tool, require_str};
@@ -37,6 +37,30 @@ pub fn tool_ingest_begin_def() -> Tool {
                 "label": { "type": "string", "maxLength": 200 },
                 "blank_nodes": { "type": "string", "enum": ["skolemize", "reject"], "default": "skolemize" }
             }
+        }),
+    )
+}
+
+pub fn tool_ingest_batch_def() -> Tool {
+    make_tool(
+        "ingest_batch",
+        "Send one batch of an ingestion job. Number batches from 1 with `seq`. Re-sending the \
+         same seq with the same data after a timeout or error is always safe: a batch that \
+         already landed returns duplicate:true with its original counts, and the data is stored \
+         once. The same seq with different data is refused (seq_conflict). A batch with a syntax \
+         error, a reserved IRI or an oversized term is refused as a whole and nothing is \
+         written; fix it and re-send the same seq. Blank nodes written as _:x are the same node \
+         in every batch of the job. Keep batches within the limits returned by ingest_begin \
+         (about 2,000-5,000 triples, at most 512 KiB, is a good size).",
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "seq": { "type": "integer", "minimum": 1 },
+                "data": { "type": "string", "description": "The RDF payload, in the job's format." },
+                "format": { "type": "string", "enum": ["ntriples", "turtle"], "description": "Overrides the job's format for this batch." }
+            },
+            "required": ["job_id", "seq", "data"]
         }),
     )
 }
@@ -139,6 +163,21 @@ pub fn ingest_begin(svc: &IngestService, args: &JsonObject) -> Result<CallToolRe
             .to_string(),
     };
     reply(svc.begin(&request))
+}
+
+pub fn ingest_batch(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {
+    let seq = args
+        .get("seq")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| McpError::invalid_params("'seq' must be a positive integer", None))?;
+    let request = BatchRequest {
+        job_id: require_str(args, "job_id")?.to_string(),
+        seq,
+        data: require_str(args, "data")?.to_string(),
+        format: opt_str(args, "format")?.map(str::to_string),
+    };
+    reply(svc.batch(&request))
 }
 
 pub fn ingest_status(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {

@@ -646,12 +646,55 @@ criterion passes.
     `sparql_text::string_literal` / `iri`, and a job id that is not a ULID is never
     put in a query.
 
-**Not yet done:** `ingest_batch` (idempotent, with the in-transaction re-checks of
-step 5), `ingest_commit` (staged, replace, direct), the expiry sweeper and heartbeat,
-chunked staging drops, `ingest_validate`, `ingest_file`, and the bench. Decision to
-make when `ingest_batch` lands: the design's `write_batch(quads, ledger, guard)` port
-method (one transaction that re-checks the job state, then inserts the data and the
-batch record) is not implemented yet.
+**Phase 1, slice 2 (2026-11-18): `ingest_batch`.** Done:
+
+*   the port primitive `SparqlStore::write_batch(BatchWrite)`: in **one**
+    transaction it checks that required quads are present (the job is `open`),
+    that the batch was not already accepted (`Duplicate`) or does not clash with
+    one that was (`Conflict`), advances numeric counters against their ceilings
+    (`CounterLimit`), and writes the data, the batch record and the new/duplicate
+    counts. It knows nothing about jobs: the ledger vocabulary stays in
+    `application/ingest.rs`. A refusal writes nothing. `GatedStore` refuses it for
+    non-privileged callers (the ledger is a protected graph);
+*   `parse_rdf_raw`, which keeps blank node labels as written (the port's
+    `parse_rdf` renames them per call, which would make a retry non-idempotent);
+*   `ingest_batch`: cheap checks and an idempotency fast path outside the gate,
+    then parse, skolemize and check, then `write_batch`. Labelled blank nodes become
+    `<urn:sparql-mcp:genid:{job}:{label}>`; parser-generated ones (32 hexadecimal
+    digits) become `<urn:sparql-mcp:genid:{job}:{seq}:a{n}>` by order of first
+    appearance, so a retried Turtle batch gets the same IRIs. IRIs in
+    `urn:sparql-mcp:` are `reserved_iri`; IRI and literal sizes are limited
+    (`max_iri_bytes`, `max_literal_bytes`); `blank_nodes: reject` is honoured;
+*   a retry that overlaps the original, or loses a race for the same seq, gets the
+    original counts with `duplicate: true`; a different payload for the same seq is
+    `seq_conflict`;
+*   direct jobs write to the target and emit `Insert` events (bounded), or one
+    `Changed` at most every 5 s above `event_changed_threshold`; staged jobs emit
+    nothing until commit.
+
+Deviations from the text above, with the reason:
+
+*   **The job's totals are running counters** (`smj:triplesTotal`, `smj:batchCount`
+    on the manifest), advanced in the same transaction as the batch record, instead
+    of sums over the batch records. A sum is O(batches) per batch, so O(n²) over a
+    job of 10,000 batches. The counter cannot be lost: the check and the update are
+    one transaction under the write gate.
+*   **The port has `write_batch` and `parse_rdf_raw`**, not `parse_batch` and
+    `commit_job`: parsing stays outside the transaction, and the checks are data
+    (`BatchWrite`), not code.
+*   `smj:lastActivity` is not yet updated by batches (it matters for expiry, which is
+    not built).
+
+Tests: 30 end-to-end tests, including three on a RocksDB store with concurrent
+calls (eight overlapping retries of one batch: stored once, counted once; six
+different payloads for one seq: exactly one lands; ten batches against a
+ceiling of four: exactly four fit). With the in-transaction checks disabled, five
+of them fail.
+
+**Not yet done:** `ingest_commit` (staged, replace, direct), so a job cannot be
+closed yet and a staged job's data stays in its staging graph; the expiry sweeper and
+heartbeat; chunked staging drops; `ingest_validate`; `ingest_file`; the bench; and the
+skill guidance.
 
 ### Target Files to Create/Modify
 

@@ -74,6 +74,19 @@ impl SparqlStore for SlowStore {
     ) -> Result<Vec<sparql_mcp::domain::StoredQuad>> {
         self.inner.parse_rdf(content, opts)
     }
+    fn parse_rdf_raw(
+        &self,
+        content: &[u8],
+        format: sparql_mcp::domain::InputFormat,
+    ) -> Result<Vec<sparql_mcp::domain::StoredQuad>> {
+        self.inner.parse_rdf_raw(content, format)
+    }
+    fn write_batch(
+        &self,
+        write: &sparql_mcp::domain::BatchWrite,
+    ) -> Result<Result<sparql_mcp::domain::BatchApplied, sparql_mcp::domain::BatchRefusal>> {
+        self.inner.write_batch(write)
+    }
     fn write_quads(&self, quads: &[sparql_mcp::domain::StoredQuad]) -> Result<u64> {
         std::thread::sleep(self.write_delay);
         self.inner.write_quads(quads)

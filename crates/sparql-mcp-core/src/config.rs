@@ -116,6 +116,14 @@ pub struct IngestConfig {
     pub max_file_bytes: u64,
     /// Time limit for one `ingest_validate` check, in seconds.
     pub validate_timeout_secs: u64,
+    /// Longest IRI in a payload, in bytes.
+    pub max_iri_bytes: usize,
+    /// Longest literal in a payload, in bytes (measured on its N-Triples form).
+    pub max_literal_bytes: usize,
+    /// Most triples in one `Insert`/`Delete` event.
+    pub event_max_triples: usize,
+    /// More triples than this to one graph are reported as one `Changed`.
+    pub event_changed_threshold: usize,
 }
 
 impl Default for IngestConfig {
@@ -137,6 +145,10 @@ impl Default for IngestConfig {
             job_retention_secs: 604_800,
             max_file_bytes: 2_147_483_648,
             validate_timeout_secs: 10,
+            max_iri_bytes: 4_096,
+            max_literal_bytes: 65_536,
+            event_max_triples: 5_000,
+            event_changed_threshold: 50_000,
         }
     }
 }

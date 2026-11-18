@@ -39,6 +39,8 @@ pub struct SparqlMcpServer {
     privileged: Arc<PrivilegedStore>,
     /// The batch ingestion jobs (`ingest_*` tools).
     ingest: Arc<IngestService>,
+    /// The `[ingest]` settings the service was built from.
+    ingest_cfg: IngestConfig,
     doc_store: Arc<dyn DocStore>,
     ontology_dir: PathBuf,
     /// Shared with `infrastructure::viewer_channel`: `project_switch`
@@ -64,15 +66,18 @@ impl SparqlMcpServer {
         gdrive_config: Option<crate::config::GDriveConfig>,
         store_path: PathBuf,
     ) -> Self {
+        let ingest_cfg = IngestConfig::default();
         let ingest = Arc::new(IngestService::new(
             privileged.clone(),
             active_graph.clone(),
-            IngestConfig::default(),
+            ingest_cfg.clone(),
+            Arc::new(NullEventSink),
         ));
         Self {
             store: gated,
             privileged,
             ingest,
+            ingest_cfg,
             doc_store,
             ontology_dir,
             active_graph,
@@ -85,17 +90,26 @@ impl SparqlMcpServer {
 
     /// Use the `[ingest]` settings for the ingestion jobs' limits.
     pub fn with_ingest_config(mut self, cfg: IngestConfig) -> Self {
-        self.ingest = Arc::new(IngestService::new(
-            self.privileged.clone(),
-            self.active_graph.clone(),
-            cfg,
-        ));
+        self.ingest_cfg = cfg;
+        self.rebuild_ingest();
         self
     }
 
     pub fn with_event_sink(mut self, event_sink: Arc<dyn EventSink>) -> Self {
         self.event_sink = event_sink;
+        self.rebuild_ingest();
         self
+    }
+
+    /// The ingestion service holds the settings and the event sink, so it is
+    /// rebuilt when either changes.
+    fn rebuild_ingest(&mut self) {
+        self.ingest = Arc::new(IngestService::new(
+            self.privileged.clone(),
+            self.active_graph.clone(),
+            self.ingest_cfg.clone(),
+            self.event_sink.clone(),
+        ));
     }
 
     pub fn with_plugins(mut self, plugins: Vec<Box<dyn ToolPlugin>>) -> Self {
@@ -189,6 +203,7 @@ impl SparqlMcpServer {
                 self.event_sink.as_ref(),
             ),
             "ingest_begin" => ingest::ingest_begin(&self.ingest, args),
+            "ingest_batch" => ingest::ingest_batch(&self.ingest, args),
             "ingest_status" => ingest::ingest_status(&self.ingest, args),
             "ingest_abort" => ingest::ingest_abort(&self.ingest, args),
             "export_graph" => export::export_graph(&self.store, args),
@@ -439,6 +454,7 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::doc::tool_write_doc_def(),
         crate::application::tools::gdrive::tool_get_gdrive_config_def(),
         crate::application::tools::ingest::tool_ingest_begin_def(),
+        crate::application::tools::ingest::tool_ingest_batch_def(),
         crate::application::tools::ingest::tool_ingest_status_def(),
         crate::application::tools::ingest::tool_ingest_abort_def(),
     ];

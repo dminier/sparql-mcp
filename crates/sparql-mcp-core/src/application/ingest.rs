@@ -17,19 +17,25 @@
 //! [`string_literal`] and [`iri`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange, StoreEvent};
 use crate::application::gated_store::PrivilegedStore;
 use crate::application::guards::is_protected;
 use crate::application::limits::ToolError;
 use crate::application::sparql_text::{iri, string_literal};
 use crate::application::tools::project::iso_now;
 use crate::config::IngestConfig;
-use crate::domain::{QueryResult, RdfTerm, SparqlStore};
+use crate::domain::{
+    BatchRefusal, BatchWrite, Counter, Idempotency, InputFormat, QueryResult, RdfTerm,
+    RecordCounts, SparqlStore, StoredQuad,
+};
 
 /// The protected graph holding every job's manifest and batch records.
 pub const JOBS_GRAPH: &str = "urn:sparql-mcp:jobs";
@@ -42,6 +48,12 @@ const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const SMC_NAMED_GRAPH: &str = "https://sparql-mcp.dev/ns#namedGraph";
 const META_GRAPH: &str = "urn:meta";
 const MAX_LABEL_CHARS: usize = 200;
+/// Once a direct job is above the event threshold, at most one `Changed`
+/// event this often.
+const CHANGED_EVERY: Duration = Duration::from_secs(5);
+/// Anonymous blank nodes and skolem IRIs live in this reserved namespace.
+const GENID: &str = "urn:sparql-mcp:genid:";
+const RESERVED_PREFIX: &str = "urn:sparql-mcp:";
 
 /// Where a job is in its life. The ledger stores it as an `smj:` IRI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +222,10 @@ pub struct IngestService {
     privileged: Arc<PrivilegedStore>,
     active_graph: Arc<RwLock<String>>,
     cfg: IngestConfig,
+    events: Arc<dyn EventSink>,
+    /// When a `Changed` event was last sent for a direct job, to send at most
+    /// one every [`CHANGED_EVERY`].
+    last_changed: Mutex<HashMap<String, Instant>>,
 }
 
 impl IngestService {
@@ -217,11 +233,14 @@ impl IngestService {
         privileged: Arc<PrivilegedStore>,
         active_graph: Arc<RwLock<String>>,
         cfg: IngestConfig,
+        events: Arc<dyn EventSink>,
     ) -> Self {
         Self {
             privileged,
             active_graph,
             cfg,
+            events,
+            last_changed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -392,6 +411,8 @@ impl IngestService {
                         smj("lastActivity"),
                         typed(&now, "dateTime")
                     ),
+                    format!("<{job}> {} {}", smj("triplesTotal"), typed("0", "long")),
+                    format!("<{job}> {} {}", smj("batchCount"), typed("0", "long")),
                 ];
                 if let Some(s) = &staging {
                     triples.push(format!("<{job}> {} <{s}>", smj("staging")));
@@ -561,6 +582,334 @@ impl IngestService {
         Ok(out)
     }
 
+    /// The stored record of a batch: its hash and what it did.
+    fn read_record(
+        &self,
+        store: &dyn SparqlStore,
+        id: &str,
+        seq: u32,
+    ) -> Result<Option<BatchRecord>> {
+        let q = format!(
+            "SELECT ?sha ?parsed ?new ?dup WHERE {{ GRAPH <{JOBS_GRAPH}> {{ <{}> {} ?sha . \
+             OPTIONAL {{ <{r}> {} ?parsed }} OPTIONAL {{ <{r}> {} ?new }} OPTIONAL {{ <{r}> {} ?dup }} }} }}",
+            batch_iri(id, seq),
+            smj("sha256"),
+            smj("parsed"),
+            smj("insertedNew"),
+            smj("alreadyPresent"),
+            r = batch_iri(id, seq),
+        );
+        Ok(rows(store, &q)?.first().map(|r| {
+            let n = |k: &str| value(r, k).and_then(|v| v.parse().ok()).unwrap_or(0);
+            BatchRecord {
+                sha256: value(r, "sha").unwrap_or_default().to_string(),
+                parsed: n("parsed"),
+                inserted_new: n("new"),
+                already_present: n("dup"),
+            }
+        }))
+    }
+
+    /// The job's running totals: batches accepted and triples parsed.
+    fn totals(&self, m: &HashMap<String, String>) -> (u64, u64) {
+        let n = |k: &str| m.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+        (n("batchCount"), n("triplesTotal"))
+    }
+
+    fn batch_reply(
+        &self,
+        id: &str,
+        seq: u32,
+        mode: Mode,
+        rec: &BatchRecord,
+        duplicate: bool,
+        totals: (u64, u64),
+    ) -> Value {
+        let (batches, triples) = totals;
+        let (new_key, dup_key) = match mode {
+            Mode::Staged => ("new_to_staging", "already_staged"),
+            Mode::Direct => ("new_to_target", "already_in_target"),
+        };
+        let max = self.max_triples(mode);
+        let mut out = json!({
+            "job_id": id,
+            "seq": seq,
+            "parsed": rec.parsed,
+            "duplicate": duplicate,
+            "job": {
+                "batches": batches,
+                "triples": triples,
+                "remaining_triples": max.saturating_sub(triples),
+            },
+        });
+        out[new_key] = json!(rec.inserted_new);
+        out[dup_key] = json!(rec.already_present);
+        out
+    }
+
+    fn max_triples(&self, mode: Mode) -> u64 {
+        match mode {
+            Mode::Staged => self.cfg.max_job_triples_staged,
+            Mode::Direct => self.cfg.max_job_triples_direct,
+        }
+    }
+
+    /// Accept one batch of a job.
+    ///
+    /// 1. Cheap checks and an idempotency fast path, outside the write gate.
+    /// 2. Parse the whole payload: nothing is written on a syntax error.
+    /// 3. Skolemize blank nodes, refuse reserved IRIs and oversized terms.
+    /// 4. One transaction (`SparqlStore::write_batch`) that **re-checks** the job
+    ///    is open and the batch is new, advances the job's counters against
+    ///    their ceilings, and writes the data and the batch record. The fast
+    ///    paths only save work; this is the check that counts, so a retry that
+    ///    overlaps the original cannot be accepted twice.
+    pub fn batch(&self, req: &BatchRequest) -> Result<Value> {
+        let id = req.job_id.as_str();
+        if !is_job_id(id) {
+            return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
+        }
+        if req.seq == 0 || req.seq > self.cfg.max_job_batches {
+            return Err(coded(
+                "invalid_argument",
+                format!("seq must be between 1 and {}", self.cfg.max_job_batches),
+                Some(id),
+            ));
+        }
+        if req.data.len() > self.cfg.max_batch_bytes {
+            return Err(ToolError::LimitExceeded {
+                limit_key: "max_batch_bytes".to_string(),
+                limit: self.cfg.max_batch_bytes as u64,
+                value: req.data.len() as u64,
+            }
+            .into_anyhow());
+        }
+        let store: &dyn SparqlStore = self.privileged.as_ref();
+        let Some(m) = self.manifest(store, id)? else {
+            return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
+        };
+        let state = m.get("state").and_then(|s| JobState::from_iri(s));
+        if !state.is_some_and(JobState::accepts_batches) {
+            return Err(job_not_open(id, state));
+        }
+        let mode = m
+            .get("mode")
+            .and_then(|s| Mode::parse(s))
+            .unwrap_or(Mode::Staged);
+        let target = m.get("target").cloned().unwrap_or_default();
+        let graph = match (mode, m.get("staging")) {
+            (Mode::Staged, Some(staging)) => staging.clone(),
+            _ => target.clone(),
+        };
+        let format = req
+            .format
+            .as_deref()
+            .or_else(|| m.get("format").map(String::as_str))
+            .unwrap_or("ntriples");
+        let format = match format {
+            "ntriples" => InputFormat::NTriples,
+            "turtle" => InputFormat::Turtle,
+            other => {
+                return Err(coded(
+                    "invalid_argument",
+                    format!("format must be ntriples or turtle, not {other:?}"),
+                    Some(id),
+                ))
+            }
+        };
+        let reject_blank = m.get("blankNodes").is_some_and(|b| b == "reject");
+        let sha = format!("{:x}", Sha256::digest(req.data.as_bytes()));
+
+        // Fast path: this batch was already accepted.
+        if let Some(rec) = self.read_record(store, id, req.seq)? {
+            return if rec.sha256 == sha {
+                let (batches, triples) = self.totals(&m);
+                Ok(self.batch_reply(id, req.seq, mode, &rec, true, (batches, triples)))
+            } else {
+                Err(seq_conflict(id, req.seq))
+            };
+        }
+
+        // Parse completely, then check and skolemize. Nothing is written yet.
+        let parsed = store
+            .parse_rdf_raw(req.data.as_bytes(), format)
+            .map_err(|e| {
+                ToolError::ParseError {
+                    message: e.to_string(),
+                    line: None,
+                    column: None,
+                }
+                .into_anyhow()
+            })?;
+        if parsed.len() > self.cfg.max_batch_triples {
+            return Err(ToolError::LimitExceeded {
+                limit_key: "max_batch_triples".to_string(),
+                limit: self.cfg.max_batch_triples as u64,
+                value: parsed.len() as u64,
+            }
+            .into_anyhow());
+        }
+        let parsed_count = parsed.len() as u64;
+        let quads = prepare_quads(parsed, id, req.seq, reject_blank, &graph, &self.cfg)
+            .map_err(ToolError::into_anyhow)?;
+
+        // The write, with its conditions, in one transaction.
+        let job = job_iri(id);
+        let rec_iri = batch_iri(id, req.seq);
+        let identity = ledger_quad(&rec_iri, "sha256", &string_literal(&sha));
+        let write = BatchWrite {
+            quads: quads.clone(),
+            ledger: vec![
+                ledger_quad(&rec_iri, "type_", &format!("<{SMJ}Batch>")),
+                ledger_quad(&rec_iri, "job", &format!("<{job}>")),
+                ledger_quad(&rec_iri, "seq", &typed(&req.seq.to_string(), "long")),
+                identity.clone(),
+                ledger_quad(
+                    &rec_iri,
+                    "parsed",
+                    &typed(&parsed_count.to_string(), "long"),
+                ),
+                ledger_quad(&rec_iri, "accepted", &typed(&iso_now(), "dateTime")),
+            ],
+            require: vec![ledger_quad(
+                &job,
+                "state",
+                &format!("<{}>", JobState::Open.iri()),
+            )],
+            idempotency: Some(Idempotency {
+                subject: rec_iri.clone(),
+                graph: JOBS_GRAPH.to_string(),
+                identity,
+            }),
+            counters: vec![
+                Counter {
+                    subject: job.clone(),
+                    predicate: format!("{SMJ}triplesTotal"),
+                    graph: JOBS_GRAPH.to_string(),
+                    add: parsed_count,
+                    max: Some(self.max_triples(mode)),
+                },
+                Counter {
+                    subject: job.clone(),
+                    predicate: format!("{SMJ}batchCount"),
+                    graph: JOBS_GRAPH.to_string(),
+                    add: 1,
+                    max: Some(u64::from(self.cfg.max_job_batches)),
+                },
+            ],
+            record_counts: Some(RecordCounts {
+                subject: rec_iri,
+                graph: JOBS_GRAPH.to_string(),
+                inserted_new_predicate: format!("{SMJ}insertedNew"),
+                already_present_predicate: format!("{SMJ}alreadyPresent"),
+            }),
+        };
+
+        match self.privileged.write_batch(&write)? {
+            Ok(applied) => {
+                let (triples, batches) = (applied.counters[0], applied.counters[1]);
+                self.after_batch(mode, &target, &quads, id, parsed_count, triples);
+                let rec = BatchRecord {
+                    sha256: sha,
+                    parsed: parsed_count,
+                    inserted_new: applied.inserted_new,
+                    already_present: applied.already_present,
+                };
+                Ok(self.batch_reply(id, req.seq, mode, &rec, false, (batches, triples)))
+            }
+            Err(refusal) => self.refused_batch(store, id, req.seq, mode, &sha, refusal),
+        }
+    }
+
+    /// Turn what the transaction refused into the answer the agent gets. A
+    /// retry that lost the race for the same batch gets the original result.
+    fn refused_batch(
+        &self,
+        store: &dyn SparqlStore,
+        id: &str,
+        seq: u32,
+        mode: Mode,
+        sha: &str,
+        refusal: BatchRefusal,
+    ) -> Result<Value> {
+        match refusal {
+            BatchRefusal::RequirementNotMet(_) => {
+                let state = self
+                    .manifest(store, id)?
+                    .and_then(|m| m.get("state").and_then(|s| JobState::from_iri(s)));
+                Err(job_not_open(id, state))
+            }
+            BatchRefusal::Duplicate => {
+                let m = self.manifest(store, id)?.unwrap_or_default();
+                let (batches, triples) = self.totals(&m);
+                match self.read_record(store, id, seq)? {
+                    Some(rec) if rec.sha256 == sha => {
+                        Ok(self.batch_reply(id, seq, mode, &rec, true, (batches, triples)))
+                    }
+                    _ => Err(seq_conflict(id, seq)),
+                }
+            }
+            BatchRefusal::Conflict => Err(seq_conflict(id, seq)),
+            BatchRefusal::CounterLimit {
+                counter,
+                limit,
+                value,
+            } => {
+                let key = match (counter, mode) {
+                    (0, Mode::Staged) => "max_job_triples_staged",
+                    (0, Mode::Direct) => "max_job_triples_direct",
+                    _ => "max_job_batches",
+                };
+                Err(ToolError::LimitExceeded {
+                    limit_key: key.to_string(),
+                    limit,
+                    value,
+                }
+                .into_anyhow())
+            }
+        }
+    }
+
+    /// What a direct job tells the viewer after a batch. A staged job is
+    /// invisible until it commits.
+    fn after_batch(
+        &self,
+        mode: Mode,
+        target: &str,
+        quads: &[StoredQuad],
+        id: &str,
+        parsed: u64,
+        total: u64,
+    ) {
+        if mode != Mode::Direct {
+            return;
+        }
+        if total as usize <= self.cfg.event_changed_threshold {
+            emit_quads(
+                self.events.as_ref(),
+                QuadChange::Inserted,
+                quads,
+                EventLimits {
+                    max_triples: self.cfg.event_max_triples,
+                    changed_threshold: self.cfg.event_changed_threshold,
+                },
+            );
+            return;
+        }
+        // Above the threshold a stream of inserts would flood a viewer, so
+        // send one `Changed` now and then. Its counts are the job's totals.
+        let mut last = self.last_changed.lock().unwrap_or_else(|e| e.into_inner());
+        let due = last.get(id).is_none_or(|t| t.elapsed() >= CHANGED_EVERY);
+        if due {
+            last.insert(id.to_string(), Instant::now());
+            self.events.emit(StoreEvent::Changed {
+                graph: target.to_string(),
+                triples_before: total.saturating_sub(parsed),
+                triples_after: total,
+            });
+        }
+    }
+
     /// Abort a job that is open, interrupted or failed. A staged job's staging
     /// graph is dropped in the same transaction as the state change. A direct
     /// job's accepted batches stay in the target graph: the reply lists them.
@@ -617,6 +966,159 @@ impl IngestService {
                 Ok(reply)
             })?
     }
+}
+
+/// What `ingest_batch` is given.
+#[derive(Debug, Clone)]
+pub struct BatchRequest {
+    pub job_id: String,
+    pub seq: u32,
+    pub data: String,
+    /// Overrides the job's format for this batch.
+    pub format: Option<String>,
+}
+
+/// A batch as recorded in the ledger.
+#[derive(Debug, Clone)]
+struct BatchRecord {
+    sha256: String,
+    parsed: u64,
+    inserted_new: u64,
+    already_present: u64,
+}
+
+pub fn batch_iri(id: &str, seq: u32) -> String {
+    format!("{JOB_PREFIX}{id}:batch:{seq}")
+}
+
+/// A ledger quad (in the jobs graph) with an `smj:` predicate. `object` is
+/// already in its N-Triples form. `type_` stands for `rdf:type`.
+fn ledger_quad(subject: &str, predicate: &str, object: &str) -> StoredQuad {
+    let predicate = if predicate == "type_" {
+        "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_string()
+    } else {
+        format!("<{SMJ}{predicate}>")
+    };
+    StoredQuad {
+        s: format!("<{subject}>"),
+        p: predicate,
+        o: object.to_string(),
+        g: Some(JOBS_GRAPH.to_string()),
+    }
+}
+
+fn job_not_open(id: &str, state: Option<JobState>) -> anyhow::Error {
+    coded(
+        "job_not_open",
+        format!(
+            "job {id} is {}: only an open job accepts batches",
+            state.map_or("in an unknown state", JobState::name)
+        ),
+        Some(id),
+    )
+}
+
+fn seq_conflict(id: &str, seq: u32) -> anyhow::Error {
+    coded(
+        "seq_conflict",
+        format!(
+            "batch {seq} of job {id} was already accepted with different content; \
+             send corrected data under a new seq, or abort the job"
+        ),
+        Some(id),
+    )
+}
+
+/// A blank node label the parser generated itself (a Turtle `[]` or
+/// collection): 32 hexadecimal digits. Anything else was written by the agent.
+fn is_generated_label(label: &str) -> bool {
+    label.len() == 32 && label.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Percent-encode a blank node label so it is a safe IRI path segment.
+fn pct_encode(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for b in label.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Check and rewrite a parsed batch, and put every quad in `graph`.
+///
+/// *   An IRI in the reserved namespace is refused (`reserved_iri`), and an IRI
+///     or literal over its size limit is `limit_exceeded`.
+/// *   A **labelled** blank node `_:x` becomes `<urn:sparql-mcp:genid:{job}:x>`,
+///     the same IRI in every batch and every retry of the job. An
+///     **anonymous** one (generated by the parser, so its label is random)
+///     becomes `<urn:sparql-mcp:genid:{job}:{seq}:a{n}>`, `n` being the order of
+///     first appearance in the batch, so a retried batch gets the same IRIs.
+/// *   With `reject_blank`, any blank node is `blank_node_rejected`.
+pub fn prepare_quads(
+    quads: Vec<StoredQuad>,
+    job_id: &str,
+    seq: u32,
+    reject_blank: bool,
+    graph: &str,
+    cfg: &IngestConfig,
+) -> std::result::Result<Vec<StoredQuad>, ToolError> {
+    let mut anonymous: HashMap<String, usize> = HashMap::new();
+    let mut map = |term: &str| -> std::result::Result<String, ToolError> {
+        if let Some(label) = term.strip_prefix("_:") {
+            if reject_blank {
+                return Err(ToolError::Coded {
+                    code: "blank_node_rejected",
+                    message: "this job was started with blank_nodes: reject, and the batch \
+                              contains a blank node"
+                        .to_string(),
+                    job_id: Some(job_id.to_string()),
+                });
+            }
+            return Ok(if is_generated_label(label) {
+                let next = anonymous.len();
+                let n = *anonymous.entry(label.to_string()).or_insert(next);
+                format!("<{GENID}{job_id}:{seq}:a{n}>")
+            } else {
+                format!("<{GENID}{job_id}:{}>", pct_encode(label))
+            });
+        }
+        if let Some(iri) = term.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+            if iri.starts_with(RESERVED_PREFIX) {
+                return Err(ToolError::ReservedIri {
+                    iri: iri.to_string(),
+                });
+            }
+            if iri.len() > cfg.max_iri_bytes {
+                return Err(ToolError::LimitExceeded {
+                    limit_key: "max_iri_bytes".to_string(),
+                    limit: cfg.max_iri_bytes as u64,
+                    value: iri.len() as u64,
+                });
+            }
+        } else if term.len() > cfg.max_literal_bytes {
+            return Err(ToolError::LimitExceeded {
+                limit_key: "max_literal_bytes".to_string(),
+                limit: cfg.max_literal_bytes as u64,
+                value: term.len() as u64,
+            });
+        }
+        Ok(term.to_string())
+    };
+    quads
+        .into_iter()
+        .map(|q| {
+            Ok(StoredQuad {
+                s: map(&q.s)?,
+                p: map(&q.p)?,
+                o: map(&q.o)?,
+                g: Some(graph.to_string()),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -685,5 +1187,127 @@ mod tests {
         assert!(is_protected(&staging_iri("X")));
         assert!(is_protected(JOBS_GRAPH));
         assert!(job_iri("X").starts_with("urn:sparql-mcp:"));
+    }
+    fn quad(s: &str, p: &str, o: &str) -> StoredQuad {
+        StoredQuad {
+            s: s.to_string(),
+            p: p.to_string(),
+            o: o.to_string(),
+            g: None,
+        }
+    }
+
+    const JOB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    fn prep(quads: Vec<StoredQuad>, seq: u32) -> std::result::Result<Vec<StoredQuad>, ToolError> {
+        prepare_quads(quads, JOB, seq, false, "urn:g", &IngestConfig::default())
+    }
+
+    #[test]
+    fn a_labelled_blank_node_is_the_same_iri_in_every_batch_of_the_job() {
+        let q = vec![
+            quad("_:a", "<urn:p>", "_:b"),
+            quad("_:a", "<urn:q>", "\"x\""),
+        ];
+        let one = prep(q.clone(), 1).unwrap();
+        let two = prep(q, 2).unwrap();
+        // Same labels, different batches: the same skolem IRIs.
+        assert_eq!(one[0].s, format!("<{GENID}{JOB}:a>"));
+        assert_eq!(one[0].o, format!("<{GENID}{JOB}:b>"));
+        assert_eq!(one[0].s, two[0].s);
+        assert_eq!(one[0].s, one[1].s, "_:a is one node within a batch");
+        // Everything lands in the job's graph.
+        assert!(one.iter().all(|q| q.g.as_deref() == Some("urn:g")));
+    }
+
+    #[test]
+    fn an_anonymous_node_is_numbered_by_first_appearance_and_stable_on_retry() {
+        // Two parses of the same Turtle give different random labels, but the
+        // same shape; the skolem IRIs must not depend on the random label.
+        let a = "e29eb7b417983b13f1fe41d6e2793a70";
+        let b = "0123456789abcdef0123456789abcdef";
+        let first = prep(
+            vec![quad(&format!("_:{a}"), "<urn:p>", &format!("_:{b}"))],
+            3,
+        )
+        .unwrap();
+        let again_a = "ffffffffffffffffffffffffffffffff";
+        let again_b = "00000000000000000000000000000001";
+        let second = prep(
+            vec![quad(
+                &format!("_:{again_a}"),
+                "<urn:p>",
+                &format!("_:{again_b}"),
+            )],
+            3,
+        )
+        .unwrap();
+        assert_eq!(first, second, "a retried batch must produce the same quads");
+        assert_eq!(first[0].s, format!("<{GENID}{JOB}:3:a0>"));
+        assert_eq!(first[0].o, format!("<{GENID}{JOB}:3:a1>"));
+    }
+
+    #[test]
+    fn labels_are_percent_encoded_so_they_cannot_break_the_iri() {
+        let out = prep(vec![quad("_:we ird>", "<urn:p>", "\"x\"")], 1).unwrap();
+        assert_eq!(out[0].s, format!("<{GENID}{JOB}:we%20ird%3E>"));
+    }
+
+    #[test]
+    fn blank_nodes_can_be_rejected() {
+        let err = prepare_quads(
+            vec![quad("_:a", "<urn:p>", "\"x\"")],
+            JOB,
+            1,
+            true,
+            "urn:g",
+            &IngestConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "blank_node_rejected");
+        // A batch with no blank node is fine in that mode.
+        assert!(prepare_quads(
+            vec![quad("<urn:a>", "<urn:p>", "\"x\"")],
+            JOB,
+            1,
+            true,
+            "urn:g",
+            &IngestConfig::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_reserved_namespace_and_oversized_terms_are_refused() {
+        for bad in [
+            quad("<urn:sparql-mcp:genid:x:1>", "<urn:p>", "\"x\""),
+            quad("<urn:a>", "<urn:sparql-mcp:jobs#state>", "\"x\""),
+            quad("<urn:a>", "<urn:p>", "<urn:sparql-mcp:job:X>"),
+        ] {
+            assert_eq!(prep(vec![bad], 1).unwrap_err().code(), "reserved_iri");
+        }
+        let cfg = IngestConfig {
+            max_iri_bytes: 20,
+            max_literal_bytes: 20,
+            ..IngestConfig::default()
+        };
+        let long_iri = quad(&format!("<urn:{}>", "x".repeat(30)), "<urn:p>", "\"x\"");
+        let e = prepare_quads(vec![long_iri], JOB, 1, false, "urn:g", &cfg).unwrap_err();
+        assert!(
+            matches!(&e, ToolError::LimitExceeded { limit_key, .. } if limit_key == "max_iri_bytes")
+        );
+        let long_lit = quad("<urn:a>", "<urn:p>", &format!("\"{}\"", "x".repeat(40)));
+        let e = prepare_quads(vec![long_lit], JOB, 1, false, "urn:g", &cfg).unwrap_err();
+        assert!(
+            matches!(&e, ToolError::LimitExceeded { limit_key, .. } if limit_key == "max_literal_bytes")
+        );
+    }
+
+    #[test]
+    fn generated_labels_are_told_from_written_ones() {
+        assert!(is_generated_label("e29eb7b417983b13f1fe41d6e2793a70"));
+        assert!(!is_generated_label("b0"));
+        assert!(!is_generated_label("e29eb7b417983b13f1fe41d6e2793a7")); // 31
+        assert!(!is_generated_label("g29eb7b417983b13f1fe41d6e2793a70")); // not hex
     }
 }

@@ -191,6 +191,89 @@ impl FileLoadResult {
     }
 }
 
+/// A write that is applied only if conditions hold, with the conditions
+/// checked and the write applied in **one transaction**
+/// ([`SparqlStore::write_batch`]).
+///
+/// The port knows nothing about what the conditions mean (the ingestion jobs
+/// use them to check that a job is open and that a batch was not already
+/// accepted); it only evaluates them against the store's own state, so no
+/// other writer can slip between the check and the write.
+#[derive(Debug, Clone, Default)]
+pub struct BatchWrite {
+    /// The data to insert.
+    pub quads: Vec<StoredQuad>,
+    /// More quads inserted with the data (a batch record, for instance).
+    pub ledger: Vec<StoredQuad>,
+    /// Each of these quads must be in the store, or nothing is written
+    /// ([`BatchRefusal::RequirementNotMet`] with its index).
+    pub require: Vec<StoredQuad>,
+    /// Refuse a write that was already accepted.
+    pub idempotency: Option<Idempotency>,
+    /// Numeric counters (`xsd:long` objects) to advance in the same
+    /// transaction, each with an optional ceiling.
+    pub counters: Vec<Counter>,
+    /// Record, inside the transaction, how many of `quads` were new.
+    pub record_counts: Option<RecordCounts>,
+}
+
+/// A write is *the same* when `identity` is already in the store, and a
+/// *conflict* when something else is already recorded for `subject` in `graph`.
+#[derive(Debug, Clone)]
+pub struct Idempotency {
+    pub subject: String,
+    pub graph: String,
+    pub identity: StoredQuad,
+}
+
+/// Add `add` to the number that is the object of `(subject, predicate)` in
+/// `graph`. If the result would exceed `max`, nothing is written
+/// ([`BatchRefusal::CounterLimit`]).
+#[derive(Debug, Clone)]
+pub struct Counter {
+    pub subject: String,
+    pub predicate: String,
+    pub graph: String,
+    pub add: u64,
+    pub max: Option<u64>,
+}
+
+/// Write, in `graph`, the number of new and of already present quads as two
+/// `xsd:long` quads on `subject`.
+#[derive(Debug, Clone)]
+pub struct RecordCounts {
+    pub subject: String,
+    pub graph: String,
+    pub inserted_new_predicate: String,
+    pub already_present_predicate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchApplied {
+    pub inserted_new: u64,
+    pub already_present: u64,
+    /// The counters after the write, in the order of `BatchWrite::counters`.
+    pub counters: Vec<u64>,
+}
+
+/// Why [`SparqlStore::write_batch`] wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchRefusal {
+    /// `require[i]` is not in the store.
+    RequirementNotMet(usize),
+    /// The idempotency identity is already recorded: the same write was
+    /// accepted before.
+    Duplicate,
+    /// Something else is recorded for the same subject.
+    Conflict,
+    /// `counters[counter]` would reach `value`, above its ceiling `limit`.
+    CounterLimit {
+        counter: usize,
+        limit: u64,
+        value: u64,
+    },
+}
+
 // ── Port trait ────────────────────────────────────────────────────────────────
 
 /// The sole storage abstraction used by the application layer.
@@ -238,6 +321,20 @@ pub trait SparqlStore: Send + Sync {
     fn check_update(&self, _sparql: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Like [`Self::parse_rdf`], but blank node labels are kept **as written**
+    /// (`_:a` stays `_:a`) instead of being renamed, so a caller can map them
+    /// to stable names. Nodes the parser generates itself (Turtle `[]`) get
+    /// random labels. No graph is applied: every quad is in the default graph.
+    fn parse_rdf_raw(&self, content: &[u8], format: InputFormat) -> Result<Vec<StoredQuad>>;
+
+    /// Check the conditions of `write` and apply it, in one transaction. The
+    /// outer `Err` is a store failure; the inner one is a refusal, and then
+    /// nothing was written.
+    fn write_batch(
+        &self,
+        write: &BatchWrite,
+    ) -> Result<std::result::Result<BatchApplied, BatchRefusal>>;
 
     /// Load an RDF file from disk, with SHA-256 idempotence.
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult>;
