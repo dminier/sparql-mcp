@@ -16,7 +16,7 @@ use crate::camera::SceneCamera;
 use crate::graph::{Node as GraphNode, NodeId, NodeKind, ViewerGraph};
 use crate::layout::LayoutState;
 use crate::plugin::CoreSet;
-use crate::render::NodeRef;
+use crate::render::{NodeRef, CLASS_RADIUS, INSTANCE_RADIUS};
 
 /// A press+release longer than this is a camera drag, not a click.
 const CLICK_MAX: Duration = Duration::from_millis(250);
@@ -27,6 +27,16 @@ const MAX_FILTER_ROWS: usize = 30;
 /// How many class labels are shown at once (nearest to the camera).
 const LABEL_BUDGET: usize = 30;
 const LABEL_REFRESH_SECS: f32 = 0.25;
+
+/// Label text: near-white with a hint of blue, to read on the dark plate.
+const LABEL_TEXT: Color = Color::srgb(0.97, 0.98, 1.0);
+/// The plate behind a label. It is nearly opaque so the text keeps its
+/// contrast over the brightest part of the scene (a glowing class sphere and
+/// its bloom). See the contrast test below.
+const LABEL_PLATE: Color = Color::srgba(0.02, 0.02, 0.06, 0.88);
+const LABEL_FONT_PX: f32 = 14.0;
+/// Space between a node's edge and the bottom of its label, in pixels.
+const LABEL_GAP_PX: f32 = 8.0;
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 #[derive(Resource, Default)]
@@ -549,15 +559,39 @@ fn update_labels(
             NodeLabel(id),
             Node {
                 position_type: PositionType::Absolute,
+                padding: UiRect::axes(Val::Px(7.0), Val::Px(3.0)),
+                border_radius: BorderRadius::all(Val::Px(5.0)),
                 ..default()
             },
-            text(node.label.clone(), 13.0, Color::srgb(1.0, 0.92, 0.75)),
+            // `left`/`top` hold the anchor (the middle of the label's bottom
+            // edge); this moves the label so its bottom centre sits there.
+            UiTransform::from_translation(Val2 {
+                x: Val::Percent(-50.0),
+                y: Val::Percent(-100.0),
+            }),
+            BackgroundColor(LABEL_PLATE),
+            Text::new(node.label.clone()),
+            TextFont {
+                font_size: FontSize::Px(LABEL_FONT_PX),
+                weight: FontWeight::SEMIBOLD,
+                ..default()
+            },
+            TextColor(LABEL_TEXT),
             Pickable::IGNORE,
         ));
     }
 }
 
+/// Where a label's bottom-centre anchor goes: straight above the node's
+/// centre on screen, clear of the node's own circle. `radius_px` is the node's
+/// projected radius, so the gap holds at any distance, unlike a fixed offset in
+/// world units (which shrinks to nothing, and into the glowing sphere, far away).
+fn label_anchor(centre: Vec2, radius_px: f32) -> Vec2 {
+    Vec2::new(centre.x, centre.y - radius_px - LABEL_GAP_PX)
+}
+
 fn position_labels(
+    graph: Res<ViewerGraph>,
     layout: Res<LayoutState>,
     camera: Query<(&Camera, &GlobalTransform), With<SceneCamera>>,
     mut labels: Query<(&NodeLabel, &mut Node, &mut Visibility)>,
@@ -566,10 +600,23 @@ fn position_labels(
         return;
     };
     for (label, mut node, mut visibility) in &mut labels {
+        let world_radius = match graph
+            .nodes
+            .get(label.0 .0 as usize)
+            .and_then(Option::as_ref)
+        {
+            Some(n) if n.kind == NodeKind::Class => CLASS_RADIUS,
+            _ => INSTANCE_RADIUS,
+        };
         let screen = layout.pos.get(label.0 .0 as usize).and_then(|p| {
-            camera
-                .world_to_viewport(camera_transform, *p + Vec3::Y * 0.8)
-                .ok()
+            let centre = camera.world_to_viewport(camera_transform, *p).ok()?;
+            // The projected radius: how far a point one radius to the side of
+            // the centre lands from it on screen.
+            let side = *p + camera_transform.right() * world_radius;
+            let radius_px = camera
+                .world_to_viewport(camera_transform, side)
+                .map_or(0.0, |s| (s - centre).length());
+            Some(label_anchor(centre, radius_px))
         });
         match screen {
             Some(at) => {
@@ -586,6 +633,62 @@ fn position_labels(
 mod tests {
     use super::*;
     use sparql_mcp::application::event_sink::{Snapshot, StoreEvent};
+
+    /// Relative luminance of an sRGB colour, per WCAG 2.x.
+    fn luminance(c: Color) -> f32 {
+        let c = c.to_srgba();
+        let lin = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.red) + 0.7152 * lin(c.green) + 0.0722 * lin(c.blue)
+    }
+
+    fn contrast(a: f32, b: f32) -> f32 {
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The plate is translucent, so what shows through it matters. Take the
+    /// brightest thing the scene can put behind a label (pure white, a
+    /// saturated bloom) and check the text still clears WCAG AAA (7:1).
+    #[test]
+    fn label_text_keeps_a_7_to_1_contrast_over_the_brightest_background() {
+        let plate = LABEL_PLATE.to_srgba();
+        let text = luminance(LABEL_TEXT);
+        for behind in [
+            Color::WHITE,
+            Color::srgb(1.0, 0.55, 0.15),  // the class sphere's colour
+            Color::srgb(0.35, 0.65, 0.95), // the instance sphere's colour
+        ] {
+            let b = behind.to_srgba();
+            // Blend in sRGB space, as the UI pass does.
+            let mix = |p: f32, b: f32| p * plate.alpha + b * (1.0 - plate.alpha);
+            let seen = Color::srgb(
+                mix(plate.red, b.red),
+                mix(plate.green, b.green),
+                mix(plate.blue, b.blue),
+            );
+            let ratio = contrast(text, luminance(seen));
+            assert!(
+                ratio >= 7.0,
+                "label contrast {ratio:.1}:1 over {behind:?}, below 7:1"
+            );
+        }
+    }
+
+    #[test]
+    fn the_anchor_is_centred_above_the_node_and_clears_its_circle() {
+        let at = label_anchor(Vec2::new(300.0, 200.0), 12.0);
+        assert_eq!(at.x, 300.0, "centred on the node");
+        assert!(at.y <= 200.0 - 12.0, "inside the node's own circle");
+        // A far node has a tiny radius, yet keeps the same gap above it.
+        let far = label_anchor(Vec2::new(300.0, 200.0), 1.0);
+        assert!(far.y < 200.0 && (200.0 - far.y) >= LABEL_GAP_PX);
+    }
 
     fn t(s: &str, p: &str, o: &str) -> [String; 3] {
         [s.into(), p.into(), o.into()]

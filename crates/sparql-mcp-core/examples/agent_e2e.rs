@@ -254,6 +254,22 @@ async fn main() -> Result<()> {
         || short(&body),
     );
 
+    // ── 4b. Relations in both directions: the viewer draws ONE arrow with a
+    //        head at each end, and hovering it names both relations.
+    println!("\n[4b] a two-way relation");
+    if args.instances >= 2 {
+        // n1 already depends on n0 (see above); n0 now notifies n1.
+        let update =
+            format!("INSERT DATA {{ GRAPH <{GRAPH}> {{ <{NS}n0> <{NS}notifies> <{NS}n1> }} }}");
+        let (err, body) = call(&svc, "update_sparql", json!({ "update": update })).await?;
+        checks.check(
+            "n0 notifies n1 (n1 dependsOn n0 already)",
+            !err && body["inserted_new"] == 1,
+            || short(&body),
+        );
+        tokio::time::sleep(pause).await;
+    }
+
     // ── 5. A pattern-based update: the server can only report it as `changed`.
     println!("\n[5] pattern delete (the viewer resyncs)");
     let del = format!("DELETE {{ GRAPH <{GRAPH}> {{ ?s <{NS}dependsOn> ?o }} }} WHERE {{ GRAPH <{GRAPH}> {{ ?s <{NS}dependsOn> ?o . FILTER(?s = <{NS}n3>) }} }}");

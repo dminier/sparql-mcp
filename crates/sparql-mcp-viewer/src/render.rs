@@ -11,6 +11,7 @@ use bevy::mesh::PrimitiveTopology;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 
+use crate::arrow::edge_segments;
 use crate::graph::{EdgeStyle, NodeId, NodeKind, ViewerGraph};
 use crate::ingest::LastBatch;
 use crate::interact::{ClassFilter, Selection};
@@ -55,6 +56,11 @@ fn edge_slot(style: EdgeStyle, faded: bool) -> usize {
 #[derive(Resource, Default)]
 pub struct Spawned(HashMap<NodeId, (Entity, String, NodeKind)>);
 
+/// World-space radius of a class sphere and of an instance sphere. Labels use
+/// them to sit just outside the node they name.
+pub const CLASS_RADIUS: f32 = 0.6;
+pub const INSTANCE_RADIUS: f32 = 0.25;
+
 pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
@@ -74,8 +80,18 @@ fn setup_style(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     commands.insert_resource(ViewerStyle {
-        class_mesh: meshes.add(Sphere::new(0.6).mesh().ico(3).expect("valid ico sphere")),
-        instance_mesh: meshes.add(Sphere::new(0.25).mesh().ico(2).expect("valid ico sphere")),
+        class_mesh: meshes.add(
+            Sphere::new(CLASS_RADIUS)
+                .mesh()
+                .ico(3)
+                .expect("valid ico sphere"),
+        ),
+        instance_mesh: meshes.add(
+            Sphere::new(INSTANCE_RADIUS)
+                .mesh()
+                .ico(2)
+                .expect("valid ico sphere"),
+        ),
         class_material: materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.55, 0.15),
             emissive: LinearRgba::rgb(2.0, 0.9, 0.2),
@@ -294,6 +310,11 @@ pub fn write_transforms(layout: Res<LayoutState>, mut nodes: Query<(&NodeRef, &m
     }
 }
 
+/// The directed `(from, to)` pairs of the graph, with the generation they were
+/// built for.
+#[derive(Default)]
+pub struct DirectedPairs(Option<u64>, std::collections::HashSet<(NodeId, NodeId)>);
+
 /// Rewrite the edge meshes' vertex positions. Only does work while the
 /// layout is awake, the graph changed, or the class filter changed.
 pub fn update_edge_meshes(
@@ -303,6 +324,7 @@ pub fn update_edge_meshes(
     filter: Option<Res<ClassFilter>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_generation: Local<Option<u64>>,
+    mut pairs: Local<DirectedPairs>,
 ) {
     let Some(edges) = edges else { return };
     let graph_changed = *last_generation != Some(graph.generation);
@@ -316,6 +338,16 @@ pub fn update_edge_meshes(
         (Some(filter), Some(Some(node))) => filter.is_visible(node),
         _ => true,
     };
+    // The directed pairs, rebuilt only when the graph changes: a pair linked
+    // both ways is drawn once, with a head at each end.
+    if pairs.0 != Some(graph.generation) {
+        pairs.0 = Some(graph.generation);
+        pairs.1 = graph.edges.iter().map(|e| (e.from, e.to)).collect();
+    }
+    let radius = |id: NodeId| match graph.nodes.get(id.0 as usize) {
+        Some(Some(node)) if node.kind == NodeKind::Class => CLASS_RADIUS,
+        _ => INSTANCE_RADIUS,
+    };
     let mut buckets: [Vec<[f32; 3]>; 6] = Default::default();
     for edge in &graph.edges {
         let (Some(a), Some(b)) = (
@@ -324,10 +356,18 @@ pub fn update_edge_meshes(
         ) else {
             continue;
         };
+        let reverse = pairs.1.contains(&(edge.to, edge.from));
+        // The two edges of a two-way pair share one line: the one that goes
+        // from the lower id draws it, its twin draws nothing.
+        if reverse && edge.from > edge.to {
+            continue;
+        }
         let faded = !visible(edge.from) || !visible(edge.to);
         let bucket = &mut buckets[edge_slot(edge.style, faded)];
-        bucket.push(a.to_array());
-        bucket.push(b.to_array());
+        for [p, q] in edge_segments(*a, *b, radius(edge.from), radius(edge.to), true, reverse) {
+            bucket.push(p.to_array());
+            bucket.push(q.to_array());
+        }
     }
 
     for (handle, positions) in edges.0.iter().zip(buckets) {

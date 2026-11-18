@@ -12,6 +12,8 @@ use bevy::transform::TransformSystems;
 
 use crate::camera::CameraPlugin;
 use crate::connection::{self, ConnState, ShutdownHandle, ViewerMsg};
+use crate::edge_hover::EdgeHoverPlugin;
+use crate::font::FontPlugin;
 use crate::graph::{NodeId, Remap, ViewerGraph};
 use crate::ingest::IngestPlugin;
 use crate::interact::InteractPlugin;
@@ -95,7 +97,14 @@ impl Plugin for ViewerPlugin {
         .insert_resource(LayoutParams::default())
         .insert_resource(LayoutState::new(LAYOUT_SEED))
         .insert_resource(Time::<Fixed>::from_hz(60.0))
-        .add_plugins((RenderPlugin, CameraPlugin, InteractPlugin, IngestPlugin))
+        .add_plugins((
+            FontPlugin,
+            RenderPlugin,
+            CameraPlugin,
+            InteractPlugin,
+            IngestPlugin,
+            EdgeHoverPlugin,
+        ))
         .add_systems(
             Update,
             (sync_entities, apply_node_materials)
