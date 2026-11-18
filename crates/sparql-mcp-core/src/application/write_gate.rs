@@ -13,6 +13,7 @@
 //! future therefore never releases the gate while a write is still running.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,9 +26,18 @@ pub struct GateHolder {
     pub since: Instant,
 }
 
+struct State {
+    held: Option<GateHolder>,
+    /// Waiters in arrival order. The gate is handed out first come, first
+    /// served, so a loop that releases and immediately re-acquires (a chunked
+    /// load) cannot starve a writer that is already waiting.
+    queue: VecDeque<u64>,
+    next_ticket: u64,
+}
+
 struct Shared {
-    held: Mutex<Option<GateHolder>>,
-    released: Condvar,
+    state: Mutex<State>,
+    changed: Condvar,
     wait: Duration,
 }
 
@@ -48,14 +58,14 @@ struct GateGuard<'a> {
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
         THIS_THREAD_HOLDS_GATE.with(|c| c.set(false));
-        let mut held = self
+        let mut state = self
             .gate
             .shared
-            .held
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *held = None;
-        self.gate.shared.released.notify_one();
+        state.held = None;
+        self.gate.shared.changed.notify_all();
     }
 }
 
@@ -63,8 +73,12 @@ impl WriteGate {
     pub fn new(wait: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
-                held: Mutex::new(None),
-                released: Condvar::new(),
+                state: Mutex::new(State {
+                    held: None,
+                    queue: VecDeque::new(),
+                    next_ticket: 0,
+                }),
+                changed: Condvar::new(),
                 wait,
             }),
         }
@@ -73,9 +87,10 @@ impl WriteGate {
     /// The current holder, if any.
     pub fn holder(&self) -> Option<GateHolder> {
         self.shared
-            .held
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .held
             .clone()
     }
 
@@ -89,27 +104,43 @@ impl WriteGate {
             );
         }
         let deadline = Instant::now() + self.shared.wait;
-        let mut held = self.shared.held.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(holder) = held.as_ref() {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        state.queue.push_back(ticket);
+        loop {
+            if state.held.is_none() && state.queue.front() == Some(&ticket) {
+                state.queue.pop_front();
+                break;
+            }
             let now = Instant::now();
             if now >= deadline {
+                let holder = state
+                    .held
+                    .as_ref()
+                    .map_or("queued writers", |h| h.label)
+                    .to_string();
+                state.queue.retain(|t| *t != ticket);
+                // The waiter behind us may now be at the front.
+                self.shared.changed.notify_all();
                 return Err(ToolError::WriteBusy {
-                    holder: holder.label.to_string(),
+                    holder,
                     waited_secs: self.shared.wait.as_secs(),
                 }
                 .into_anyhow());
             }
-            held = self
+            state = self
                 .shared
-                .released
-                .wait_timeout(held, deadline - now)
+                .changed
+                .wait_timeout(state, deadline - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        *held = Some(GateHolder {
+        state.held = Some(GateHolder {
             label,
             since: Instant::now(),
         });
+        drop(state);
         THIS_THREAD_HOLDS_GATE.with(|c| c.set(true));
         Ok(GateGuard { gate: self })
     }
@@ -169,6 +200,34 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_waiting_writer_is_not_starved_by_a_loop_that_reacquires() {
+        use std::sync::atomic::AtomicBool;
+        let gate = WriteGate::new(Duration::from_secs(5));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (g2, s2) = (gate.clone(), stop.clone());
+        // A chunked load: take the gate, work, release, and immediately again.
+        let looper = std::thread::spawn(move || {
+            while !s2.load(Ordering::SeqCst) {
+                g2.run_blocking("chunk", || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                })
+                .unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        let started = Instant::now();
+        gate.run_blocking("other", || Ok(())).unwrap();
+        let waited = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        looper.join().unwrap();
+        assert!(
+            waited < Duration::from_millis(250),
+            "a waiting writer was starved for {waited:?} by a re-acquiring loop"
+        );
     }
 
     #[test]

@@ -222,6 +222,16 @@ pub trait SparqlStore: Send + Sync {
         opts: LoadOpts,
     ) -> Result<(u64, Vec<StoredQuad>)>;
 
+    /// Parse RDF into quads **without touching the store**: pure CPU work that
+    /// takes no write gate. Blank nodes are renamed per call, as in
+    /// [`Self::load_rdf`]. Pair it with [`Self::write_quads`] to load a large
+    /// payload in bounded chunks, releasing the write gate between them.
+    fn parse_rdf(&self, content: &[u8], opts: &LoadOpts) -> Result<Vec<StoredQuad>>;
+
+    /// Write `quads` in one transaction. Returns how many were not in the
+    /// store before; the count costs no whole-store scan.
+    fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64>;
+
     /// Load an RDF file from disk, with SHA-256 idempotence.
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult>;
 

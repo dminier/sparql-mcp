@@ -162,7 +162,12 @@ impl SparqlMcpServer {
                 &self.active_graph,
                 self.event_sink.as_ref(),
             ),
-            "cbm_load_graph" => cbm::cbm_load_graph(&self.store, args),
+            "cbm_load_graph" => cbm::cbm_load_graph(
+                &self.store,
+                args,
+                &self.active_graph,
+                self.event_sink.as_ref(),
+            ),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),

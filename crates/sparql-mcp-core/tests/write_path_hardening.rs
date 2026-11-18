@@ -24,6 +24,8 @@ use sparql_mcp::mcp::server::SparqlMcpServer;
 struct SlowStore {
     inner: OxigraphAdapter,
     delay: Duration,
+    /// Sleep inside `write_quads`, to model a slow chunk.
+    write_delay: Duration,
     inside: AtomicUsize,
     peak: AtomicUsize,
 }
@@ -33,6 +35,7 @@ impl SlowStore {
         Self {
             inner: OxigraphAdapter::open(dir).unwrap(),
             delay,
+            write_delay: Duration::ZERO,
             inside: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
         }
@@ -63,6 +66,17 @@ impl SparqlStore for SlowStore {
         opts: LoadOpts,
     ) -> Result<(u64, Vec<sparql_mcp::domain::StoredQuad>)> {
         self.inner.load_rdf_with_triples(content, opts)
+    }
+    fn parse_rdf(
+        &self,
+        content: &[u8],
+        opts: &LoadOpts,
+    ) -> Result<Vec<sparql_mcp::domain::StoredQuad>> {
+        self.inner.parse_rdf(content, opts)
+    }
+    fn write_quads(&self, quads: &[sparql_mcp::domain::StoredQuad]) -> Result<u64> {
+        std::thread::sleep(self.write_delay);
+        self.inner.write_quads(quads)
     }
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult> {
         self.inner.load_rdf_file(path, opts, force)
@@ -202,4 +216,52 @@ async fn a_dropped_request_keeps_the_gate_until_its_write_ends() {
     assert!(!third.is_error.unwrap_or(false), "{:?}", body(&third));
     // Both the abandoned write and the third one landed; the refused one did not.
     assert_eq!(f.slow.triple_count().unwrap(), 2);
+}
+
+#[test]
+fn a_chunked_load_lets_other_writers_in_between_chunks() {
+    use sparql_mcp::domain::StoredQuad;
+
+    // Four chunks of 300 ms each: 1.2 s in total. A second writer arriving
+    // after 100 ms must be served after the current chunk, not after the whole
+    // load (the gate is released between chunks, and handed out in order).
+    let dir = tempfile::tempdir().unwrap();
+    let mut slow = SlowStore::new(&dir.path().join("store"), Duration::ZERO);
+    slow.write_delay = Duration::from_millis(300);
+    let raw: Arc<dyn SparqlStore> = Arc::new(slow);
+    let (gated, _privileged) = build_stores(raw, WriteGate::new(Duration::from_secs(10)));
+
+    let quads: Vec<StoredQuad> = (0..4)
+        .map(|n| StoredQuad {
+            s: format!("<urn:s:{n}>"),
+            p: "<urn:p>".into(),
+            o: "<urn:o>".into(),
+            g: Some("urn:g".into()),
+        })
+        .collect();
+    let loader_store = gated.clone();
+    let loader = std::thread::spawn(move || {
+        let mut inserted = 0;
+        for chunk in quads.chunks(1) {
+            inserted += loader_store.write_quads(chunk).unwrap();
+        }
+        inserted
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    gated
+        .update("INSERT DATA { <urn:other> <urn:p> <urn:o> }")
+        .unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(700),
+        "the second writer waited {waited:?}: the gate was held for the whole load"
+    );
+    assert!(
+        !loader.is_finished(),
+        "the second writer only ran once the whole load was over"
+    );
+    assert_eq!(loader.join().unwrap(), 4);
+    assert_eq!(gated.triple_count().unwrap(), 5);
 }

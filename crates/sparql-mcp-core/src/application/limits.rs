@@ -151,6 +151,15 @@ thread_local! {
     static CAPTURED: RefCell<Option<ToolError>> = const { RefCell::new(None) };
 }
 
+/// Refuse from inside a tool: records `error` for the dispatcher (which turns
+/// it into an `isError` result with the JSON payload) and returns the
+/// `McpError` to propagate with `?`.
+pub fn refuse(error: ToolError) -> rmcp::ErrorData {
+    let message = error.to_string();
+    drop(error.into_anyhow());
+    rmcp::ErrorData::invalid_params(message, None)
+}
+
 /// Forget any refusal recorded on this thread. Call before running a tool.
 pub fn clear_captured() {
     CAPTURED.with(|slot| *slot.borrow_mut() = None);

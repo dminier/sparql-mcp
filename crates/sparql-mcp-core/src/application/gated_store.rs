@@ -110,6 +110,16 @@ macro_rules! gated_impl {
             }
 
             // ── pass-through reads ───────────────────────────────────────
+            fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64> {
+                self.gate
+                    .run_blocking("write_quads", || self.inner.write_quads(quads))
+            }
+
+            // Pure CPU work: no store access, so no gate.
+            fn parse_rdf(&self, content: &[u8], opts: &LoadOpts) -> Result<Vec<StoredQuad>> {
+                self.inner.parse_rdf(content, opts)
+            }
+
             fn query(&self, sparql: &str) -> Result<QueryResult> {
                 self.inner.query(sparql)
             }

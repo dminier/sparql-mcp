@@ -209,37 +209,6 @@ fn render_term(term: RdfTerm) -> Value {
     }
 }
 
-/// Wrap a store mutation in before/after triple counts and return JSON.
-pub fn with_delta<F>(
-    store: &Arc<dyn SparqlStore>,
-    extra: Value,
-    f: F,
-) -> Result<CallToolResult, McpError>
-where
-    F: FnOnce(&Value) -> Result<(), McpError>,
-{
-    let before = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
-    f(&extra)?;
-    let after = store
-        .triple_count()
-        .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
-
-    let mut payload = json!({
-        "status": "ok",
-        "triples_before": before,
-        "triples_after": after,
-        "delta": after as i64 - before as i64,
-    });
-    if let (Value::Object(p), Value::Object(e)) = (&mut payload, extra) {
-        p.extend(e);
-    }
-    Ok(CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(&payload).unwrap(),
-    )]))
-}
-
 // ── Shared small helpers ──────────────────────────────────────────────────────
 
 pub fn require_str<'a>(args: &'a JsonObject, key: &str) -> Result<&'a str, McpError> {

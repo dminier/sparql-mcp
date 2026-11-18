@@ -163,6 +163,15 @@ impl SparqlStore for OxigraphAdapter {
         self.load_rdf_impl(content, opts, &[])
     }
 
+    fn parse_rdf(&self, content: &[u8], opts: &LoadOpts) -> Result<Vec<StoredQuad>> {
+        Ok(parse_quads(content, opts)?.iter().map(to_stored).collect())
+    }
+
+    fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64> {
+        let quads: Vec<Quad> = quads.iter().map(from_stored).collect::<Result<_>>()?;
+        self.write_quad_batch(&quads, &[])
+    }
+
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult> {
         let path_str = path.to_string_lossy().to_string();
         let _format = InputFormat::guess_from_path(&path_str);
@@ -302,23 +311,18 @@ impl OxigraphAdapter {
         opts: LoadOpts,
         extra: &[Quad],
     ) -> Result<(u64, Vec<StoredQuad>)> {
-        let format = to_oxigraph_format(opts.format);
-        let mut parser = RdfParser::from_format(format).rename_blank_nodes();
-        if let Some(base) = &opts.base_iri {
-            parser = parser.with_base_iri(base)?;
-        }
-        if let Some(iri) = &opts.graph_iri {
-            let node = NamedNode::new(iri)?;
-            parser = parser.with_default_graph(GraphName::NamedNode(node));
-        }
+        let quads = parse_quads(content, &opts)?;
+        let inserted_new = self.write_quad_batch(&quads, extra)?;
+        Ok((inserted_new, quads.iter().map(to_stored).collect()))
+    }
 
-        let quads: Vec<Quad> = parser
-            .for_reader(content)
-            .collect::<std::result::Result<_, _>>()?;
-
+    /// Write `quads` plus `extra` in one transaction; returns how many of
+    /// `quads` were new. `Transaction::contains` sees the transaction's own
+    /// writes, so a quad repeated in `quads` counts once.
+    fn write_quad_batch(&self, quads: &[Quad], extra: &[Quad]) -> Result<u64> {
         let mut tx = self.store.start_transaction()?;
         let mut inserted_new = 0u64;
-        for q in &quads {
+        for q in quads {
             if !tx.contains(q)? {
                 inserted_new += 1;
             }
@@ -328,8 +332,7 @@ impl OxigraphAdapter {
             tx.insert(q);
         }
         tx.commit()?;
-
-        Ok((inserted_new, quads.iter().map(to_stored).collect()))
+        Ok(inserted_new)
     }
 
     /// Whether `hash` was already loaded into `target` (`""` = default graph).
@@ -432,6 +435,37 @@ fn ground_quads(update: &spargebra::Update) -> Option<GroundQuads> {
         }
     }
     Some(GroundQuads { inserted, deleted })
+}
+
+/// Parse `content` completely into quads. Blank nodes are renamed per call.
+fn parse_quads(content: &[u8], opts: &LoadOpts) -> Result<Vec<Quad>> {
+    let mut parser = RdfParser::from_format(to_oxigraph_format(opts.format)).rename_blank_nodes();
+    if let Some(base) = &opts.base_iri {
+        parser = parser.with_base_iri(base)?;
+    }
+    if let Some(iri) = &opts.graph_iri {
+        parser = parser.with_default_graph(GraphName::NamedNode(NamedNode::new(iri)?));
+    }
+    Ok(parser
+        .for_reader(content)
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// The inverse of [`to_stored`]: terms are in their N-Triples encoding.
+fn from_stored(q: &StoredQuad) -> Result<Quad> {
+    use std::str::FromStr;
+    let subject = match Term::from_str(&q.s).with_context(|| format!("subject {}", q.s))? {
+        Term::NamedNode(n) => oxigraph::model::NamedOrBlankNode::NamedNode(n),
+        Term::BlankNode(b) => oxigraph::model::NamedOrBlankNode::BlankNode(b),
+        other => anyhow::bail!("subject {other} is not an IRI or blank node"),
+    };
+    let predicate = NamedNode::from_str(&q.p).with_context(|| format!("predicate {}", q.p))?;
+    let object = Term::from_str(&q.o).with_context(|| format!("object {}", q.o))?;
+    let graph = match &q.g {
+        Some(g) => GraphName::NamedNode(NamedNode::new(g)?),
+        None => GraphName::DefaultGraph,
+    };
+    Ok(Quad::new(subject, predicate, object, graph))
 }
 
 /// A quad with each term in its N-Triples encoding (`Display` on Oxigraph's

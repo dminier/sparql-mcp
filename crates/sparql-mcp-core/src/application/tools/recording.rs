@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::domain::{LoadOpts, QueryResult, RdfTerm, SparqlStore};
 use crate::mcp::recording;
 
-use super::sparql::{make_tool, require_str, with_delta};
+use super::sparql::{make_tool, require_str};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -208,22 +208,35 @@ fn import_kind(
         "items": kg.count,
     });
 
-    // Load session metadata (default graph).
-    let session_bytes = session_ttl.as_bytes().to_vec();
-    with_delta(store, extra, |_| {
-        store
-            .load_rdf(&session_bytes, LoadOpts::default())
-            .map(|_| ())
-            .map_err(|e| McpError::invalid_params(format!("session load: {e}"), None))?;
-        store
-            .load_rdf(
-                kg.turtle.as_bytes(),
-                LoadOpts {
-                    graph_iri: Some(kg.graph_iri.clone()),
-                    ..Default::default()
-                },
-            )
-            .map(|_| ())
-            .map_err(|e| McpError::invalid_params(format!("{kind} load: {e}"), None))
-    })
+    // Load session metadata (default graph), then the stream's own graph.
+    // Each load is one transaction and reports how many quads were new, so
+    // no whole-store count is needed.
+    let session_new = store
+        .load_rdf(session_ttl.as_bytes(), LoadOpts::default())
+        .map_err(|e| McpError::invalid_params(format!("session load: {e}"), None))?;
+    let kind_new = store
+        .load_rdf(
+            kg.turtle.as_bytes(),
+            LoadOpts {
+                graph_iri: Some(kg.graph_iri.clone()),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| McpError::invalid_params(format!("{kind} load: {e}"), None))?;
+
+    let inserted_new = session_new + kind_new;
+    let mut payload = json!({
+        "status": "ok",
+        // Deprecated: whole-store sizes cost a full scan.
+        "triples_before": null,
+        "triples_after": null,
+        "delta": inserted_new,
+        "inserted_new": inserted_new,
+    });
+    if let (serde_json::Value::Object(p), serde_json::Value::Object(e)) = (&mut payload, extra) {
+        p.extend(e);
+    }
+    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )]))
 }
