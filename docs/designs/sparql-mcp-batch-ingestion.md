@@ -450,9 +450,9 @@ agent sizes its batches from data rather than guesses.
 | Key | Default | Rationale |
 |---|---|---|
 | `max_job_batches` | 10,000 | Bounds the ledger |
-| `max_job_triples_staged` | 500,000 (provisional) | A commit is one in-memory transaction; confirmed or lowered by the Phase 1 bench |
+| `max_job_triples_staged` | 100,000 | A commit is one in-memory transaction that holds the write gate: 100,000 triples take 6.6 s and 323 MiB, 500,000 take 48 s and 1.6 GiB (`docs/benchmarks/ingest.md`) |
 | `max_job_triples_direct` | 10,000,000 | Per-batch transactions, so the bound is disk, not memory |
-| `max_replace_triples` | 1,000,000 (provisional) | Bounds the replace transaction |
+| `max_replace_triples` | 200,000 | Bounds the replace transaction: 100,000 + 100,000 take 9.4 s; a 250,000-triple target takes 12.8 s (`docs/benchmarks/ingest.md`) |
 | `max_open_jobs` | 4 | Bounds the number of staging graphs |
 | `job_idle_ttl_secs` | 3,600 | Cleans up abandoned staging data |
 | `job_retention_secs` | 604,800 | Keeps finished-job ledgers for 7 days |
@@ -717,6 +717,14 @@ Tests: 45 end-to-end, five on a RocksDB store with concurrent callers (five
 simultaneous commits close the job once; eight batches racing a commit are each in
 the commit or refused). With the open-state check or the empty-replace check
 disabled, three tests fail.
+
+**The bench (2026-11-18)** confirmed `ingest_batch` and the hardening promise, and
+**lowered the provisional ceilings**: `max_job_triples_staged` 500,000 → **100,000**
+and `max_replace_triples` 1,000,000 → **200,000**. A 500,000-triple commit held the
+write gate for 48 s (longer than `write_wait_timeout_secs`, 30) and took 1.6 GiB. See
+[`docs/benchmarks/ingest.md`](../benchmarks/ingest.md). A faster commit (moving the quads
+directly instead of `ADD` + `DROP`) is a possible optimisation, after which the ceiling
+would be raised only after rerunning the bench.
 
 **Not yet done:** the expiry sweeper and heartbeat; chunked staging drops for large
 graphs (a staged job above `max_job_triples_staged` is refused earlier, so abort and

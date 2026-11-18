@@ -61,6 +61,10 @@ Named graphs: `<urn:project:<slug>>` per project, `<urn:meta>` for project metad
 - **Paths embedded in Turtle must be escaped** (`\` is a Turtle escape char —
   this broke every Windows path once). Prefer building RDF terms directly, as
   the loaded-file ledger does, over formatting Turtle text.
+- **Performance claims need the bench.** Limits that depend on memory or on how long
+  the write gate is held (`max_job_triples_staged`, `max_replace_triples`) come from
+  `examples/ingest_bench.rs`, run in release; see `docs/benchmarks/ingest.md`. Rerun it
+  after a change to the write path or to the store port, and record the new results.
 - The `recording` feature gates three tools; CI builds with `--all-features`,
   so feature-gated code must compile and pass clippy.
 

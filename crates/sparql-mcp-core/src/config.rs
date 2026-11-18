@@ -97,13 +97,15 @@ pub struct IngestConfig {
     pub max_batch_triples: usize,
     /// Most batches in one ingestion job.
     pub max_job_batches: u32,
-    /// Most triples in one staged job (its commit is one in-memory
-    /// transaction). Provisional: confirmed by the bench.
+    /// Most triples in one staged job. Its commit is one in-memory transaction
+    /// that holds the write gate: 100,000 triples take about 7 s and 320 MiB
+    /// (`docs/benchmarks/ingest.md`).
     pub max_job_triples_staged: u64,
     /// Most triples in one direct or file job.
     pub max_job_triples_direct: u64,
     /// Most triples a staged `replace` commit may rewrite (target size plus
-    /// staging size). Provisional.
+    /// staging size): 100,000 + 100,000 triples take about 9 s
+    /// (`docs/benchmarks/ingest.md`).
     pub max_replace_triples: u64,
     /// Most jobs that are open, running or interrupted at once.
     pub max_open_jobs: usize,
@@ -137,9 +139,9 @@ impl Default for IngestConfig {
             file_roots: None,
             max_batch_triples: 10_000,
             max_job_batches: 10_000,
-            max_job_triples_staged: 500_000,
+            max_job_triples_staged: 100_000,
             max_job_triples_direct: 10_000_000,
-            max_replace_triples: 1_000_000,
+            max_replace_triples: 200_000,
             max_open_jobs: 4,
             job_idle_ttl_secs: 3_600,
             job_retention_secs: 604_800,

@@ -124,7 +124,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all --all-features
 ```
 
-Architecture and conventions: [AGENTS.md](AGENTS.md).
+Architecture and conventions: [AGENTS.md](AGENTS.md). The write path and ingestion
+jobs have a benchmark that sets their limits: [docs/benchmarks/ingest.md](docs/benchmarks/ingest.md).
 
 ## License
 

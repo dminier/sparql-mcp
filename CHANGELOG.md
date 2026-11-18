@@ -51,6 +51,9 @@ of domain-specific content.
   `max_job_triples_direct`, `max_replace_triples`, `max_batch_triples`,
   `max_iri_bytes`, `max_literal_bytes`, `event_max_triples`,
   `event_changed_threshold`, and others (see `sparql-mcp.toml`).
+  The ceilings come from a benchmark (`docs/benchmarks/ingest.md`): a staged job holds
+  at most 100,000 triples (its commit is one in-memory transaction that holds the write
+  gate), a replace 200,000; larger loads use several jobs or `mode: "direct"`.
   Not yet available: `ingest_validate`, `ingest_file`, and the expiry of idle jobs.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.

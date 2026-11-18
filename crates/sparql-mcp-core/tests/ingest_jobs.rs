@@ -394,7 +394,7 @@ async fn a_staged_batch_lands_in_the_staging_graph_and_is_recorded() {
     assert_eq!(r["duplicate"], false);
     assert_eq!(r["job"]["batches"], 1);
     assert_eq!(r["job"]["triples"], 5);
-    assert_eq!(r["job"]["remaining_triples"], 500_000 - 5);
+    assert_eq!(r["job"]["remaining_triples"], 100_000 - 5);
 
     // In the staging graph, not in the target, and the target is untouched.
     assert!(graph_has(&raw, &staging, "<urn:s:1:0>"));

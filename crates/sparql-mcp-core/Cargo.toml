@@ -33,6 +33,7 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
 [dev-dependencies]
 tempfile = "3"
+memory-stats = "1"
 # `examples/viewer_load.rs`: Ctrl-C to stop, batch pacing.
 tokio = { version = "1", features = ["signal", "time"] }
 
