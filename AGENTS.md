@@ -18,6 +18,40 @@ an optional live 3D viewer. Rust workspace, edition 2021, MSRV 1.78.
 | `ontology/1-smc.ttl` | Core `smc:` vocabulary (`https://sparql-mcp.dev/ns#`) |
 | `docs/designs/` | Design docs and their reviews — read the relevant one before changing the viewer |
 
+## Code discovery: graph first
+
+This repo is indexed by **codebase-memory-mcp**, and the index follows the
+working tree. Use it before `grep`, `find`, `cat` or reading whole files: a
+graph query returns the few symbols you need with their callers, where a
+grep returns every line that contains a word, and a whole-file read of
+`mcp/server.rs` or the viewer's `interact.rs` costs hundreds of lines for one function.
+
+**First action of every conversation, before any other tool call:**
+`index_repository(repo_path=<repo root>)`. Several agents work on this repo
+in parallel and the code moves under you; a stale graph gives confident
+wrong answers. On a large change, `async=true` then `index_repository(status=true)`
+until it succeeds.
+
+Project name: the repo path with `-` as separator (here
+`C-Users-…-sparql-mcp`); `list_projects` gives it.
+
+| Question | Tool call |
+|---|---|
+| Where is X defined? | `search_graph(name_pattern="^X$")`, or `query="…"` for fuzzy search |
+| Read one function or type | `get_code_snippet(qualified_name=<qn from search_graph>)` |
+| What's in a file, without reading it | `get_file_outline` |
+| Who calls X / what does X call | `trace_path(function_name="X", direction="inbound"\|"outbound")` |
+| All MCP tools | `search_graph(name_pattern="^tool_.*_def$")` |
+| Who emits viewer events | `query_graph("MATCH (f)-[:CALLS]->(g {name:'emit'}) RETURN f.name, f.file_path")` |
+| Impact of my diff | `detect_changes(scope="impact")` — run before a commit |
+| Layout of an unfamiliar area | `get_architecture(path="crates/…")` |
+| A string literal, error message, config key | `search_code(pattern="…")` |
+
+Use `grep`/`Read` directly for what the graph does not model: Markdown, TOML,
+Turtle (`.ttl`), YAML, JSON, and lines you have already located. When a
+conclusion depends on a file, `check_index_coverage(paths=[…])` tells you
+whether the index is complete for it; if not, read the flagged lines.
+
 ## Core architecture (`crates/sparql-mcp-core/src/`)
 
 Layered, dependencies point inward:

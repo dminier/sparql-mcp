@@ -20,10 +20,19 @@ short — remove a stale line rather than explaining it.
 | AGENTS.md layout, architecture, commands, invariants | the tree, `lib.rs` modules, `Makefile`, `.github/workflows/ci.yml` |
 | Versions | `[workspace.package] version` in `Cargo.toml`, crate `Cargo.toml`s, `server.json`, plugin manifests in `plugins/`, latest `CHANGELOG.md` heading |
 
-Get the current lists mechanically instead of from memory, e.g.:
+Get the current lists mechanically instead of from memory. For code, use
+codebase-memory-mcp (see "Code discovery" in AGENTS.md):
+
+- tools: `search_graph(name_pattern="^tool_.*_def$")`, then check each one
+  is listed in `core_tool_defs()` with `get_code_snippet`;
+- CLI: `search_graph(name_pattern="^Cmd$")`, then `get_code_snippet` on the
+  `…main.Cmd` result;
+- config keys: `get_file_outline` on `crates/sparql-mcp-core/src/config.rs`
+  (structs and their fields, without reading the file).
+
+For non-code files (versions in TOML/JSON, Markdown), grep is the right tool:
 
 ```bash
-grep -n "tool_.*_def()" crates/sparql-mcp-core/src/mcp/server.rs
 grep -rn '"version"\|^version' Cargo.toml crates/*/Cargo.toml server.json plugins/**/*.json
 ```
 
