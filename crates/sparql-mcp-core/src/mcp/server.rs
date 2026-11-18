@@ -221,6 +221,7 @@ impl SparqlMcpServer {
             "ingest_commit" => ingest::ingest_commit(&self.ingest, args),
             "ingest_status" => ingest::ingest_status(&self.ingest, args),
             "ingest_abort" => ingest::ingest_abort(&self.ingest, args),
+            "ingest_validate" => ingest::ingest_validate(&self.ingest, args),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),
@@ -473,6 +474,7 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::ingest::tool_ingest_commit_def(),
         crate::application::tools::ingest::tool_ingest_status_def(),
         crate::application::tools::ingest::tool_ingest_abort_def(),
+        crate::application::tools::ingest::tool_ingest_validate_def(),
     ];
     #[cfg(feature = "recording")]
     {

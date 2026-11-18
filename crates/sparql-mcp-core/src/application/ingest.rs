@@ -17,7 +17,9 @@
 //! [`string_literal`] and [`iri`].
 
 mod maintenance;
+mod validate;
 pub use maintenance::{Maintenance, Recovery, SweepReport};
+pub use validate::{Check, ValidateRequest};
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1184,8 +1186,7 @@ impl IngestService {
             )),
             _ => Err(coded(
                 "validation_required",
-                "no passing validation is recorded for this job (ingest_validate is not \
-                 available in this build)",
+                "no passing validation is recorded for this job; run ingest_validate",
                 Some(id),
             )),
         }

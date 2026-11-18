@@ -102,6 +102,21 @@ pub struct SolutionSet {
     pub rows: Vec<HashMap<String, RdfTerm>>,
 }
 
+/// The outcome of [`SparqlStore::query_bounded`].
+#[derive(Debug)]
+pub enum BoundedOutcome {
+    /// An `ASK` answer.
+    Answer(bool),
+    /// The first rows of a `SELECT`; `truncated` when there were more.
+    Rows {
+        variables: Vec<String>,
+        rows: Vec<HashMap<String, RdfTerm>>,
+        truncated: bool,
+    },
+    /// The deadline passed and the evaluation was cancelled.
+    TimedOut,
+}
+
 #[derive(Debug)]
 pub enum QueryResult {
     Boolean(bool),
@@ -319,6 +334,18 @@ pub enum BatchRefusal {
 pub trait SparqlStore: Send + Sync {
     /// Run a SPARQL 1.1 SELECT / ASK / CONSTRUCT / DESCRIBE query.
     fn query(&self, sparql: &str) -> Result<QueryResult>;
+
+    /// Run a `SELECT` or `ASK` that is cancelled after `timeout`, reading at
+    /// most `max_rows` rows (the evaluation stops there, it does not compute
+    /// the rest). Any other query form is an error.
+    fn query_bounded(
+        &self,
+        _sparql: &str,
+        _max_rows: usize,
+        _timeout: std::time::Duration,
+    ) -> Result<BoundedOutcome> {
+        anyhow::bail!("this store does not support bounded queries")
+    }
 
     /// Run a SPARQL 1.1 Update (INSERT DATA, DELETE, CLEAR, …).
     fn update(&self, sparql: &str) -> Result<()>;

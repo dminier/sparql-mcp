@@ -10,7 +10,9 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::ingest::{BatchRequest, BeginRequest, CommitRequest, IngestService, Mode};
+use crate::application::ingest::{
+    BatchRequest, BeginRequest, Check, CommitRequest, IngestService, Mode, ValidateRequest,
+};
 use crate::application::limits::ToolError;
 
 use super::sparql::{make_tool, require_str};
@@ -119,6 +121,43 @@ pub fn tool_ingest_abort_def() -> Tool {
     )
 }
 
+pub fn tool_ingest_validate_def() -> Tool {
+    make_tool(
+        "ingest_validate",
+        "Check a staged job's data before committing it. Each check is a named read-only SELECT \
+         or ASK in which {{staging}} and {{target}} stand for the job's two graphs (angle \
+         brackets included), e.g. SELECT ?s WHERE { GRAPH {{staging}} { ?s a ?c } FILTER NOT \
+         EXISTS { GRAPH {{target}} { ?c a ?k } } } LIMIT 20. `expect` is empty (default for a \
+         SELECT: it looks for violations) or non_empty; true (default) or false for an ASK. \
+         Up to 16 checks of 16 KiB; SERVICE and other query forms are refused (not_a_query). \
+         Each check is cancelled after validate_timeout_secs (validate_timeout). Returns \
+         {passed, results:[{name, passed, expect, rows (at most 20) or answer}], recorded}. \
+         The outcome is recorded for ingest_commit with require_validation, unless a batch \
+         arrived while the checks ran (recorded: false). A direct job has nothing to validate \
+         (wrong_mode).",
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "checks": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "query": { "type": "string" },
+                            "expect": { "type": "string", "enum": ["empty", "non_empty", "true", "false"] }
+                        },
+                        "required": ["name", "query"]
+                    }
+                }
+            },
+            "required": ["job_id", "checks"]
+        }),
+    )
+}
+
 // ── Implementations ───────────────────────────────────────────────────────────
 
 /// An optional string argument: absent is `None`, a non-string is an error.
@@ -218,4 +257,29 @@ pub fn ingest_status(svc: &IngestService, args: &JsonObject) -> Result<CallToolR
 
 pub fn ingest_abort(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {
     reply(svc.abort(require_str(args, "job_id")?))
+}
+
+pub fn ingest_validate(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {
+    let checks = args
+        .get("checks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::invalid_params("'checks' must be an array", None))?
+        .iter()
+        .map(|c| {
+            let field = |k: &str| c.get(k).and_then(Value::as_str).map(str::to_string);
+            Ok(Check {
+                name: field("name").ok_or_else(|| {
+                    McpError::invalid_params("each check needs a string 'name'", None)
+                })?,
+                query: field("query").ok_or_else(|| {
+                    McpError::invalid_params("each check needs a string 'query'", None)
+                })?,
+                expect: field("expect"),
+            })
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
+    reply(svc.validate(&ValidateRequest {
+        job_id: require_str(args, "job_id")?.to_string(),
+        checks,
+    }))
 }

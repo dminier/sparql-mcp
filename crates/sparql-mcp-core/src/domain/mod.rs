@@ -8,7 +8,7 @@ pub mod sparql_store;
 
 pub use doc_store::DocStore;
 pub use sparql_store::{
-    BatchApplied, BatchRefusal, BatchWrite, Counter, FileLoadResult, Idempotency, InputFormat,
-    LoadOpts, QueryResult, RdfTerm, RecordCounts, Replace, SolutionSet, SparqlStore, StoredQuad,
-    UpdateOutcome,
+    BatchApplied, BatchRefusal, BatchWrite, BoundedOutcome, Counter, FileLoadResult, Idempotency,
+    InputFormat, LoadOpts, QueryResult, RdfTerm, RecordCounts, Replace, SolutionSet, SparqlStore,
+    StoredQuad, UpdateOutcome,
 };

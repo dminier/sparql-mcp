@@ -38,7 +38,7 @@ needed — there is no daemon. See [getting started](docs/getting-started.md).
 | `export_graph`, `list_graphs`, `stats` | Export to Turtle, introspection |
 | `project_create`, `project_list`, `project_switch` | One named graph per project: `<urn:project:<slug>>` |
 | `cbm_load_graph` | Import a codebase-memory-mcp code graph |
-| `ingest_begin`, `ingest_batch`, `ingest_commit`, `ingest_abort`, `ingest_status` | Batch ingestion jobs: numbered, retry-safe batches, staged and committed in one step (see below) |
+| `ingest_begin`, `ingest_batch`, `ingest_validate`, `ingest_commit`, `ingest_abort`, `ingest_status` | Batch ingestion jobs: numbered, retry-safe batches, staged and committed in one step (see below) |
 | `write_doc` | Write markdown under the configured docs root |
 | `get_gdrive_config` | Expose the `[gdrive]` sync settings to the agent |
 
@@ -78,7 +78,11 @@ ingestion job instead of looping over `load_ontology`:
    a batch that already landed returns `duplicate: true` with its original
    counts, and is stored once. A batch with a syntax error is refused whole;
    fix it and re-send it under the same `seq`.
-3. `ingest_commit`: the staged triples move into the target in one transaction.
+3. Optionally `ingest_validate`: named read-only `SELECT`/`ASK` checks over the staged data,
+   with `{{staging}}` and `{{target}}` standing for the two graphs (each cancelled after
+   `validate_timeout_secs`). `ingest_commit` with `require_validation: true` then refuses
+   unless the last validation passed and no batch arrived since.
+4. `ingest_commit`: the staged triples move into the target in one transaction.
    The reply lists `new_subjects`, which can be passed to `viewer_show`.
    `ingest_abort` discards the job instead.
 

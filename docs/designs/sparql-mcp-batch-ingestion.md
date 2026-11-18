@@ -710,9 +710,17 @@ of them fail.
     move and named after the **target** graph; a large one, and every replace, is one
     `Changed` with the target's real before/after sizes; a large direct job gets a
     final `Changed`;
-*   `require_validation` is accepted and checked against the ledger
-    (`validation_required` / `validation_stale`), but with no `ingest_validate` yet
-    it can never be satisfied.
+*   `ingest_validate` (`ingest/validate.rs`) and `SparqlStore::query_bounded` (a timer thread
+    sets an Oxigraph `CancellationToken`; reading stops after 20 rows). Placeholders are
+    substituted **before** parsing (`{{staging}}` is not valid SPARQL), the query is then
+    parsed with spargebra: only `SELECT`/`ASK`, and any `SERVICE` (also inside `FILTER
+    EXISTS`) is refused, as is a string literal containing the word (the safe side). The
+    job state is checked before the syntax. `expect` defaults to `empty` for a `SELECT`
+    and `true` for an `ASK`; a mismatch is `not_a_query`. The outcome
+    (`validationPassed`, `validatedAtBatches`) is written under the write gate only if the
+    job is still open and no batch arrived meanwhile (`recorded: false` otherwise); a
+    timeout records nothing. The race between a batch and the recording is covered by this
+    guard but not by a test (it would need a check of controlled duration).
 
 Tests: 45 end-to-end, five on a RocksDB store with concurrent callers (five
 simultaneous commits close the job once; eight batches racing a commit are each in
@@ -740,7 +748,7 @@ All of it takes the time as a parameter, so tests move the clock instead of slee
 
 **Not yet done:** chunked staging drops for large graphs (a staged job above
 `max_job_triples_staged` is refused earlier, so abort and commit drop a bounded graph in
-one request); `ingest_validate`; `ingest_file`.
+one request); `ingest_file`.
 
 ### Target Files to Create/Modify
 

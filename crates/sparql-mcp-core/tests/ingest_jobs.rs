@@ -1246,10 +1246,10 @@ async fn an_incomplete_job_cannot_be_committed() {
 }
 
 #[tokio::test]
-async fn an_empty_job_can_be_committed_and_validation_cannot_be_required_yet() {
+async fn an_empty_job_can_be_committed_and_a_required_validation_must_be_on_record() {
     let (server, _raw) = server();
     let (id, _) = begin(&server, json!({})).await;
-    // ingest_validate does not exist yet, so a validation can never be on record.
+    // Nothing has been validated, so a required validation is missing.
     let e = refused(
         &server,
         "ingest_commit",
@@ -1949,4 +1949,339 @@ async fn a_sweep_racing_batches_never_leaves_data_in_an_expired_jobs_staging_gra
         0,
         "data survived in an expired job's staging graph"
     );
+}
+
+// ── ingest_validate ──────────────────────────────────────────────────────────
+
+fn chk(name: &str, query: &str, expect: Option<&str>) -> Value {
+    match expect {
+        Some(e) => json!({ "name": name, "query": query, "expect": e }),
+        None => json!({ "name": name, "query": query }),
+    }
+}
+
+async fn validate(server: &SparqlMcpServer, id: &str, checks: Vec<Value>) -> Value {
+    ok(
+        server,
+        "ingest_validate",
+        json!({ "job_id": id, "checks": checks }),
+    )
+    .await
+}
+
+async fn validate_refused(server: &SparqlMcpServer, id: &str, checks: Vec<Value>) -> Value {
+    refused(
+        server,
+        "ingest_validate",
+        json!({ "job_id": id, "checks": checks }),
+    )
+    .await
+}
+
+async fn status_of(server: &SparqlMcpServer, id: &str) -> Value {
+    ok(server, "ingest_status", json!({ "job_id": id })).await
+}
+
+const ANY_STAGED: &str = "SELECT ?s WHERE { GRAPH {{staging}} { ?s ?p ?o } }";
+
+#[tokio::test]
+async fn each_expectation_passes_and_fails_as_documented() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 3)).await;
+
+    let present = "ASK { GRAPH {{staging}} { <urn:s:1:0> ?p ?o } }";
+    let absent = "ASK { GRAPH {{staging}} { <urn:absent> ?p ?o } }";
+    let none = "SELECT ?s WHERE { GRAPH {{staging}} { ?s <urn:nope> ?o } }";
+    let r = validate(
+        &server,
+        &id,
+        vec![
+            chk("empty-fails", ANY_STAGED, Some("empty")),
+            chk("non_empty-passes", ANY_STAGED, Some("non_empty")),
+            chk("default-select-is-empty", ANY_STAGED, None),
+            chk("none-pass", none, Some("empty")),
+            chk("ask-true", present, Some("true")),
+            chk("ask-default-true", present, None),
+            chk("ask-false-fails", present, Some("false")),
+            chk("ask-false-passes", absent, Some("false")),
+        ],
+    )
+    .await;
+    let verdicts: Vec<(&str, bool)> = r["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["name"].as_str().unwrap(), c["passed"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec![
+            ("empty-fails", false),
+            ("non_empty-passes", true),
+            ("default-select-is-empty", false),
+            ("none-pass", true),
+            ("ask-true", true),
+            ("ask-default-true", true),
+            ("ask-false-fails", false),
+            ("ask-false-passes", true),
+        ]
+    );
+    assert_eq!(r["passed"], false, "one failing check fails the validation");
+    // A SELECT shows its rows, an ASK its answer.
+    assert_eq!(r["results"][0]["rows"].as_array().unwrap().len(), 3);
+    assert!(r["results"][0]["rows"][0]["s"]
+        .as_str()
+        .unwrap()
+        .starts_with("<urn:s:1:"));
+    assert_eq!(r["results"][4]["answer"], true);
+}
+
+#[tokio::test]
+async fn placeholders_name_the_staging_and_the_target_graph() {
+    let (server, raw) = server();
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:known:class> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+    let (id, _) = begin(&server, json!({})).await;
+    send(
+        &server,
+        &id,
+        1,
+        "<urn:s:1> <urn:type> <urn:known:class> .\n<urn:s:2> <urn:type> <urn:unknown:class> .\n"
+            .into(),
+    )
+    .await;
+    // Staged subjects whose class is defined neither in staging nor in the target.
+    let q = "SELECT ?s WHERE { GRAPH {{staging}} { ?s <urn:type> ?c } \
+             FILTER NOT EXISTS { GRAPH {{staging}} { ?c ?p ?o } } \
+             FILTER NOT EXISTS { GRAPH {{target}} { ?c ?p ?o } } }";
+    let r = validate(&server, &id, vec![chk("dangling", q, Some("empty"))]).await;
+    assert_eq!(r["passed"], false);
+    let rows = r["results"][0]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{r}");
+    assert_eq!(rows[0]["s"], "<urn:s:2>");
+}
+
+#[tokio::test]
+async fn at_most_twenty_rows_are_returned_and_the_rest_is_reported_as_truncated() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 50)).await;
+    let r = validate(
+        &server,
+        &id,
+        vec![chk("all", ANY_STAGED, Some("non_empty"))],
+    )
+    .await;
+    assert_eq!(r["results"][0]["rows"].as_array().unwrap().len(), 20);
+    assert_eq!(r["results"][0]["truncated"], true);
+    let three = format!("{ANY_STAGED} LIMIT 3");
+    let r = validate(&server, &id, vec![chk("few", &three, Some("non_empty"))]).await;
+    assert_eq!(r["results"][0]["truncated"], false);
+}
+
+#[tokio::test]
+async fn only_read_only_select_and_ask_are_accepted() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 2)).await;
+    for (what, q) in [
+        ("update", "INSERT DATA { <urn:a> <urn:b> <urn:c> }"),
+        ("update with a placeholder", "DROP GRAPH {{staging}}"),
+        (
+            "construct",
+            "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH {{staging}} { ?s ?p ?o } }",
+        ),
+        ("describe", "DESCRIBE <urn:s:1:0>"),
+        (
+            "service",
+            "ASK { SERVICE <http://example.org/sparql> { ?s ?p ?o } }",
+        ),
+        (
+            "service in a filter",
+            "ASK { FILTER EXISTS { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?o } } }",
+        ),
+        ("syntax error", "SELECT WHERE {"),
+        ("nothing", ""),
+    ] {
+        let e = validate_refused(&server, &id, vec![chk("c", q, None)]).await;
+        assert_eq!(e["code"], "not_a_query", "{what}: {e}");
+    }
+    // None of it ran: the target is empty and the staged data is intact.
+    assert_eq!(count_in(&raw, ACTIVE), 0);
+    assert_eq!(status_of(&server, &id).await["triples"], 2);
+    // An expectation that does not fit the query form, or is unknown.
+    for (q, expect) in [
+        (ANY_STAGED, "true"),
+        ("ASK { ?s ?p ?o }", "empty"),
+        (ANY_STAGED, "maybe"),
+    ] {
+        let e = validate_refused(&server, &id, vec![chk("c", q, Some(expect))]).await;
+        assert_eq!(e["code"], "not_a_query", "{q} / {expect}");
+    }
+}
+
+#[tokio::test]
+async fn the_number_and_size_of_checks_are_capped() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    let e = validate_refused(&server, &id, vec![]).await;
+    assert_eq!(e["code"], "limit_exceeded");
+    let many: Vec<Value> = (0..17)
+        .map(|i| chk(&format!("c{i}"), ANY_STAGED, None))
+        .collect();
+    assert_eq!(
+        validate_refused(&server, &id, many).await["code"],
+        "limit_exceeded"
+    );
+    let fat = format!("{ANY_STAGED} # {}", "x".repeat(16 * 1024));
+    assert_eq!(
+        validate_refused(&server, &id, vec![chk("fat", &fat, None)]).await["code"],
+        "limit_exceeded"
+    );
+    // Sixteen checks are fine.
+    let sixteen: Vec<Value> = (0..16)
+        .map(|i| chk(&format!("c{i}"), ANY_STAGED, None))
+        .collect();
+    let r = validate(&server, &id, sixteen).await;
+    assert_eq!(r["results"].as_array().unwrap().len(), 16);
+}
+
+#[tokio::test]
+async fn only_an_open_staged_job_can_be_validated() {
+    let (server, _raw) = server();
+    let (direct, _) = begin(&server, json!({ "mode": "direct" })).await;
+    let e = validate_refused(&server, &direct, vec![chk("c", "ASK { ?s ?p ?o }", None)]).await;
+    assert_eq!(e["code"], "wrong_mode");
+
+    let (done, _) = begin(&server, json!({})).await;
+    ok(&server, "ingest_commit", json!({ "job_id": done })).await;
+    let e = validate_refused(&server, &done, vec![chk("c", ANY_STAGED, None)]).await;
+    assert_eq!(e["code"], "job_not_open");
+
+    let unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let e = validate_refused(&server, unknown, vec![chk("c", ANY_STAGED, None)]).await;
+    assert_eq!(e["code"], "job_not_found");
+}
+
+#[tokio::test]
+async fn a_check_that_runs_too_long_is_cancelled_and_nothing_is_recorded() {
+    let cfg = IngestConfig {
+        validate_timeout_secs: 1,
+        ..IngestConfig::default()
+    };
+    let (server, _raw) = server_with(cfg);
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 3000)).await;
+    // 3000^3 combinations: far longer than a second.
+    let slow =
+        "SELECT (COUNT(*) AS ?n) WHERE { GRAPH {{staging}} { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i } }";
+    let started = std::time::Instant::now();
+    let e = validate_refused(&server, &id, vec![chk("slow", slow, Some("non_empty"))]).await;
+    assert_eq!(e["code"], "validate_timeout", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("slow"));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    // The timed-out call recorded nothing.
+    let need = json!({ "job_id": id, "require_validation": true });
+    assert_eq!(
+        refused(&server, "ingest_commit", need).await["code"],
+        "validation_required"
+    );
+    // The job is untouched and a fast check still works afterwards.
+    let r = validate(&server, &id, vec![chk("ok", ANY_STAGED, Some("non_empty"))]).await;
+    assert_eq!(r["passed"], true);
+}
+
+#[tokio::test]
+async fn require_validation_needs_a_passing_validation_that_covers_every_batch() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 2)).await;
+    let need = json!({ "job_id": id, "require_validation": true });
+    let code = |v: Value| v["code"].clone();
+
+    // Not validated yet.
+    assert_eq!(
+        code(refused(&server, "ingest_commit", need.clone()).await),
+        "validation_required"
+    );
+
+    // A failing validation does not satisfy it either, and is recorded as failed.
+    let r = validate(
+        &server,
+        &id,
+        vec![chk("must-be-empty", ANY_STAGED, Some("empty"))],
+    )
+    .await;
+    assert_eq!(
+        (&r["passed"], &r["recorded"]),
+        (&json!(false), &json!(true))
+    );
+    assert_eq!(
+        code(refused(&server, "ingest_commit", need.clone()).await),
+        "validation_required"
+    );
+
+    // A passing one does.
+    let r = validate(
+        &server,
+        &id,
+        vec![chk("has-data", ANY_STAGED, Some("non_empty"))],
+    )
+    .await;
+    assert_eq!(
+        (&r["passed"], &r["batches_validated"]),
+        (&json!(true), &json!(1))
+    );
+
+    // But a batch that arrives afterwards makes it stale.
+    send(&server, &id, 2, nt(2, 2)).await;
+    assert_eq!(
+        code(refused(&server, "ingest_commit", need.clone()).await),
+        "validation_stale"
+    );
+    assert_eq!(
+        count_in(&raw, ACTIVE),
+        0,
+        "a refused commit must not move anything"
+    );
+
+    // Validating again covers both batches, and the commit goes through.
+    validate(
+        &server,
+        &id,
+        vec![chk("has-data", ANY_STAGED, Some("non_empty"))],
+    )
+    .await;
+    let c = ok(&server, "ingest_commit", need).await;
+    assert_eq!(c["triples"], 4);
+    assert_eq!(count_in(&raw, ACTIVE), 4);
+}
+
+#[tokio::test]
+async fn validation_changes_neither_the_data_nor_the_job_and_cannot_be_forged_with_sparql() {
+    let (server, raw) = server();
+    let (id, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+    send(&server, &id, 1, nt(1, 5)).await;
+    let before = status_of(&server, &id).await;
+    validate(&server, &id, vec![chk("c", ANY_STAGED, Some("non_empty"))]).await;
+    let after = status_of(&server, &id).await;
+    for k in ["state", "batches", "triples", "received_seqs"] {
+        assert_eq!(before[k], after[k], "{k}");
+    }
+    assert_eq!(count_in(&raw, &staging), 5);
+    // An agent cannot write the validation record itself.
+    let forged = format!(
+        "INSERT DATA {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> \
+         <urn:sparql-mcp:jobs#validationPassed> true }} }}"
+    );
+    let e = refused(&server, "update_sparql", json!({ "update": forged })).await;
+    assert_eq!(e["code"], "graph_protected");
 }

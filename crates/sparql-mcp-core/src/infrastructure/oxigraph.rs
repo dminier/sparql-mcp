@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::domain::{
-    BatchApplied, BatchRefusal, BatchWrite, FileLoadResult, InputFormat, LoadOpts, QueryResult,
-    RdfTerm, SolutionSet, SparqlStore, StoredQuad, UpdateOutcome,
+    BatchApplied, BatchRefusal, BatchWrite, BoundedOutcome, FileLoadResult, InputFormat, LoadOpts,
+    QueryResult, RdfTerm, SolutionSet, SparqlStore, StoredQuad, UpdateOutcome,
 };
 
 // Named graph holding SHA-256 records for idempotent file loading.
@@ -86,6 +86,76 @@ impl SparqlStore for OxigraphAdapter {
             .on_store(&self.store)
             .execute()?;
         convert_query_results(results)
+    }
+
+    fn query_bounded(
+        &self,
+        sparql: &str,
+        max_rows: usize,
+        timeout: std::time::Duration,
+    ) -> Result<BoundedOutcome> {
+        use oxigraph::sparql::CancellationToken;
+        let token = CancellationToken::new();
+        // A timer cancels the evaluation. Dropping `done` (when this function
+        // returns) wakes the timer thread, which then exits without cancelling.
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let timer = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                if wait.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    token.cancel();
+                }
+            })
+        };
+        let outcome = (|| -> Result<BoundedOutcome> {
+            let results = SparqlEvaluator::new()
+                .with_cancellation_token(token.clone())
+                .parse_query(sparql)?
+                .on_store(&self.store)
+                .execute();
+            let results = match results {
+                Ok(r) => r,
+                Err(_) if token.is_cancelled() => return Ok(BoundedOutcome::TimedOut),
+                Err(e) => return Err(e.into()),
+            };
+            match results {
+                QueryResults::Boolean(b) => Ok(BoundedOutcome::Answer(b)),
+                QueryResults::Solutions(solutions) => {
+                    let variables = solutions
+                        .variables()
+                        .iter()
+                        .map(|v| v.as_str().to_string())
+                        .collect();
+                    let mut rows = Vec::new();
+                    let mut truncated = false;
+                    for sol in solutions {
+                        let sol = match sol {
+                            Ok(s) => s,
+                            Err(_) if token.is_cancelled() => return Ok(BoundedOutcome::TimedOut),
+                            Err(e) => return Err(e.into()),
+                        };
+                        if rows.len() == max_rows {
+                            truncated = true;
+                            break;
+                        }
+                        let mut row = HashMap::new();
+                        for (var, term) in sol.iter() {
+                            row.insert(var.as_str().to_string(), convert_term(term));
+                        }
+                        rows.push(row);
+                    }
+                    Ok(BoundedOutcome::Rows {
+                        variables,
+                        rows,
+                        truncated,
+                    })
+                }
+                QueryResults::Graph(_) => anyhow::bail!("only SELECT and ASK are supported here"),
+            }
+        })();
+        drop(done);
+        let _ = timer.join();
+        outcome
     }
 
     fn update(&self, sparql: &str) -> Result<()> {

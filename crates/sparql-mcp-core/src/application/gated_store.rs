@@ -355,6 +355,15 @@ macro_rules! gated_impl {
                 self.inner.query(sparql)
             }
 
+            fn query_bounded(
+                &self,
+                sparql: &str,
+                max_rows: usize,
+                timeout: std::time::Duration,
+            ) -> Result<crate::domain::BoundedOutcome> {
+                self.inner.query_bounded(sparql, max_rows, timeout)
+            }
+
             fn export_graph(&self, graph_iri: Option<&str>, dest: &Path) -> Result<usize> {
                 let dest = self.policy_write_path(dest)?;
                 self.inner.export_graph(graph_iri, &dest)

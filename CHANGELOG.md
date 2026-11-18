@@ -57,7 +57,10 @@ of domain-specific content.
   Idle jobs expire (`job_idle_ttl_secs`, staging graph dropped), finished ones are purged
   after `job_retention_secs`, and time with the core off does not count as idle
   (`[ingest] sweep_interval_secs`); `ingest_status` shows `idle_secs` and `expires_in_secs`.
-  Not yet available: `ingest_validate`, `ingest_file`.
+  `ingest_validate` runs named read-only `SELECT`/`ASK` checks (`{{staging}}`, `{{target}}`;
+  cancelled after `validate_timeout_secs`; at most 16 checks, 20 rows each) and records the
+  outcome for `ingest_commit` with `require_validation`.
+  Not yet available: `ingest_file`.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 
