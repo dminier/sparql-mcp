@@ -46,6 +46,11 @@ struct Args {
     /// Keep the server (and the viewer connection) up this long at the end.
     #[arg(long, default_value_t = 0)]
     hold_secs: u64,
+    /// After the scenario, show only this class (and its subclasses) in the
+    /// viewer, using what exists today: copy that sub-graph into its own
+    /// project and `project_switch` to it. Example: `--show-only Database`.
+    #[arg(long)]
+    show_only: Option<String>,
 }
 
 const GRAPH: &str = "urn:project:e2e";
@@ -380,12 +385,103 @@ async fn main() -> Result<()> {
         count("event", "changed")
     );
 
+    // ── 8. Show only one class in the viewer, driven entirely through MCP.
+    if let Some(class) = &args.show_only {
+        println!("\n[8] show only {class}");
+        let view = "urn:project:e2e-view";
+        let (err, body) = call(
+            &svc,
+            "project_create",
+            json!({ "id": "e2e-view", "label": format!("only {class}") }),
+        )
+        .await?;
+        checks.check("view project created", !err, || short(&body));
+
+        let sub = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+        let owl_class = "http://www.w3.org/2002/07/owl#Class";
+        let t = format!("<{NS}{class}>");
+        // The class, its subclasses, and their instances, with only the edges
+        // between them: an edge to anything else would draw a stray node.
+        let copy = format!(
+            "INSERT {{ GRAPH <{view}> {{ ?s ?p ?o }} }} WHERE {{ GRAPH <{GRAPH}> {{ ?s ?p ?o . \
+             FILTER( EXISTS {{ ?s <{sub}>* {t} }} || EXISTS {{ ?s a ?c . ?c <{sub}>* {t} }} ) \
+             FILTER( isLiteral(?o) || ?o = <{owl_class}> || EXISTS {{ ?o <{sub}>* {t} }} \
+                     || EXISTS {{ ?o a ?d . ?d <{sub}>* {t} }} ) }} }}"
+        );
+        let (err, body) = call(&svc, "update_sparql", json!({ "update": copy })).await?;
+        checks.check("sub-graph copied", !err, || short(&body));
+        let (err, body) = call(&svc, "project_switch", json!({ "id": "e2e-view" })).await?;
+        checks.check(
+            "switched to the view project",
+            !err && body.to_string().contains(view),
+            || short(&body),
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // What the viewer was just sent: the last snapshot.
+        let seen = events.lock().unwrap().clone();
+        let snap = seen.iter().rev().find_map(|e| e.get("snapshot")).cloned();
+        let snap = snap.unwrap_or(Value::Null);
+        let allowed: &[&str] = match class.as_str() {
+            "Database" => &["Database", "Cache"],
+            other => &[other],
+        };
+        let mut shown = 0;
+        let mut strays: Vec<String> = Vec::new();
+        let mut subjects = std::collections::BTreeSet::new();
+        for t in snap["triples"].as_array().into_iter().flatten() {
+            if let Some(s) = t[0].as_str() {
+                subjects.insert(s.to_string());
+            }
+        }
+        for s in &subjects {
+            if let Some(i) = s
+                .strip_prefix(&format!("<{NS}n"))
+                .and_then(|r| r.strip_suffix('>'))
+                .and_then(|r| r.parse::<usize>().ok())
+            {
+                if allowed.contains(&kinds[i % kinds.len()]) {
+                    shown += 1;
+                } else {
+                    strays.push(s.clone());
+                }
+            }
+        }
+        let expected = (0..args.instances)
+            .filter(|i| allowed.contains(&kinds[i % kinds.len()]))
+            .count();
+        checks.check(
+            "the viewer got a snapshot of the view graph",
+            snap["graph"] == view,
+            || format!("graph = {}", snap["graph"]),
+        );
+        checks.check(
+            &format!("it holds only {class} instances"),
+            strays.is_empty(),
+            || format!("strays: {strays:?}"),
+        );
+        checks.check(
+            &format!("and all {expected} of them"),
+            shown == expected,
+            || format!("shown {shown}, expected {expected}"),
+        );
+        println!(
+            "  the viewer now shows {shown} {class} instances (of {} in the whole graph)",
+            args.instances
+        );
+    }
+
     if args.hold_secs > 0 {
         println!(
             "\nholding the server for {} s (Ctrl-C to stop) …",
             args.hold_secs
         );
         tokio::time::sleep(Duration::from_secs(args.hold_secs)).await;
+        if args.show_only.is_some() {
+            let (err, _) = call(&svc, "project_switch", json!({ "id": "e2e" })).await?;
+            println!("switched back to the whole graph (error: {err})");
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        }
     }
     listener.abort();
     let _ = svc.cancel().await;
