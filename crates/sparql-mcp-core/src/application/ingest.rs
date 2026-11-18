@@ -1466,9 +1466,16 @@ fn seq_conflict(id: &str, seq: u32) -> anyhow::Error {
 }
 
 /// A blank node label the parser generated itself (a Turtle `[]` or
-/// collection): 32 hexadecimal digits. Anything else was written by the agent.
-fn is_generated_label(label: &str) -> bool {
-    label.len() == 32 && label.bytes().all(|b| b.is_ascii_hexdigit())
+/// collection). Oxigraph writes its random 128-bit id in lowercase hexadecimal
+/// **without leading zeros**, and only keeps ids that start with a letter, so
+/// the label has 32 digits about 94 times in 100, 31 about 6 times, and fewer
+/// than 28 less than once in a thousand. Anything else was written by the agent.
+pub(crate) fn is_generated_label(label: &str) -> bool {
+    (28..=32).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && matches!(label.as_bytes()[0], b'a'..=b'f')
 }
 
 /// Percent-encode a blank node label so it is a safe IRI path segment.
@@ -1661,14 +1668,14 @@ mod tests {
         // Two parses of the same Turtle give different random labels, but the
         // same shape; the skolem IRIs must not depend on the random label.
         let a = "e29eb7b417983b13f1fe41d6e2793a70";
-        let b = "0123456789abcdef0123456789abcdef";
+        let b = "a123456789abcdef0123456789abcdef";
         let first = prep(
             vec![quad(&format!("_:{a}"), "<urn:p>", &format!("_:{b}"))],
             3,
         )
         .unwrap();
         let again_a = "ffffffffffffffffffffffffffffffff";
-        let again_b = "00000000000000000000000000000001";
+        let again_b = "a0000000000000000000000000000001";
         let second = prep(
             vec![quad(
                 &format!("_:{again_a}"),
@@ -1741,9 +1748,27 @@ mod tests {
 
     #[test]
     fn generated_labels_are_told_from_written_ones() {
-        assert!(is_generated_label("e29eb7b417983b13f1fe41d6e2793a70"));
-        assert!(!is_generated_label("b0"));
-        assert!(!is_generated_label("e29eb7b417983b13f1fe41d6e2793a7")); // 31
-        assert!(!is_generated_label("g29eb7b417983b13f1fe41d6e2793a70")); // not hex
+        // 32, 31, 30 and 28 digits: the parser drops leading zeros.
+        for generated in [
+            "e29eb7b417983b13f1fe41d6e2793a70",
+            "e29eb7b417983b13f1fe41d6e2793a7",
+            "e29eb7b417983b13f1fe41d6e2793a",
+            "e29eb7b417983b13f1fe41d6e279",
+        ] {
+            assert!(is_generated_label(generated), "{generated}");
+        }
+        for written in [
+            "b0",
+            "add",
+            "deadbeef",
+            "e29eb7b417983b13f1fe41d6e27",       // 27 digits
+            "E29EB7B417983B13F1FE41D6E2793A70",  // upper case
+            "g29eb7b417983b13f1fe41d6e2793a70",  // not hex
+            "029eb7b417983b13f1fe41d6e2793a70",  // starts with a digit: never generated
+            "e29eb7b417983b13f1fe41d6e2793a700", // 33
+            "",
+        ] {
+            assert!(!is_generated_label(written), "{written:?}");
+        }
     }
 }

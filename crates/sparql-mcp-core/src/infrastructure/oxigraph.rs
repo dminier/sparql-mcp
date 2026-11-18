@@ -1098,8 +1098,42 @@ mod tests {
         println!("generated blank node: {}", anon.o);
         let id = anon.o.trim_start_matches("_:");
         assert!(
-            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+            crate::application::ingest::is_generated_label(id),
             "unexpected generated blank node shape: {id}"
         );
+    }
+
+    #[test]
+    fn every_generated_blank_node_is_recognised_as_generated() {
+        // Oxigraph drops leading zeros from the random id, so the length varies:
+        // a few thousand samples cover the 31-digit case many times over.
+        let a = OxigraphAdapter::open_in_memory().unwrap();
+        let ttl: String = (0..4000)
+            .map(|i| {
+                format!(
+                    "<urn:s:{i}> <urn:p> [ <urn:q> <urn:o> ] .
+"
+                )
+            })
+            .collect();
+        let quads = a
+            .parse_rdf_raw(ttl.as_bytes(), InputFormat::Turtle)
+            .unwrap();
+        let labels: Vec<&str> = quads
+            .iter()
+            .filter_map(|q| q.o.strip_prefix("_:"))
+            .collect();
+        assert_eq!(labels.len(), 4000);
+        let shorter = labels.iter().filter(|l| l.len() < 32).count();
+        assert!(
+            shorter > 0,
+            "the sample should include ids shorter than 32 digits"
+        );
+        for label in labels {
+            assert!(
+                crate::application::ingest::is_generated_label(label),
+                "{label}"
+            );
+        }
     }
 }
