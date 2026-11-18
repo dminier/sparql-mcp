@@ -52,7 +52,7 @@ fn print_messages(frame: Res<FrameMessages>, graph: Res<ViewerGraph>) {
             ViewerMsg::Event(StoreEvent::Insert { .. }) => "insert",
             ViewerMsg::Event(StoreEvent::Delete { .. }) => "delete",
             ViewerMsg::Event(StoreEvent::Changed { .. }) => "changed",
-            ViewerMsg::State(_) => continue,
+            ViewerMsg::State(_) | ViewerMsg::Request(_) => continue,
         };
         let nodes = graph.nodes.iter().filter(|n| n.is_some()).count();
         println!("{kind} nodes={nodes} edges={}", graph.edges.len());

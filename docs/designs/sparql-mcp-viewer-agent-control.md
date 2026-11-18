@@ -808,6 +808,43 @@ Each phase starts only when the previous phase's exit criterion passes.
 | 5 | `viewer_screenshot` | Manual CUJ 4. On a label-dense 5000-node scene at 1568 px with panels, the PNG is under 3.5 MiB, or is downscaled to fit. An oversized capture returns `payload_too_large`, not a timeout. |
 | 6 | Docs and skill guidance | README tool list; `plugins/kb-workbench/skills/kb-workbench/SKILL.md` and `plugins/kb-workbench/skills/sparql-first-code/SKILL.md` mention `query_sparql` → `viewer_show` and `ingest_commit` → `viewer_show`. |
 
+### Implementation status
+
+**Phase 1 is done** (the core integration test, `crates/sparql-mcp-core/tests/viewer_control.rs`,
+and a headless end-to-end test that starts the real viewer binary). Phases 2 to 6 are not started:
+the tools are `viewer_status` only, and the viewer answers `status` and refuses every other op
+with `unknown_op`.
+
+What phase 1 did, and where it differs from the plan above:
+
+*   **Core.** `application/viewer_control.rs` (types, `ViewerControl`, `NullViewerControl`),
+    `ViewerHub` and the reader and writer tasks in `infrastructure/viewer_channel.rs`,
+    `application/tools/viewer.rs` (`viewer_status`, the envelope), `with_viewer_control` on the
+    server, wiring in `main.rs`. `HubInfo` (listener state, controlled instance, connection count)
+    is added to the trait so `viewer_status` can say why no viewer connects.
+*   **Resync echo (not in the plan).** The core adds `"control":1` to the snapshot of a controllable
+    connection. A new viewer resynchronises on the same connection only if it sees this echo;
+    against an older core, which never echoes, it reconnects after `changed` as before. Without the
+    echo a new viewer against an old core would ask in-band and never get an answer.
+*   **`FramedRead` quirk.** After an error (a line over the cap) `FramedRead` yields one `None` and
+    then reads on. The reader must not take that `None` for the end of the connection; a test sends
+    a 9 MiB line and checks that control still works afterwards.
+*   **Calling a disconnected controlled viewer.** With nothing connected the answer is
+    `not_connected` at once; if the controlled instance is gone but another is connected, that one
+    takes over. Waiting for a reconnect happens only after a request was lost in flight, and only for
+    an idempotent op.
+*   **Viewer.** `connection.rs` has `spawn_controllable` (instance id, `control:1`, a response
+    sender) next to the old `spawn`, which does not offer control. `agent.rs` holds `AgentOutbox`,
+    `answer_core_requests` and the pure `answer`/`status_snapshot`; `CorePlugin` adds them, so the
+    headless path answers too. `user` is a constant "no activity" block until the user is tracked
+    (phase 3).
+*   **Compatibility.** The three existing channel tests, which send the plain handshake, pass
+    unchanged. Old core: four tests in `connection.rs` (the plain `spawn` sends the old first line;
+    a controllable viewer against a core without the echo still reconnects on `changed`).
+*   **Not covered by an automated test:** a real `Lagged` against a *viewer-side* process (the core's
+    handling is tested with a fake viewer), and the previous release's viewer binary against the new
+    core (the plain handshake test stands in for it).
+
 ### Target Files to Create/Modify
 
 #### 1. `crates/sparql-mcp-core/src/application/viewer_control.rs` (Create)

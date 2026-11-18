@@ -12,6 +12,7 @@ pub mod limits;
 pub mod path_guard;
 pub mod sparql_text;
 pub mod tools;
+pub mod viewer_control;
 pub mod write_gate;
 
 pub use event_sink::{

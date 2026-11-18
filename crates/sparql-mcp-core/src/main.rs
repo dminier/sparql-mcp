@@ -11,7 +11,7 @@ use sparql_mcp::application::{build_stores_with, BroadcastEventSink, GuardConfig
 use sparql_mcp::cbm::{db as cbm_db, turtle as cbm_turtle};
 use sparql_mcp::config::{Config, McpServer, DEFAULT_CONFIG_FILE, DEFAULT_MCP_JSON_FILE};
 use sparql_mcp::domain::{InputFormat, LoadOpts, SparqlStore};
-use sparql_mcp::infrastructure::{spawn_viewer_channel, FsDocStore, OxigraphAdapter};
+use sparql_mcp::infrastructure::{spawn_viewer_channel, FsDocStore, OxigraphAdapter, ViewerHub};
 use sparql_mcp::mcp::{client, importer, server::SparqlMcpServer};
 
 #[derive(Parser)]
@@ -387,7 +387,17 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok(bind) => {
                         let (tx, rx) = tokio::sync::broadcast::channel(1024);
                         srv = srv.with_event_sink(Arc::new(BroadcastEventSink(tx)));
-                        tokio::spawn(spawn_viewer_channel(bind, raw, active_graph, rx));
+                        // One hub: the side-channel registers viewers with it, and
+                        // the viewer_* tools send their requests through it.
+                        let hub = ViewerHub::new();
+                        srv = srv.with_viewer_control(hub.clone());
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                spawn_viewer_channel(bind, raw, active_graph, rx, hub).await
+                            {
+                                tracing::warn!(error = %e, "the viewer side-channel stopped");
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(

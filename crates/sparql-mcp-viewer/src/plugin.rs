@@ -56,7 +56,14 @@ pub struct CorePlugin {
 
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        let (rx, handle) = connection::spawn(self.addr, self.connect_timeout);
+        // The viewer offers itself for control: the core's `viewer_*` tools
+        // reach it through the requests this connection delivers.
+        let conn = connection::spawn_controllable(self.addr, self.connect_timeout);
+        let (rx, handle) = (conn.rx, conn.shutdown);
+        app.insert_resource(crate::agent::AgentOutbox {
+            responses: conn.responses,
+            instance: conn.instance,
+        });
         app.insert_resource(Inbox(rx));
         app.insert_resource(FrameMessages::default());
         app.insert_resource(ConnStatus(ConnState::Connecting));
@@ -74,6 +81,7 @@ impl Plugin for CorePlugin {
                 apply_to_graph.in_set(CoreSet::Graph),
             ),
         );
+        app.add_plugins(crate::agent::AgentPlugin);
     }
 }
 
@@ -166,6 +174,8 @@ pub fn apply_to_graph(
             ViewerMsg::State(state) => {
                 status.0 = state.clone();
             }
+            // Answered by `agent::answer_core_requests`; it changes no graph.
+            ViewerMsg::Request(_) => {}
         }
     }
 }

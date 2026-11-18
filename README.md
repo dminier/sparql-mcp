@@ -83,7 +83,7 @@ ingestion job instead of looping over `load_ontology`:
    `validate_timeout_secs`). `ingest_commit` with `require_validation: true` then refuses
    unless the last validation passed and no batch arrived since.
 4. `ingest_commit`: the staged triples move into the target in one transaction.
-   The reply lists `new_subjects`, which can be passed to `viewer_show`.
+   The reply lists `new_subjects` (for `viewer_show`, once that tool exists: see *Live 3D viewer*).
    `ingest_abort` discards the job instead.
 
 For a big N-Triples file on the server's disk, `ingest_file` streams it in the background
@@ -115,6 +115,12 @@ Configuration: [`sparql-mcp.toml`](sparql-mcp.toml).
 `sparql-mcp-viewer` shows the active project graph in 3D and grows it as the
 agent writes. Enable `[viewer]` in `sparql-mcp.toml`, then see
 [its README](crates/sparql-mcp-viewer/README.md).
+
+The agent can also look at the viewer: with `[viewer]` enabled, `viewer_status` returns the
+connected viewer's graph, node and edge counts (and says plainly when no viewer is open).
+Camera, filtering, search, highlighting and screenshots are designed
+([docs/designs/sparql-mcp-viewer-agent-control.md](docs/designs/sparql-mcp-viewer-agent-control.md))
+but not built yet.
 
 ## Claude Code plugin
 

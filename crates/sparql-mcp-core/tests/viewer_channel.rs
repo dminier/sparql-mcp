@@ -11,7 +11,7 @@ use serde_json::Value;
 use sparql_mcp::application::event_sink::{BroadcastEventSink, EventSink, StoreEvent};
 use sparql_mcp::application::tools::{ontology, project, sparql};
 use sparql_mcp::domain::SparqlStore;
-use sparql_mcp::infrastructure::{serve_viewer_channel, OxigraphAdapter};
+use sparql_mcp::infrastructure::{serve_viewer_channel, OxigraphAdapter, ViewerHub};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -59,6 +59,7 @@ async fn snapshot_then_insert_and_changed_events_in_order() {
         store.clone(),
         active_graph.clone(),
         rx,
+        ViewerHub::new(),
     ));
 
     let (mut reader, _writer) = connect_and_request_snapshot(addr).await;
@@ -126,6 +127,7 @@ async fn lagged_connection_is_closed() {
         store.clone(),
         active_graph.clone(),
         rx,
+        ViewerHub::new(),
     ));
 
     let (mut reader, _writer) = connect_and_request_snapshot(addr).await;
@@ -166,6 +168,7 @@ async fn project_switch_triggers_a_new_snapshot() {
         store.clone(),
         active_graph.clone(),
         rx,
+        ViewerHub::new(),
     ));
 
     let (mut reader, _writer) = connect_and_request_snapshot(addr).await;

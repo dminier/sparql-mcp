@@ -9,4 +9,4 @@ pub mod viewer_channel;
 
 pub use fs_doc_store::FsDocStore;
 pub use oxigraph::OxigraphAdapter;
-pub use viewer_channel::{serve_viewer_channel, spawn_viewer_channel};
+pub use viewer_channel::{serve_viewer_channel, spawn_viewer_channel, ViewerHub};

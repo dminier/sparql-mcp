@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use rmcp::object;
 use sparql_mcp::application::event_sink::BroadcastEventSink;
 use sparql_mcp::application::tools::{ontology, sparql};
+use sparql_mcp::application::viewer_control::{ViewerControl, ViewerOp, ViewerOutcome};
 use sparql_mcp::domain::SparqlStore;
-use sparql_mcp::infrastructure::{serve_viewer_channel, OxigraphAdapter};
+use sparql_mcp::infrastructure::{serve_viewer_channel, OxigraphAdapter, ViewerHub};
 use sparql_mcp_viewer::connection::{self, ConnState, ViewerMsg};
 use sparql_mcp_viewer::graph::{NodeKind, ViewerGraph};
 use tokio::net::TcpListener;
@@ -42,6 +43,7 @@ async fn drain_until(
                 }
             }
             Ok(ViewerMsg::State(state)) => states.push(state),
+            Ok(ViewerMsg::Request(_)) => {}
             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
         if graph.as_ref().is_some_and(&pred) {
@@ -77,6 +79,7 @@ async fn cuj4_smoke_test_without_a_window() {
         store.clone(),
         active_graph.clone(),
         server_rx,
+        ViewerHub::new(),
     ));
 
     // Step 1: load the ontology (ground data — a precise Insert event).
@@ -212,4 +215,98 @@ async fn cuj4_smoke_test_without_a_window() {
         final_instance_count, 2,
         "2 instance nodes remain after deleting one of three"
     );
+}
+
+/// Kills the child process when the test ends, however it ends.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn the_core_reads_the_status_of_a_real_headless_viewer_and_sees_its_own_writes_at_once() {
+    let store: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+    let active_graph = Arc::new(RwLock::new("urn:project:default".to_string()));
+    let (tx, server_rx) = tokio::sync::broadcast::channel(64);
+    let sink = BroadcastEventSink(tx);
+    let hub = ViewerHub::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_viewer_channel(
+        listener,
+        store.clone(),
+        active_graph.clone(),
+        server_rx,
+        hub.clone(),
+    ));
+    let ttl_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ontology/1-smc.ttl");
+    let turtle = std::fs::read_to_string(&ttl_path).unwrap();
+    ontology::load_ontology(
+        &store,
+        &object!({ "turtle": turtle, "graph_iri": "urn:project:default" }),
+        &active_graph,
+        &sink,
+    )
+    .unwrap();
+
+    // The real binary, without a window.
+    let _child = Child(
+        std::process::Command::new(env!("CARGO_BIN_EXE_sparql-mcp-viewer"))
+            .args(["--headless", "--connect", &addr.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starting the headless viewer"),
+    );
+
+    let ask = |hub: Arc<ViewerHub>| async move {
+        hub.request(ViewerOp::Status {}, Instant::now() + Duration::from_secs(5))
+            .await
+    };
+    // The first connection takes a moment (the process starts, then connects).
+    let started = Instant::now();
+    let first = loop {
+        match ask(hub.clone()).await {
+            ViewerOutcome::Applied { result, user, .. } => break (result, user),
+            ViewerOutcome::NotConnected | ViewerOutcome::Timeout => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the viewer never connected"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    let (result, user) = first;
+    assert_eq!(result["graph"], "urn:project:default");
+    assert_eq!(result["connection"], "streaming");
+    assert_eq!(hub.info().instance.as_deref(), result["instance"].as_str());
+    assert_eq!(user.epoch, 0);
+    let nodes_before = result["nodes"].as_u64().unwrap();
+    assert!(nodes_before > 0, "the ontology is loaded: {result}");
+
+    // Three inserts, then a request at once: the viewer has applied the events
+    // that were emitted before the request when it answers.
+    let insert = "INSERT DATA { GRAPH <urn:project:default> {
+        <urn:project:q1> a <https://sparql-mcp.dev/ns#Project> .
+        <urn:project:q2> a <https://sparql-mcp.dev/ns#Project> .
+        <urn:project:q3> a <https://sparql-mcp.dev/ns#Project> .
+    } }";
+    sparql::update_sparql(&store, &object!({ "update": insert }), &active_graph, &sink).unwrap();
+    match ask(hub.clone()).await {
+        ViewerOutcome::Applied { result, .. } => {
+            assert_eq!(
+                result["nodes"].as_u64().unwrap(),
+                nodes_before + 3,
+                "{result}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }

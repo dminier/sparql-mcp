@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
         store.clone(),
         active_graph.clone(),
         rx,
+        sparql_mcp::infrastructure::ViewerHub::new(),
     ));
 
     let ontologies = if args.ontologies.is_empty() {

@@ -65,6 +65,13 @@ of domain-specific content.
   progress in `ingest_status`; `ingest_abort` stops a running one. Measured at 32-39k triples/s
   (`docs/benchmarks/ingest.md`). `[ingest] file_batch_triples` (5000). Turtle files are not
   streamed.
+- **Viewer control, phase 1.** With `[viewer]` enabled the core lists `viewer_status`, which asks
+  the connected viewer (also a headless one) for its graph and node and edge counts, and answers
+  `{"viewer":"not_connected","applied":false}` when none is open. Underneath: a `ViewerHub` that
+  tracks controllable viewers (newest instance controlled, a reconnect keeps its place), request and
+  response lines on the side-channel, separate reader and writer tasks, an 8 MiB line cap, and a
+  resync on the same connection after `changed` or a lag. A viewer without `control` in its first
+  line (an older one) behaves as before.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 

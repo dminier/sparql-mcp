@@ -25,6 +25,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `sync` for the inbox channel; no `process`, which the viewer never spawns.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 crossbeam-channel = "0.5"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
 rand = { version = "0.9", features = ["small_rng"] }
 
 # "3d" pulls in default_platform (bevy_winit + x11/wayland + multi_threaded),

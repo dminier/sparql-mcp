@@ -18,8 +18,9 @@ rmcp = { version = "1.5", default-features = false, features = [
     "transport-child-process",
     "transport-io",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "net", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "net", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

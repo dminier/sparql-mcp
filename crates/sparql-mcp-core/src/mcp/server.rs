@@ -23,6 +23,7 @@ use crate::application::limits::{clear_captured, take_captured};
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
 use crate::application::tools::{cbm, doc, export, gdrive, ingest, ontology, project, sparql};
+use crate::application::viewer_control::{NullViewerControl, ViewerControl};
 use crate::application::{EventSink, NullEventSink, PrivilegedStore};
 use crate::config::IngestConfig;
 use crate::domain::{DocStore, SparqlStore};
@@ -51,6 +52,10 @@ pub struct SparqlMcpServer {
     gdrive_config: Option<crate::config::GDriveConfig>,
     store_path: std::path::PathBuf,
     event_sink: Arc<dyn EventSink>,
+    /// How the `viewer_*` tools reach a connected viewer.
+    viewer: Arc<dyn ViewerControl>,
+    /// Whether the `viewer_*` tools are listed (`[viewer] enabled`).
+    viewer_tools: bool,
 }
 
 impl SparqlMcpServer {
@@ -85,7 +90,17 @@ impl SparqlMcpServer {
             gdrive_config,
             store_path,
             event_sink: Arc::new(NullEventSink),
+            viewer: Arc::new(NullViewerControl),
+            viewer_tools: false,
         }
+    }
+
+    /// Offer the `viewer_*` tools, and send them to `control`. Without this
+    /// call they are not listed.
+    pub fn with_viewer_control(mut self, control: Arc<dyn ViewerControl>) -> Self {
+        self.viewer = control;
+        self.viewer_tools = true;
+        self
     }
 
     /// The ingestion service, for tests and tools that need to run its
@@ -313,6 +328,9 @@ impl ServerHandler for SparqlMcpServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools: Vec<Tool> = core_tool_defs();
+        if self.viewer_tools {
+            tools.extend(crate::application::tools::viewer::tool_defs());
+        }
 
         let _ctx = self.plugin_ctx();
         for plugin in self.plugins.iter() {
@@ -330,6 +348,16 @@ impl ServerHandler for SparqlMcpServer {
         let empty = JsonObject::new();
         let args = request.arguments.as_ref().unwrap_or(&empty);
         let name = request.name.as_ref();
+
+        // The viewer tools are async (they wait for the viewer), and exist only
+        // when the side-channel is configured.
+        if self.viewer_tools {
+            if let Some(result) =
+                crate::application::tools::viewer::dispatch(name, args, self.viewer.as_ref()).await
+            {
+                return result;
+            }
+        }
 
         // Core tools take priority.
         if let Some(result) = self.dispatch_core(name, args).await {
@@ -509,6 +537,32 @@ mod dispatch_tests {
             None,
             std::path::PathBuf::from("/tmp/smcp-test-store"),
         )
+    }
+
+    #[test]
+    fn every_viewer_tool_is_handled_by_the_viewer_dispatcher() {
+        for t in crate::application::tools::viewer::tool_defs() {
+            assert!(
+                crate::application::tools::viewer::handles(t.name.as_ref()),
+                "{} is declared but not handled",
+                t.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_viewer_tools_are_listed_only_when_a_viewer_control_is_set() {
+        let plain = build_server();
+        assert!(!plain.viewer_tools);
+        let with = build_server().with_viewer_control(Arc::new(NullViewerControl));
+        assert!(with.viewer_tools);
+        let r = crate::application::tools::viewer::dispatch(
+            "viewer_status",
+            &object!({}),
+            with.viewer.as_ref(),
+        )
+        .await;
+        assert!(r.is_some());
     }
 
     #[tokio::test]

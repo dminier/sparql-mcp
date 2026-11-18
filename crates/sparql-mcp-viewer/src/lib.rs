@@ -4,6 +4,7 @@
 //! Modules are declared as their phase adds them (see the Delivery phases
 //! table in `docs/designs/sparql-mcp-viewer.md`).
 
+pub mod agent;
 pub mod arrow;
 pub mod camera;
 mod camera_input;

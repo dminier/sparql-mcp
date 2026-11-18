@@ -5899,6 +5899,7 @@ version = "0.0.3"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "memory-stats",
  "oxigraph",
  "rmcp",
@@ -5925,6 +5926,7 @@ dependencies = [
  "bevy",
  "clap",
  "crossbeam-channel",
+ "futures-util",
  "rand 0.9.4",
  "rmcp",
  "serde",
@@ -5932,6 +5934,7 @@ dependencies = [
  "sparql-mcp",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

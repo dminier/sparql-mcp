@@ -10,3 +10,4 @@ pub mod project;
 #[cfg(feature = "recording")]
 pub mod recording;
 pub mod sparql;
+pub mod viewer;

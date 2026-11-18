@@ -101,7 +101,7 @@ pub fn feed_entry_for(msg: &ViewerMsg, graph: &str) -> Option<(FeedKind, u64)> {
                 Some((kind, count))
             }
         }
-        ViewerMsg::State(_) => None,
+        ViewerMsg::State(_) | ViewerMsg::Request(_) => None,
     }
 }
 
@@ -152,7 +152,7 @@ fn record_feed(
                 last_batch.seq = Some(graph.event_seq);
                 last_batch.started = Some(Instant::now());
             }
-            ViewerMsg::Event(_) => {}
+            ViewerMsg::Event(_) | ViewerMsg::Request(_) => {}
         }
         if let Some((kind, count)) = feed_entry_for(msg, &graph.graph) {
             feed.push(kind, count);
