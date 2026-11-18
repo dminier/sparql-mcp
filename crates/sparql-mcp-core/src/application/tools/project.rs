@@ -73,12 +73,15 @@ pub fn project_create(
 
     let project_iri = format!("urn:project:{id}");
     let now = iso_now();
+    // The label comes from the agent: write it as an escaped literal, so it
+    // cannot close the string and add triples of its own to the registry.
+    let label_literal = crate::application::sparql_text::string_literal(label);
     let turtle = format!(
         "@prefix smc: <{SMC_NS}> .\n\
          @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
          <{project_iri}> a smc:Project ;\n\
              smc:projectId \"{id}\" ;\n\
-             smc:label \"{label}\" ;\n\
+             smc:label {label_literal} ;\n\
              smc:namedGraph <{project_iri}> ;\n\
              smc:created \"{now}\"^^xsd:dateTime .\n"
     );
@@ -192,7 +195,7 @@ fn iri_cell(row: &std::collections::HashMap<String, RdfTerm>, var: &str) -> Opti
     })
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

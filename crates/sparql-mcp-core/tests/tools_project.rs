@@ -123,3 +123,29 @@ fn switch_invalid_id_rejected() {
     let res = project_switch(&graph, &args(json!({"id": "bad id!"})));
     assert!(res.is_err() || res.unwrap().is_error.unwrap_or(false));
 }
+
+#[test]
+fn a_label_cannot_inject_triples_into_the_registry() {
+    use sparql_mcp::domain::QueryResult;
+    let s = store();
+    // A label that tries to close the string and add a triple of its own.
+    let evil = r#"x" ; <urn:smc:injected> "yes"#;
+    let res = project_create(&s, &args(json!({"id": "p1", "label": evil}))).unwrap();
+    assert!(!res.is_error.unwrap_or(false));
+
+    // The label is stored exactly as given, and nothing else was added.
+    let listed = project_list(&s).unwrap();
+    let text = listed.content[0].as_text().unwrap().text.clone();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        body.to_string().contains("injected"),
+        "label not stored: {body}"
+    );
+    let injected = s
+        .query("ASK { GRAPH <urn:meta> { ?s <urn:smc:injected> ?o } }")
+        .unwrap();
+    assert!(
+        matches!(injected, QueryResult::Boolean(false)),
+        "the label added a triple of its own"
+    );
+}
