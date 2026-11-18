@@ -220,27 +220,30 @@ core internals (registry, load ledger, ingestion jobs) ──▶ PrivilegedStore
     writer wins with no error. The gate is therefore the only thing that
     keeps new-versus-duplicate counts exact and stops ledger updates from
     being lost.
-*   **Shape.** `WriteGate` is `Clone` and wraps
-    `Arc<tokio::sync::Mutex<GateHolder>>`, with
+*   **Shape (as implemented in 0a).** `WriteGate` is `Clone`. It is a binary
+    lock built on `std::sync::Mutex` + `Condvar`, not a tokio mutex, so it
+    needs no runtime and cannot panic when called on an async worker. A
+    waiter blocks its own thread. The current holder is
     `GateHolder { label: &'static str, since: Instant }`. It has two entry
     points:
     *   `fn run_blocking<T>(&self, label: &'static str, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T>`
-        takes the lock with
-        `Handle::current().block_on(tokio::time::timeout(wait, mutex.clone().lock_owned()))`
-        and runs `f` on the current thread. The write methods of
-        `GatedStore` and `PrivilegedStore` use it.
-    *   `async fn run<T: Send + 'static>(&self, label: &'static str, f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T>`
-        takes the lock, then moves the owned guard into `spawn_blocking`.
-        It is for callers that hold no store handle.
+        waits for the lock up to `write_wait_timeout_secs`, then runs `f` on
+        the current thread. The write methods of `GatedStore` and
+        `PrivilegedStore` use it.
+    *   `async fn run<T: Send + 'static>(&self, label, f) -> anyhow::Result<T>`
+        does the same inside `spawn_blocking`. It is for callers that hold no
+        store handle.
 
-    If the waiting time runs out, both return `ToolError::WriteBusy` with the
-    label of the current holder.
-*   **Calling rule.** Gated and privileged store methods are only called from
-    a blocking thread, because `block_on` panics on an async worker.
-    `dispatch_core`, plugin dispatch and every CLI write wrap their call in
-    `tokio::task::spawn_blocking`. The gate is not reentrant, so
-    `WriteGate::run` and `run_blocking` are never wrapped around a
-    `GatedStore` or `PrivilegedStore` call: that would deadlock.
+    If the waiting time runs out, both return `ToolError::WriteBusy`. Its
+    `holder` is the label of the **store method** that holds the gate (for
+    example `update_with_outcome`), not the tool name.
+*   **Calling rule.** Store work runs on a blocking thread: `dispatch_core`,
+    plugin dispatch and the CLI wrap their calls in
+    `tokio::task::spawn_blocking`, so waiting for the gate never occupies a
+    Tokio worker. The gate is not reentrant. A thread that already holds it
+    and asks again gets an immediate error instead of waiting for the
+    timeout, so `WriteGate::run` and `run_blocking` are never wrapped around a
+    `GatedStore` or `PrivilegedStore` call.
 *   **Cancellation.** The guard lives on the blocking thread that runs the
     store work, so dropping the request future does not release the gate. It
     is released only when the store work ends.
@@ -431,9 +434,15 @@ design adds its own job keys to the same section.
     refusal raised below the tool would surface as a JSON-RPC error string.
     `limits.rs` therefore defines
     `pub enum ToolError { LimitExceeded{..}, ParseError{..}, GraphProtected{graph}, ReservedIri{iri}, DestructiveUpdateForbidden, LoadForbidden, PathOutsideRoots{path}, PathRejected{path}, WriteBusy{holder: String, waited_secs: u64} }`.
-    *   Store-level refusals are returned as `anyhow::Error::new(ToolError::…)`.
-    *   Each tool's error mapping first tries `e.downcast_ref::<ToolError>()`.
-        On a match, it returns `Ok(CallToolResult { is_error: Some(true), content: [json] })`.
+    *   Store-level refusals are raised with `ToolError::into_anyhow()`. It
+        wraps the error (so `downcast_ref::<ToolError>()` works) and also
+        records it in a thread-local slot.
+    *   **As implemented in 0a:** tools keep their own `map_err(McpError…)`,
+        which would hide the `ToolError`. Tools run synchronously on one
+        blocking thread, so the dispatcher clears the slot before the tool and
+        takes it after the tool returns an error. A recorded refusal replaces
+        the error with `Ok(CallToolResult { is_error: Some(true), content: [json] })`.
+        This needs no edit to each tool's error mapping.
     *   Missing or ill-typed arguments stay `McpError::invalid_params`.
     *   `holder` is the `GateHolder.label`, which is the tool or method name.
     *   `ToolError` exists from Phase 0a, because `write_busy` needs it.
@@ -536,7 +545,7 @@ store serializes writers by itself.
 
 | Phase | Scope | Files | Exit criterion |
 |---|---|---|---|
-| 0a | `WriteGate` with `run` and `run_blocking`; `GatedStore` (gate only) and `PrivilegedStore`, with their wiring; `ToolError` and the error channel; `spawn_blocking` everywhere; async `dispatch_core` | 1, 2 (`write_wait_timeout_secs`), 3 (`ToolError`), 4, 5, 9, 10, 12 | In `tests/write_path_hardening.rs`, on `#[tokio::test(flavor = "current_thread")]`, with a `SlowStore` double wrapping `OxigraphAdapter::open(tempdir)` whose `update` sleeps 2 s: (a) `dispatch_core("query_sparql")` completes within 200 ms while `dispatch_core("update_sparql")` is running; (b) two concurrent writes never overlap, with an `AtomicUsize` of concurrent entries that peaks at 1; (c) the first write's future is dropped by `timeout(50 ms)`, then a second write with `write_wait_timeout_secs = 1` gets `write_busy` with holder `update_sparql`, and succeeds after the first write ends. All existing tests pass. |
+| 0a | `WriteGate` with `run` and `run_blocking`; `GatedStore` (gate only) and `PrivilegedStore`, with their wiring; `ToolError` and the error channel; `spawn_blocking` everywhere; async `dispatch_core` | 1, 2 (`write_wait_timeout_secs`), 3 (`ToolError`), 4, 5, 9, 10, 12 | In `tests/write_path_hardening.rs`, on `#[tokio::test(flavor = "current_thread")]`, with a `SlowStore` double wrapping `OxigraphAdapter::open(tempdir)` whose `update` sleeps 2 s: (a) `dispatch_core("query_sparql")` completes within 200 ms while `dispatch_core("update_sparql")` is running; (b) two concurrent writes never overlap, with an `AtomicUsize` of concurrent entries that peaks at 1; (c) the first write's future is dropped by `timeout(50 ms)`, then a second write with `write_wait_timeout_secs = 1` gets `write_busy` with holder `update_with_outcome`, and succeeds after the first write ends. `dispatch_core` is `#[doc(hidden)] pub` so integration tests can call it. All existing tests pass. **Done (2026-11-18):** the tests pass, and (b) and (c) fail when the gate is bypassed on `update_with_outcome`. |
 | 0b | Atomic scan-free loads, `StoredQuad` and the new outcome types, per-graph split events, blank-node renaming, load-ledger key and cleanup, chunked `cbm_load_graph` with events | 6, 7, 10, 11, 12 (`tools_sparql.rs`, `store.rs`, bench) | CUJs 1 and 4. F3: a `#[cfg(test)]` counter behind a private `OxigraphAdapter::store_len()`, which replaces every `self.store.len()`, stays at 0 across `load_rdf`, `INSERT DATA` and `DELETE DATA`. F10: `_:b0` in two calls gives two nodes. CUJ 5: a `query_sparql` and a second write both complete while a 300,000-triple `cbm_load_graph` runs. The tests listed under [Compatibility](#compatibility) are updated in this phase. |
 | 0c | Limits, `GatedStore` guard checks, `classify_update`, real `dry_run`, `file_roots` | 1, 2, 3, 5 (guards), 7, 8, 9, 10, 12 | CUJs 2 and 3. Each row of the guard table, and each of the *Rules*. F6: `dry_run` on invalid SPARQL returns `parse_error`. F8: a path outside `file_roots` and a junction escape are refused. |
 | 0d | Docs, skills, CHANGELOG | 12 (docs) | `kb-workbench` SKILL.md uses the new fields. Every existing test passes. |

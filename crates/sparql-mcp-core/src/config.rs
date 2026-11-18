@@ -66,6 +66,32 @@ pub struct Config {
     /// Live 3D viewer side-channel configuration.
     #[serde(default)]
     pub viewer: Option<ViewerConfig>,
+
+    /// Write-path limits and guards. The whole section is optional.
+    #[serde(default)]
+    pub ingest: IngestConfig,
+}
+
+fn default_write_wait_timeout_secs() -> u64 {
+    30
+}
+
+/// `[ingest]` — write-path hardening settings (see
+/// `docs/designs/sparql-mcp-write-path-hardening.md`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestConfig {
+    /// How long a write waits for the write gate before failing with
+    /// `write_busy`, in seconds.
+    #[serde(default = "default_write_wait_timeout_secs")]
+    pub write_wait_timeout_secs: u64,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            write_wait_timeout_secs: default_write_wait_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -90,8 +116,12 @@ pub struct McpServer {
     pub env: BTreeMap<String, String>,
 }
 
-fn default_backup_retain() -> usize { 5 }
-fn default_true() -> bool { true }
+fn default_backup_retain() -> usize {
+    5
+}
+fn default_true() -> bool {
+    true
+}
 
 fn default_viewer_bind() -> String {
     "127.0.0.1:7878".to_string()
@@ -259,5 +289,19 @@ sync_on_render = false
         let cfg: Config = toml::from_str(toml).unwrap();
         let viewer = cfg.viewer.unwrap();
         assert_eq!(viewer.bind, "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn ingest_section_absent_uses_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 30);
+    }
+
+    #[test]
+    fn ingest_section_partial_and_explicit() {
+        let cfg: Config = toml::from_str("[ingest]\n").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 30);
+        let cfg: Config = toml::from_str("[ingest]\nwrite_wait_timeout_secs = 5\n").unwrap();
+        assert_eq!(cfg.ingest.write_wait_timeout_secs, 5);
     }
 }
