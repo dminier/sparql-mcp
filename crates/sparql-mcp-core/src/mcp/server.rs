@@ -18,11 +18,13 @@ use rmcp::service::{RequestContext, RoleServer, RunningService};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
+use crate::application::ingest::IngestService;
 use crate::application::limits::{clear_captured, take_captured};
 #[cfg(feature = "recording")]
 use crate::application::tools::recording;
-use crate::application::tools::{cbm, doc, export, gdrive, ontology, project, sparql};
+use crate::application::tools::{cbm, doc, export, gdrive, ingest, ontology, project, sparql};
 use crate::application::{EventSink, NullEventSink, PrivilegedStore};
+use crate::config::IngestConfig;
 use crate::domain::{DocStore, SparqlStore};
 use crate::plugin::{PluginContext, ToolPlugin};
 
@@ -35,6 +37,8 @@ pub struct SparqlMcpServer {
     /// Handle for core modules that own the registry and ledger graphs
     /// (`project_create`, recording imports).
     privileged: Arc<PrivilegedStore>,
+    /// The batch ingestion jobs (`ingest_*` tools).
+    ingest: Arc<IngestService>,
     doc_store: Arc<dyn DocStore>,
     ontology_dir: PathBuf,
     /// Shared with `infrastructure::viewer_channel`: `project_switch`
@@ -60,9 +64,15 @@ impl SparqlMcpServer {
         gdrive_config: Option<crate::config::GDriveConfig>,
         store_path: PathBuf,
     ) -> Self {
+        let ingest = Arc::new(IngestService::new(
+            privileged.clone(),
+            active_graph.clone(),
+            IngestConfig::default(),
+        ));
         Self {
             store: gated,
             privileged,
+            ingest,
             doc_store,
             ontology_dir,
             active_graph,
@@ -71,6 +81,16 @@ impl SparqlMcpServer {
             store_path,
             event_sink: Arc::new(NullEventSink),
         }
+    }
+
+    /// Use the `[ingest]` settings for the ingestion jobs' limits.
+    pub fn with_ingest_config(mut self, cfg: IngestConfig) -> Self {
+        self.ingest = Arc::new(IngestService::new(
+            self.privileged.clone(),
+            self.active_graph.clone(),
+            cfg,
+        ));
+        self
     }
 
     pub fn with_event_sink(mut self, event_sink: Arc<dyn EventSink>) -> Self {
@@ -168,6 +188,9 @@ impl SparqlMcpServer {
                 &self.active_graph,
                 self.event_sink.as_ref(),
             ),
+            "ingest_begin" => ingest::ingest_begin(&self.ingest, args),
+            "ingest_status" => ingest::ingest_status(&self.ingest, args),
+            "ingest_abort" => ingest::ingest_abort(&self.ingest, args),
             "export_graph" => export::export_graph(&self.store, args),
             "list_graphs" => export::list_graphs(&self.store),
             "stats" => export::stats(&self.store, &self.ontology_dir),
@@ -415,6 +438,9 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::project::tool_project_switch_def(),
         crate::application::tools::doc::tool_write_doc_def(),
         crate::application::tools::gdrive::tool_get_gdrive_config_def(),
+        crate::application::tools::ingest::tool_ingest_begin_def(),
+        crate::application::tools::ingest::tool_ingest_status_def(),
+        crate::application::tools::ingest::tool_ingest_abort_def(),
     ];
     #[cfg(feature = "recording")]
     {

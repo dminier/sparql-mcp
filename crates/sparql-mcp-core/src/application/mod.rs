@@ -6,8 +6,10 @@
 pub mod event_sink;
 pub mod gated_store;
 pub mod guards;
+pub mod ingest;
 pub mod limits;
 pub mod path_guard;
+pub mod sparql_text;
 pub mod tools;
 pub mod write_gate;
 

@@ -4,6 +4,7 @@ pub mod cbm;
 pub mod doc;
 pub mod export;
 pub mod gdrive;
+pub mod ingest;
 pub mod ontology;
 pub mod project;
 #[cfg(feature = "recording")]

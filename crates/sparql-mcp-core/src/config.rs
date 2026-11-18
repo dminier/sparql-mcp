@@ -93,6 +93,29 @@ pub struct IngestConfig {
     /// (`export_graph`) are confined to. Unset keeps the old behaviour (any
     /// path) and logs a warning. Each root must exist.
     pub file_roots: Option<Vec<PathBuf>>,
+    /// Most triples in one `ingest_batch` payload.
+    pub max_batch_triples: usize,
+    /// Most batches in one ingestion job.
+    pub max_job_batches: u32,
+    /// Most triples in one staged job (its commit is one in-memory
+    /// transaction). Provisional: confirmed by the bench.
+    pub max_job_triples_staged: u64,
+    /// Most triples in one direct or file job.
+    pub max_job_triples_direct: u64,
+    /// Most triples a staged `replace` commit may rewrite (target size plus
+    /// staging size). Provisional.
+    pub max_replace_triples: u64,
+    /// Most jobs that are open, running or interrupted at once.
+    pub max_open_jobs: usize,
+    /// An open job idle for longer than this is expired, in seconds.
+    pub job_idle_ttl_secs: u64,
+    /// Finished jobs' ledger entries are deleted this long after they end,
+    /// in seconds.
+    pub job_retention_secs: u64,
+    /// Largest file `ingest_file` accepts, in bytes.
+    pub max_file_bytes: u64,
+    /// Time limit for one `ingest_validate` check, in seconds.
+    pub validate_timeout_secs: u64,
 }
 
 impl Default for IngestConfig {
@@ -104,6 +127,16 @@ impl Default for IngestConfig {
             max_batch_bytes: 1_048_576,
             max_load_file_bytes: 67_108_864,
             file_roots: None,
+            max_batch_triples: 10_000,
+            max_job_batches: 10_000,
+            max_job_triples_staged: 500_000,
+            max_job_triples_direct: 10_000_000,
+            max_replace_triples: 1_000_000,
+            max_open_jobs: 4,
+            job_idle_ttl_secs: 3_600,
+            job_retention_secs: 604_800,
+            max_file_bytes: 2_147_483_648,
+            validate_timeout_secs: 10,
         }
     }
 }

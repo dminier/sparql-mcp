@@ -50,6 +50,14 @@ pub enum ToolError {
         holder: String,
         waited_secs: u64,
     },
+    /// A refusal specific to one tool family, with its own stable code (for
+    /// example `job_not_found` from the ingestion tools). `job_id` is echoed
+    /// in the payload when the refusal is about one job.
+    Coded {
+        code: &'static str,
+        message: String,
+        job_id: Option<String>,
+    },
 }
 
 impl ToolError {
@@ -64,6 +72,7 @@ impl ToolError {
             Self::PathOutsideRoots { .. } => "path_outside_roots",
             Self::PathRejected { .. } => "path_rejected",
             Self::WriteBusy { .. } => "write_busy",
+            Self::Coded { code, .. } => code,
         }
     }
 
@@ -86,6 +95,7 @@ impl ToolError {
                 format!("path {path} is outside every [ingest] file_roots entry")
             }
             Self::PathRejected { path } => format!("path {path} is not allowed"),
+            Self::Coded { message, .. } => message.clone(),
             Self::WriteBusy {
                 holder,
                 waited_secs,
@@ -119,6 +129,11 @@ impl ToolError {
             }
             Self::WriteBusy { holder, .. } => {
                 obj.insert("holder".into(), json!(holder));
+            }
+            Self::Coded {
+                job_id: Some(id), ..
+            } => {
+                obj.insert("job_id".into(), json!(id));
             }
             _ => {}
         }

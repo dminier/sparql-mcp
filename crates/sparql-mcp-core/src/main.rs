@@ -379,7 +379,8 @@ async fn run(cli: Cli) -> Result<()> {
                 active_graph.clone(),
                 cfg.gdrive.clone(),
                 store_path.clone(),
-            );
+            )
+            .with_ingest_config(cfg.ingest.clone());
 
             if let Some(viewer) = cfg.viewer.clone().filter(|v| v.enabled) {
                 match viewer.bind.parse::<SocketAddr>() {

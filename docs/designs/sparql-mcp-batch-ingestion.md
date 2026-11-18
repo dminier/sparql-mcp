@@ -628,6 +628,31 @@ criterion passes.
 | 3 | `ingest_file`: hashing, streaming, checkpoints, resume, progress | 3, 4, 8 | CUJ 5 on a generated 1 GiB file: ≥ 50,000 triples/s; peak working set < 512 MiB; `query_sparql` p95 < 200 ms. Resume after killing the process. `source_changed` after the file is edited. |
 | 4 | Docs, skill guidance, viewer tie-in | 9 | README and CHANGELOG updated; the two SKILL.md files updated; manual CUJ 1 with the viewer and `viewer_show`. |
 
+### Implementation status
+
+**Phase 1, slice 1 (2026-11-18): the job lifecycle.** Done:
+
+*   the `[ingest]` keys of [Limits](#limits) (`max_open_jobs`, `max_job_batches`,
+    `max_job_triples_staged`/`_direct`, `max_replace_triples`, `job_idle_ttl_secs`,
+    `job_retention_secs`, `max_file_bytes`, `validate_timeout_secs`,
+    `max_batch_triples`);
+*   `application/ingest.rs`: the job ledger in `urn:sparql-mcp:jobs` (manifest as
+    `smj:` quads), `JobState` and its transitions, ULID job ids, sequence ranges;
+*   `ingest_begin`, `ingest_status`, `ingest_abort` (staging graph dropped in the
+    same update request as the state change), with target validation, the
+    `max_open_jobs` limit and the `invalid_*` / `job_*` codes (`ToolError::Coded`);
+*   every ledger read-then-write runs under `PrivilegedStore::exclusive`, so it
+    holds the write gate once; every value from outside goes through
+    `sparql_text::string_literal` / `iri`, and a job id that is not a ULID is never
+    put in a query.
+
+**Not yet done:** `ingest_batch` (idempotent, with the in-transaction re-checks of
+step 5), `ingest_commit` (staged, replace, direct), the expiry sweeper and heartbeat,
+chunked staging drops, `ingest_validate`, `ingest_file`, and the bench. Decision to
+make when `ingest_batch` lands: the design's `write_batch(quads, ledger, guard)` port
+method (one transaction that re-checks the job state, then inserts the data and the
+batch record) is not implemented yet.
+
 ### Target Files to Create/Modify
 
 #### 0. `crates/sparql-mcp-core/Cargo.toml` (Modify)
