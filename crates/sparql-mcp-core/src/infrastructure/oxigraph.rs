@@ -82,6 +82,11 @@ impl SparqlStore for OxigraphAdapter {
         convert_query_results(results)
     }
 
+    fn flush(&self) -> Result<()> {
+        self.store.flush()?;
+        Ok(())
+    }
+
     fn query_bounded(
         &self,
         sparql: &str,

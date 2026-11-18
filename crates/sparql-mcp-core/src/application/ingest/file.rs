@@ -391,6 +391,11 @@ impl IngestService {
         if matches!(outcome, Ok(RunEnd::Done)) && spec.mode == Mode::Direct {
             self.final_changed(&spec);
         }
+        // A big load leaves much of its data in write buffers, which the store
+        // keeps until they fill. Writing them out gives the memory back.
+        if let Err(e) = self.privileged.flush() {
+            tracing::warn!(job = %spec.id, error = %e, "could not flush the store after a file job");
+        }
     }
 
     /// One `Changed` for a large direct load, so a viewer refreshes.

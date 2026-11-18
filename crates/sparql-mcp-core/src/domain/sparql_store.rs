@@ -335,6 +335,12 @@ pub trait SparqlStore: Send + Sync {
     /// Run a SPARQL 1.1 SELECT / ASK / CONSTRUCT / DESCRIBE query.
     fn query(&self, sparql: &str) -> Result<QueryResult>;
 
+    /// Write what is buffered in memory to disk, so the store gives that memory
+    /// back. Called after a bulk load. It takes no write gate and changes no data.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Run a `SELECT` or `ASK` that is cancelled after `timeout`, reading at
     /// most `max_rows` rows (the evaluation stops there, it does not compute
     /// the rest). Any other query form is an error.

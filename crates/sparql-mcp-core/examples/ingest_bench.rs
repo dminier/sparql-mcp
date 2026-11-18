@@ -408,6 +408,7 @@ fn main() -> Result<()> {
             Arc::new(NullEventSink),
         ));
 
+        let base_rss = rss();
         let peak = Peak::start();
         let started = Instant::now();
         let b = svc.start_file(&FileRequest {
@@ -470,6 +471,24 @@ fn main() -> Result<()> {
         reads.sort_by(|a, b| a.partial_cmp(b).unwrap());
         writes.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mb = peak.finish();
+        // Is the memory given back? Growth over the start, right after the job,
+        // after the store has been idle, and after it is closed.
+        let mib = |bytes: usize| bytes.saturating_sub(base_rss) as f64 / 1_048_576.0;
+        let just_after = mib(rss());
+        std::thread::sleep(Duration::from_secs(5));
+        let after_5s = mib(rss());
+        std::thread::sleep(Duration::from_secs(10));
+        let after_15s = mib(rss());
+        drop(svc);
+        drop(gated);
+        drop(raw);
+        std::thread::sleep(Duration::from_secs(3));
+        let after_close = mib(rss());
+        say("## Memory after an ingest_file job (growth over the start, MiB)\n".to_string());
+        say(format!(
+            "| triples | peak | right after | after 5 s idle | after 15 s idle | after the store is closed |\n|---|---|---|---|---|---|\n| {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+            status["triples"].as_u64().unwrap_or(0), mb, just_after, after_5s, after_15s, after_close
+        ));
         let triples = status["triples"].as_u64().unwrap_or(0);
         say(
             "## ingest_file (direct, RocksDB), with a reader and a writer running meanwhile\n"

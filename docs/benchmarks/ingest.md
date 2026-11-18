@@ -202,17 +202,29 @@ Same machine and date as above, code at the commit that added `ingest_file`.
     the same for batches of 2,000, 5,000 and 10,000 triples, and close to the
     44,000 triples/s of `ingest_batch` in the first table: the limit is the
     transaction that writes the triples into the store, not the file reader.
-*   **Memory** is about 0.8 KiB per triple loaded (256 MiB for 300,000
-    triples, 833 MiB for 1,000,000), against a target of 512 MiB. It grows with
-    the triples loaded and not with the batch size, so it is the store's
-    (RocksDB write buffers and the pages it maps), not the runner's, which holds
-    one batch at a time. This benchmark does not tell whether the working set is
-    given back afterwards, or whether it levels off at a larger size.
-    **Consequence:** `max_job_triples_direct` (10,000,000) would take about
-    8 GiB of working set on this evidence. The ceiling is kept, because
-    the memory is not held by the job and may be reclaimable, but it is
-    **unconfirmed**; run the benchmark with a larger `--file-triples` before
-    loading files of that size on a small machine.
+*   **Memory** is the store's, and it **levels off at about 2 GiB** (peak growth over
+    the start: 256 MiB for 300,000 triples, 833 MiB for 1,000,000, 1,974 MiB for
+    3,000,000, 2,110 MiB for 8,000,000). It does not depend on the batch size, and it
+    is not the runner's, which holds one batch at a time. The cause is how Oxigraph
+    configures RocksDB: a write-buffer budget of 512 MiB (128 MiB per buffer) for each
+    of about a dozen index column families, which fill during a bulk load. Against the
+    design's target of 512 MiB it is four times too high, but it **does not grow with
+    the size of the file**, so `max_job_triples_direct` (10,000,000) is safe as far
+    as memory goes (not run at exactly 10 M; the curve is flat from 3 M to 8 M).
+    *   **What is given back.** Without further action about half of the peak stayed
+        until the store was closed (568 MiB of 832 at 1 M after 15 s idle; 1,694 MiB of
+        1,974 at 3 M; 1,178 MiB of 2,110 at 8 M), because the write buffers stay in
+        memory until they fill.
+    *   **`ingest_file` now flushes the store when a job ends** (`SparqlStore::flush`,
+        which takes no write gate). With it, 8 MiB stayed 5 s after a 1 M job, and 406 MiB
+        after a 3 M job, falling to 26 MiB by 15 s.
+    *   Not flushed: batches sent one by one with `ingest_batch`, and commits. They keep
+        their buffers until the store flushes them itself, so a long session of direct
+        jobs may sit at up to about 2 GiB. Flushing after a large commit is a possible
+        follow-up.
+    *   Throughput falls a little as the store grows (33,000 triples/s at 1 M, 30,000 at 3 M,
+        26,000 at 8 M, with concurrent writes waiting 127 ms at the 95th percentile),
+        because RocksDB compacts in the background.
 *   **Other users are not affected.** Reads took under a millisecond throughout.
     A write waited 72 ms at the 95th percentile with the default 5,000-triple
     batches, because the gate is held for one batch at a time. With 10,000 the

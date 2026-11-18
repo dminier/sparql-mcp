@@ -62,7 +62,8 @@ of domain-specific content.
   outcome for `ingest_commit` with `require_validation`.
   `ingest_file` streams a server-side N-Triples file (inside `file_roots`) in the background,
   with a checkpoint per batch, `resume_job` after a restart, `already_loaded` / `force`, and
-  progress in `ingest_status`; `ingest_abort` stops a running one. Measured at 32-39k triples/s
+  progress in `ingest_status`; `ingest_abort` stops a running one; the store is flushed when the
+  job ends, so the memory of the load is given back. Measured at 26-39k triples/s
   (`docs/benchmarks/ingest.md`). `[ingest] file_batch_triples` (5000). Turtle files are not
   streamed.
 - **Viewer control, phase 1.** With `[viewer]` enabled the core lists `viewer_status`, which asks

@@ -778,11 +778,14 @@ differences and decisions:
 *   **Progress.** `ingest_status` has `file: {path, bytes, bytes_read, percent}` and, while a
     runner is alive in this process, `triples_per_sec` and `eta_secs`.
 
-**Measured** (`docs/benchmarks/ingest.md`): 32,000-39,000 triples/s (target 50,000), about
-0.8 KiB of working set per triple loaded (target: under 512 MiB for 1 GiB), reads unaffected,
-concurrent writes waiting 72 ms at the 95th percentile. **The throughput and memory targets of
-phase 3 are not met**; both are set by the store's write transaction, not by the reader.
-`max_job_triples_direct` is kept but unconfirmed above a few million triples.
+**Measured** (`docs/benchmarks/ingest.md`): 26,000-39,000 triples/s (target 50,000), reads
+unaffected, concurrent writes waiting 72 ms at the 95th percentile (127 ms at 8 M triples).
+**The throughput target of phase 3 is not met**; it is set by the store's write transaction, not
+by the reader. **Memory** peaks at about 2 GiB and does not grow with the file (0.8 GiB at 1 M
+triples, 2.0 at 3 M, 2.1 at 8 M), which is Oxigraph's RocksDB write-buffer budget; the design's
+512 MiB target is not met, but `max_job_triples_direct` is safe. The runner flushes the store when
+a file job ends (`SparqlStore::flush`), which gives back almost all of it (8 MiB left after a
+1 M job, against 568 MiB without the flush).
 
 **Not yet done:** chunked staging drops for large graphs (a staged job above
 `max_job_triples_staged` is refused earlier, so abort and commit drop a bounded graph in

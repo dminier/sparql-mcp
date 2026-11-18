@@ -355,6 +355,10 @@ macro_rules! gated_impl {
                 self.inner.query(sparql)
             }
 
+            fn flush(&self) -> Result<()> {
+                self.inner.flush()
+            }
+
             fn query_bounded(
                 &self,
                 sparql: &str,
