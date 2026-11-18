@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use sparql_mcp::application::{build_stores, BroadcastEventSink, WriteGate};
+use sparql_mcp::application::{build_stores_with, BroadcastEventSink, GuardConfig, WriteGate};
 use sparql_mcp::cbm::{db as cbm_db, turtle as cbm_turtle};
 use sparql_mcp::config::{Config, McpServer, DEFAULT_CONFIG_FILE, DEFAULT_MCP_JSON_FILE};
 use sparql_mcp::domain::{InputFormat, LoadOpts, SparqlStore};
@@ -243,7 +243,7 @@ async fn run(cli: Cli) -> Result<()> {
     let gate = WriteGate::new(std::time::Duration::from_secs(
         cfg.ingest.write_wait_timeout_secs,
     ));
-    let (gated, privileged) = build_stores(raw.clone(), gate);
+    let (gated, privileged) = build_stores_with(raw.clone(), gate, GuardConfig::from(&cfg.ingest));
     let store: Arc<dyn SparqlStore> = gated.clone();
     privileged.load_ontology_dir(&ontology_path)?;
 

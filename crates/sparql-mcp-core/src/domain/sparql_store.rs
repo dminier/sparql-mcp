@@ -232,6 +232,13 @@ pub trait SparqlStore: Send + Sync {
     /// store before; the count costs no whole-store scan.
     fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64>;
 
+    /// Whether `update` would be refused for this handle's caller, without
+    /// running it: too large, a syntax error, a protected graph, or a
+    /// destructive operation. A plain store never refuses.
+    fn check_update(&self, _sparql: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Load an RDF file from disk, with SHA-256 idempotence.
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult>;
 

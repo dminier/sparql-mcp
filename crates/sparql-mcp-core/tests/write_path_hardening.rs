@@ -265,3 +265,236 @@ fn a_chunked_load_lets_other_writers_in_between_chunks() {
     assert_eq!(loader.join().unwrap(), 4);
     assert_eq!(gated.triple_count().unwrap(), 5);
 }
+
+// ── Phase 0c: guards, limits and dry_run, end to end through dispatch ─────────
+
+use sparql_mcp::application::{build_stores_with, GuardConfig};
+
+fn guarded_server(guards: GuardConfig) -> (SparqlMcpServer, Arc<dyn SparqlStore>) {
+    let raw: Arc<dyn SparqlStore> = Arc::new(OxigraphAdapter::open_in_memory().unwrap());
+    let (gated, privileged) =
+        build_stores_with(raw.clone(), WriteGate::new(Duration::from_secs(5)), guards);
+    let dir = std::env::temp_dir().join("smcp-guards");
+    let server = SparqlMcpServer::new(
+        gated,
+        privileged,
+        Arc::new(FsDocStore::new(dir.join("docs"))),
+        dir.join("ontology"),
+        Arc::new(RwLock::new("urn:project:default".to_string())),
+        None,
+        dir.join("store"),
+    );
+    (server, raw)
+}
+
+/// Run a tool and return its result as `(is_error, json body)`.
+async fn run(server: &SparqlMcpServer, tool: &str, args: Value) -> (bool, Value) {
+    let res = server
+        .dispatch_core(tool, args.as_object().unwrap())
+        .await
+        .expect("known tool")
+        .expect("a refusal is a tool result, not a JSON-RPC error");
+    (res.is_error.unwrap_or(false), body(&res))
+}
+
+fn update(sparql: &str) -> Value {
+    json!({ "update": sparql })
+}
+
+fn ask(raw: &Arc<dyn SparqlStore>, query: &str) -> bool {
+    matches!(raw.query(query).unwrap(), QueryResult::Boolean(true))
+}
+
+const PROJECT_P: &str = "INSERT DATA { GRAPH <urn:project:p> { <urn:a> <urn:p> <urn:b> } }";
+
+#[tokio::test]
+async fn destructive_and_protected_updates_are_refused_as_data() {
+    let (server, raw) = guarded_server(GuardConfig::default());
+    raw.update(PROJECT_P).unwrap();
+
+    // DROP ALL would reach every graph, protected ones included.
+    let (is_err, b) = run(&server, "update_sparql", update("DROP ALL")).await;
+    assert!(is_err);
+    assert_eq!(b["code"], "graph_protected");
+
+    // DROP of one ordinary graph needs the setting.
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        update("DROP GRAPH <urn:project:p>"),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "destructive_update_forbidden");
+    assert!(b["message"]
+        .as_str()
+        .unwrap()
+        .contains("allow_destructive_updates"));
+
+    // The registry cannot be written through update_sparql.
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        update("INSERT DATA { GRAPH <urn:meta> { <urn:x> <urn:p> <urn:o> } }"),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "graph_protected");
+    assert_eq!(b["message"], "graph <urn:meta> is protected");
+
+    // Nothing was destroyed or written.
+    assert!(ask(
+        &raw,
+        "ASK { GRAPH <urn:project:p> { <urn:a> <urn:p> <urn:b> } }"
+    ));
+    assert!(!ask(&raw, "ASK { GRAPH <urn:meta> { ?s ?p ?o } }"));
+}
+
+#[tokio::test]
+async fn the_registry_is_still_writable_by_the_core_itself() {
+    let (server, _raw) = guarded_server(GuardConfig::default());
+    // project_create writes <urn:meta> through the privileged handle.
+    let (is_err, b) = run(
+        &server,
+        "project_create",
+        json!({ "id": "demo", "label": "Demo" }),
+    )
+    .await;
+    assert!(!is_err, "{b}");
+}
+
+#[tokio::test]
+async fn allow_destructive_updates_lets_drop_graph_run_but_not_protected_graphs() {
+    let guards = GuardConfig {
+        allow_destructive_updates: true,
+        ..GuardConfig::default()
+    };
+    let (server, raw) = guarded_server(guards);
+    raw.update(PROJECT_P).unwrap();
+
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        update("DROP GRAPH <urn:project:p>"),
+    )
+    .await;
+    assert!(!is_err, "{b}");
+    assert!(!ask(&raw, "ASK { GRAPH <urn:project:p> { ?s ?p ?o } }"));
+
+    for sparql in ["DROP ALL", "CLEAR GRAPH <urn:meta>"] {
+        let (is_err, b) = run(&server, "update_sparql", update(sparql)).await;
+        assert!(is_err, "{sparql}");
+        assert_eq!(b["code"], "graph_protected", "{sparql}");
+    }
+}
+
+#[tokio::test]
+async fn oversized_input_is_refused_before_anything_runs() {
+    let guards = GuardConfig {
+        max_update_bytes: 100,
+        max_batch_bytes: 100,
+        ..GuardConfig::default()
+    };
+    let (server, raw) = guarded_server(guards);
+
+    let big = format!("INSERT DATA {{ <urn:s> <urn:p> \"{}\" }}", "x".repeat(200));
+    let (is_err, b) = run(&server, "update_sparql", update(&big)).await;
+    assert!(is_err);
+    assert_eq!(b["code"], "limit_exceeded");
+    assert_eq!(b["limit_key"], "max_update_bytes");
+    assert_eq!(b["limit"], 100);
+    assert!(b["value"].as_u64().unwrap() > 100);
+
+    let turtle = format!("<urn:s> <urn:p> \"{}\" .", "x".repeat(200));
+    let (is_err, b) = run(
+        &server,
+        "load_ontology",
+        json!({ "turtle": turtle, "format": "ntriples" }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["limit_key"], "max_batch_bytes");
+
+    assert_eq!(raw.triple_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn load_ontology_into_a_protected_graph_is_refused() {
+    let (server, raw) = guarded_server(GuardConfig::default());
+    let (is_err, b) = run(
+        &server,
+        "load_ontology",
+        json!({ "turtle": "<urn:s> <urn:p> <urn:o> .", "format": "ntriples",
+                "graph_iri": "urn:hkb:meta:loaded-files" }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "graph_protected");
+    assert_eq!(raw.triple_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn an_oversized_file_is_refused_with_its_limit() {
+    let guards = GuardConfig {
+        max_load_file_bytes: 10,
+        ..GuardConfig::default()
+    };
+    let (server, raw) = guarded_server(guards);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.nt");
+    std::fs::write(&path, "<urn:s> <urn:p> <urn:o> .\n").unwrap();
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": path.display().to_string() }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "limit_exceeded");
+    assert_eq!(b["limit_key"], "max_load_file_bytes");
+    assert_eq!(raw.triple_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dry_run_classifies_and_reports_a_refusal_without_running() {
+    let (server, raw) = guarded_server(GuardConfig::default());
+    raw.update(PROJECT_P).unwrap();
+
+    // An ordinary write: classified, not refused, and not executed.
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        json!({ "update": "INSERT DATA { GRAPH <urn:project:q> { <urn:a> <urn:p> <urn:b> } }",
+                "dry_run": true }),
+    )
+    .await;
+    assert!(!is_err);
+    assert_eq!(b["dry_run"], true);
+    assert_eq!(b["operations"], json!(["insert_data"]));
+    assert_eq!(b["graphs"], json!(["urn:project:q"]));
+    assert_eq!(b["destructive"], false);
+    assert!(b["refused"].is_null());
+    assert_eq!(raw.triple_count().unwrap(), 1, "a dry run wrote something");
+
+    // A request that would be refused says so, and still does nothing.
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        json!({ "update": "DROP GRAPH <urn:project:p>", "dry_run": true }),
+    )
+    .await;
+    assert!(!is_err);
+    assert_eq!(b["destructive"], true);
+    assert_eq!(b["refused"]["code"], "destructive_update_forbidden");
+    assert_eq!(raw.triple_count().unwrap(), 1);
+
+    // Invalid SPARQL is a parse error, not a successful dry run.
+    let (is_err, b) = run(
+        &server,
+        "update_sparql",
+        json!({ "update": "INSERT DATA {", "dry_run": true }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "parse_error");
+}

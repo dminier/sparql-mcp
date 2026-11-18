@@ -1,32 +1,70 @@
-//! `SparqlStore` decorators that put every store write behind the write gate.
+//! `SparqlStore` decorators that put every store write behind the write gate
+//! and, for non-privileged callers, behind the write guards.
 //!
-//! *   [`GatedStore`] is what tools, plugins and the CLI receive.
+//! *   [`GatedStore`] is what tools, plugins and the CLI receive. Its writes
+//!     take the gate, and are refused when they are too large, touch a
+//!     protected graph, or are destructive without `allow_destructive_updates`
+//!     (see [`crate::application::guards`]).
 //! *   [`PrivilegedStore`] is held only by core modules that own the registry
 //!     and ledger graphs (`project_create`, recording imports, the importer).
+//!     It takes the gate but applies no guard.
 //!
-//! In Phase 0a both only take the gate. The protected-graph and destructive
-//! checks are added to `GatedStore` in Phase 0c. The gate is not reentrant, so
-//! code that needs several store calls in one critical section uses
-//! [`PrivilegedStore::exclusive`], which holds the gate once and hands out the
-//! ungated inner store.
+//! The gate is not reentrant, so code that needs several store calls in one
+//! critical section uses [`PrivilegedStore::exclusive`], which holds the gate
+//! once and hands out the ungated inner store.
 //!
 //! Store methods are synchronous and block while waiting for the gate: call
-//! them from a blocking thread, as the server does.
+//! them from a blocking thread, as the server does. Refusals are raised as
+//! [`ToolError`]s before the gate is taken.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::application::guards::{check_update, classify_sparql, is_protected};
+use crate::application::limits::ToolError;
 use crate::application::write_gate::WriteGate;
+use crate::config::IngestConfig;
 use crate::domain::{
     FileLoadResult, LoadOpts, QueryResult, SparqlStore, StoredQuad, UpdateOutcome,
 };
 
-/// Write-gated view of a store, for non-privileged callers.
+/// What [`GatedStore`] enforces.
+#[derive(Debug, Clone)]
+pub struct GuardConfig {
+    /// Allow `DROP`, `CLEAR` and delete templates of three variables.
+    pub allow_destructive_updates: bool,
+    /// Largest SPARQL update, in bytes.
+    pub max_update_bytes: usize,
+    /// Largest inline RDF payload, in bytes.
+    pub max_batch_bytes: usize,
+    /// Largest file loaded in one transaction, in bytes.
+    pub max_load_file_bytes: u64,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self::from(&IngestConfig::default())
+    }
+}
+
+impl From<&IngestConfig> for GuardConfig {
+    fn from(c: &IngestConfig) -> Self {
+        Self {
+            allow_destructive_updates: c.allow_destructive_updates,
+            max_update_bytes: c.max_update_bytes,
+            max_batch_bytes: c.max_batch_bytes,
+            max_load_file_bytes: c.max_load_file_bytes,
+        }
+    }
+}
+
+/// Write-gated, guarded view of a store, for non-privileged callers.
 pub struct GatedStore {
     inner: Arc<dyn SparqlStore>,
     gate: WriteGate,
+    guards: GuardConfig,
 }
 
 /// Write-gated view of a store, for core modules that own internal graphs.
@@ -35,15 +73,25 @@ pub struct PrivilegedStore {
     gate: WriteGate,
 }
 
-/// Build both handles from one store and one gate.
+/// Build both handles from one store and one gate, with the default guards.
 pub fn build_stores(
     inner: Arc<dyn SparqlStore>,
     gate: WriteGate,
+) -> (Arc<GatedStore>, Arc<PrivilegedStore>) {
+    build_stores_with(inner, gate, GuardConfig::default())
+}
+
+/// Build both handles from one store and one gate.
+pub fn build_stores_with(
+    inner: Arc<dyn SparqlStore>,
+    gate: WriteGate,
+    guards: GuardConfig,
 ) -> (Arc<GatedStore>, Arc<PrivilegedStore>) {
     (
         Arc::new(GatedStore {
             inner: inner.clone(),
             gate: gate.clone(),
+            guards,
         }),
         Arc::new(PrivilegedStore { inner, gate }),
     )
@@ -63,22 +111,117 @@ impl PrivilegedStore {
     }
 }
 
+/// The checks a handle applies before a write. `PrivilegedStore` applies none.
+trait Policy {
+    /// An update request, before it is parsed for execution.
+    fn policy_update(&self, sparql: &str) -> Result<()>;
+    /// An inline RDF payload of `bytes` bytes going to `graph` (`None` = the
+    /// default graph).
+    fn policy_inline(&self, bytes: usize, graph: Option<&str>) -> Result<()>;
+    /// A file load into `graph`.
+    fn policy_file(&self, path: &Path, graph: Option<&str>) -> Result<()>;
+    /// Quads about to be written.
+    fn policy_quads(&self, quads: &[StoredQuad]) -> Result<()>;
+}
+
+fn refuse_if_protected(graph: Option<&str>) -> Result<()> {
+    match graph {
+        Some(g) if is_protected(g) => Err(ToolError::GraphProtected {
+            graph: g.to_string(),
+        }
+        .into_anyhow()),
+        _ => Ok(()),
+    }
+}
+
+impl Policy for GatedStore {
+    fn policy_update(&self, sparql: &str) -> Result<()> {
+        if sparql.len() > self.guards.max_update_bytes {
+            return Err(ToolError::LimitExceeded {
+                limit_key: "max_update_bytes".to_string(),
+                limit: self.guards.max_update_bytes as u64,
+                value: sparql.len() as u64,
+            }
+            .into_anyhow());
+        }
+        let class = classify_sparql(sparql).map_err(ToolError::into_anyhow)?;
+        check_update(&class, self.guards.allow_destructive_updates).map_err(ToolError::into_anyhow)
+    }
+
+    fn policy_inline(&self, bytes: usize, graph: Option<&str>) -> Result<()> {
+        if bytes > self.guards.max_batch_bytes {
+            return Err(ToolError::LimitExceeded {
+                limit_key: "max_batch_bytes".to_string(),
+                limit: self.guards.max_batch_bytes as u64,
+                value: bytes as u64,
+            }
+            .into_anyhow());
+        }
+        refuse_if_protected(graph)
+    }
+
+    fn policy_file(&self, path: &Path, graph: Option<&str>) -> Result<()> {
+        refuse_if_protected(graph)?;
+        // A missing or unreadable file is the store's error to report.
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > self.guards.max_load_file_bytes {
+                return Err(ToolError::LimitExceeded {
+                    limit_key: "max_load_file_bytes".to_string(),
+                    limit: self.guards.max_load_file_bytes,
+                    value: meta.len(),
+                }
+                .into_anyhow());
+            }
+        }
+        Ok(())
+    }
+
+    fn policy_quads(&self, quads: &[StoredQuad]) -> Result<()> {
+        match quads
+            .iter()
+            .filter_map(|q| q.g.as_deref())
+            .find(|g| is_protected(g))
+        {
+            Some(g) => refuse_if_protected(Some(g)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Policy for PrivilegedStore {
+    fn policy_update(&self, _sparql: &str) -> Result<()> {
+        Ok(())
+    }
+    fn policy_inline(&self, _bytes: usize, _graph: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+    fn policy_file(&self, _path: &Path, _graph: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+    fn policy_quads(&self, _quads: &[StoredQuad]) -> Result<()> {
+        Ok(())
+    }
+}
+
 macro_rules! gated_impl {
     ($ty:ty) => {
         impl SparqlStore for $ty {
             // ── gated writes ─────────────────────────────────────────────
             fn update(&self, sparql: &str) -> Result<()> {
+                self.policy_update(sparql)?;
                 self.gate
                     .run_blocking("update", || self.inner.update(sparql))
             }
 
             fn update_with_outcome(&self, sparql: &str) -> Result<UpdateOutcome> {
+                self.policy_update(sparql)?;
                 self.gate.run_blocking("update_with_outcome", || {
                     self.inner.update_with_outcome(sparql)
                 })
             }
 
             fn load_rdf(&self, content: &[u8], opts: LoadOpts) -> Result<u64> {
+                self.policy_inline(content.len(), opts.graph_iri.as_deref())?;
                 self.gate
                     .run_blocking("load_rdf", || self.inner.load_rdf(content, opts))
             }
@@ -88,6 +231,7 @@ macro_rules! gated_impl {
                 content: &[u8],
                 opts: LoadOpts,
             ) -> Result<(u64, Vec<StoredQuad>)> {
+                self.policy_inline(content.len(), opts.graph_iri.as_deref())?;
                 self.gate.run_blocking("load_rdf_with_triples", || {
                     self.inner.load_rdf_with_triples(content, opts)
                 })
@@ -99,6 +243,7 @@ macro_rules! gated_impl {
                 opts: LoadOpts,
                 force: bool,
             ) -> Result<FileLoadResult> {
+                self.policy_file(path, opts.graph_iri.as_deref())?;
                 self.gate.run_blocking("load_rdf_file", || {
                     self.inner.load_rdf_file(path, opts, force)
                 })
@@ -109,8 +254,8 @@ macro_rules! gated_impl {
                     .run_blocking("load_ontology_dir", || self.inner.load_ontology_dir(dir))
             }
 
-            // ── pass-through reads ───────────────────────────────────────
             fn write_quads(&self, quads: &[StoredQuad]) -> Result<u64> {
+                self.policy_quads(quads)?;
                 self.gate
                     .run_blocking("write_quads", || self.inner.write_quads(quads))
             }
@@ -120,6 +265,11 @@ macro_rules! gated_impl {
                 self.inner.parse_rdf(content, opts)
             }
 
+            fn check_update(&self, sparql: &str) -> Result<()> {
+                self.policy_update(sparql)
+            }
+
+            // ── pass-through reads ───────────────────────────────────────
             fn query(&self, sparql: &str) -> Result<QueryResult> {
                 self.inner.query(sparql)
             }

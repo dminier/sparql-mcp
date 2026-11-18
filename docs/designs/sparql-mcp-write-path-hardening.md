@@ -344,7 +344,8 @@ also take the gate, on the blocking thread (see the calling rule above).
 | `InsertData` / `DeleteData` | each quad's graph | no | protected graph: always |
 | `DeleteInsert` with constant template graphs | the template graphs | only if a delete template is fully variable (`?s ?p ?o`) | protected: always; destructive: unless allowed |
 | `DeleteInsert` with any `GRAPH ?g` template, or a `WITH`/`USING` that leaves the graph variable | **all graphs** | yes | unless allowed; always if the WHERE clause could bind a protected graph |
-| `Drop` / `Clear` (graph, `DEFAULT`, `NAMED`, `ALL`); also `ADD`/`MOVE`/`COPY` after rewriting | the target | yes | unless allowed; protected: always |
+| `Drop` / `Clear` of a graph or `DEFAULT`; also `ADD`/`MOVE`/`COPY` after rewriting | the target | yes | unless allowed; protected: always |
+| `Drop` / `Clear` of `NAMED` or `ALL` | every graph | yes | always (`graph_protected`): it would wipe protected graphs |
 | `Create` | the target | no | protected: always |
 | `Load` (also `SILENT`) | the target | n/a | always (`load_forbidden`) |
 
@@ -352,13 +353,15 @@ also take the gate, on the blocking thread (see the calling rule above).
     *   A delete template is *fully variable* when its subject, predicate and
         object are all variables. `DELETE { ?s ?p ?o } WHERE { ?s a :X }` is
         destructive, whatever its `WHERE` clause.
-    *   A template graph is *variable* when it is `GRAPH ?g`, or when it has no
-        `GRAPH`, no `WITH` fixes it, and `USING NAMED` is present.
+    *   A template graph is *variable* only when it is `GRAPH ?g`. A template
+        without `GRAPH` writes to the default graph (or to the `WITH` graph);
+        `USING` and `USING NAMED` only change what the `WHERE` clause reads.
     *   A variable graph counts as touching every graph, protected ones
-        included. It is refused unless `allow_destructive_updates` is set.
-        Even then, it is refused when the update has a delete template, unless
-        `?g` is bound to constants by a top-level `VALUES` or by
-        `FILTER(?g = <iri>)`.
+        included. An insert template with a variable graph is refused unless
+        `allow_destructive_updates` is set. A delete template with a variable
+        graph is always refused (there is no exemption for a `?g` bound by
+        `VALUES` or `FILTER`: the classifier does not look at the `WHERE`
+        clause).
     *   The classifier never tries to decide statically whether a `WHERE`
         clause could bind a protected graph. A variable graph is refused or
         allowed as a whole.
@@ -548,7 +551,7 @@ store serializes writers by itself.
 |---|---|---|---|
 | 0a | `WriteGate` with `run` and `run_blocking`; `GatedStore` (gate only) and `PrivilegedStore`, with their wiring; `ToolError` and the error channel; `spawn_blocking` everywhere; async `dispatch_core` | 1, 2 (`write_wait_timeout_secs`), 3 (`ToolError`), 4, 5, 9, 10, 12 | In `tests/write_path_hardening.rs`, on `#[tokio::test(flavor = "current_thread")]`, with a `SlowStore` double wrapping `OxigraphAdapter::open(tempdir)` whose `update` sleeps 2 s: (a) `dispatch_core("query_sparql")` completes within 200 ms while `dispatch_core("update_sparql")` is running; (b) two concurrent writes never overlap, with an `AtomicUsize` of concurrent entries that peaks at 1; (c) the first write's future is dropped by `timeout(50 ms)`, then a second write with `write_wait_timeout_secs = 1` gets `write_busy` with holder `update_with_outcome`, and succeeds after the first write ends. `dispatch_core` is `#[doc(hidden)] pub` so integration tests can call it. All existing tests pass. **Done (2026-11-18):** the tests pass, and (b) and (c) fail when the gate is bypassed on `update_with_outcome`. |
 | 0b | Atomic scan-free loads, `StoredQuad` and the new outcome types, per-graph split events, blank-node renaming, load-ledger key and cleanup, chunked `cbm_load_graph` with events | 6, 7, 10, 11, 12 (`tools_sparql.rs`, `store.rs`, bench) | CUJs 1 and 4. F3: a `#[cfg(test)]` counter behind a private `OxigraphAdapter::store_len()`, which replaces every `self.store.len()`, stays at 0 across `load_rdf`, `INSERT DATA` and `DELETE DATA`. F10: `_:b0` in two calls gives two nodes. CUJ 5: a `query_sparql` and a second write both complete while a 300,000-triple `cbm_load_graph` runs. The tests listed under [Compatibility](#compatibility) are updated in this phase. **Status (2026-11-18), 0b-1 done:** atomic loads in one transaction (F2); no `len()` on loads and ground updates, with a `#[cfg(test)]` scan counter in `OxigraphAdapter::store_len` (F3); `rename_blank_nodes` (F10); `StoredQuad` and the new outcome types; per-graph, split events with `emit_quads` (F4, F5); the load ledger keyed by (file hash, graph) and written in the data transaction; `load_ontology` and `load_ontology_file` default to the active graph. **Also done (0b-2):** `cbm_load_graph` parses once (`parse_rdf`, no gate), writes chunks of 10,000 triples (`write_quads`, one gated transaction each, so the gate is released between chunks), is capped at 1,000,000 triples (`max_cbm_triples`, a constant until 0c) and emits events; `with_delta` is removed, and recording imports count with `load_rdf`'s `inserted_new`. The write gate is now a FIFO queue: without it, a chunk loop that re-acquires at once starved a waiting writer for 714 ms in a test. **Not yet done:** `graph_size` and real `Changed` counts (today `Changed` above the threshold carries the size of the change, `0 → n` or `n → 0`, not graph sizes), `[ingest]` keys for the event limits and `max_cbm_triples` (defaults in code for now), the ledger cleanup on `DROP`/`CLEAR`, and `examples/ingest_bench.rs`. |
-| 0c | Limits, `GatedStore` guard checks, `classify_update`, real `dry_run`, `file_roots` | 1, 2, 3, 5 (guards), 7, 8, 9, 10, 12 | CUJs 2 and 3. Each row of the guard table, and each of the *Rules*. F6: `dry_run` on invalid SPARQL returns `parse_error`. F8: a path outside `file_roots` and a junction escape are refused. |
+| 0c | Limits, `GatedStore` guard checks, `classify_update`, real `dry_run`, `file_roots` | 1, 2, 3, 5 (guards), 7, 8, 9, 10, 12 | CUJs 2 and 3. Each row of the guard table, and each of the *Rules*. F6: `dry_run` on invalid SPARQL returns `parse_error`. F8: a path outside `file_roots` and a junction escape are refused. **Status (2026-11-18), 0c-1 done:** `guards.rs` (`classify_update`, `check_update`, protected graphs, 11 unit tests including `ADD`/`COPY`/`MOVE` in rewritten form); `GatedStore` enforces the guards and the size limits (`max_update_bytes`, `max_batch_bytes`, `max_load_file_bytes`, protected target graphs, `write_quads`), so plugins are covered too; `PrivilegedStore` applies none; `check_update` on the port; a real `dry_run`; the four keys in `[ingest]`. **Not yet done (0c-2):** `file_roots` and the Windows path checks (F8), term-size limits (`max_iri_bytes`, `max_literal_bytes`) and `max_batch_triples`, `reserved_iri` at parse time, the `[ingest]` keys for event limits and `max_cbm_triples`, the `instructions` sentence. |
 | 0d | Docs, skills, CHANGELOG | 12 (docs) | `kb-workbench` SKILL.md uses the new fields. Every existing test passes. |
 
 ### Target Files to Create/Modify

@@ -72,24 +72,33 @@ pub struct Config {
     pub ingest: IngestConfig,
 }
 
-fn default_write_wait_timeout_secs() -> u64 {
-    30
-}
-
 /// `[ingest]` — write-path hardening settings (see
 /// `docs/designs/sparql-mcp-write-path-hardening.md`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct IngestConfig {
     /// How long a write waits for the write gate before failing with
     /// `write_busy`, in seconds.
-    #[serde(default = "default_write_wait_timeout_secs")]
     pub write_wait_timeout_secs: u64,
+    /// Allow `DROP`, `CLEAR`, and delete templates of three variables in
+    /// `update_sparql`. Writes to protected graphs and `DROP ALL` stay refused.
+    pub allow_destructive_updates: bool,
+    /// Largest `update_sparql` request, in bytes.
+    pub max_update_bytes: usize,
+    /// Largest inline RDF payload (`load_ontology`), in bytes.
+    pub max_batch_bytes: usize,
+    /// Largest file `load_ontology_file` loads in one transaction, in bytes.
+    pub max_load_file_bytes: u64,
 }
 
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
-            write_wait_timeout_secs: default_write_wait_timeout_secs(),
+            write_wait_timeout_secs: 30,
+            allow_destructive_updates: false,
+            max_update_bytes: 1_048_576,
+            max_batch_bytes: 1_048_576,
+            max_load_file_bytes: 67_108_864,
         }
     }
 }
@@ -303,5 +312,16 @@ sync_on_render = false
         assert_eq!(cfg.ingest.write_wait_timeout_secs, 30);
         let cfg: Config = toml::from_str("[ingest]\nwrite_wait_timeout_secs = 5\n").unwrap();
         assert_eq!(cfg.ingest.write_wait_timeout_secs, 5);
+        assert_eq!(cfg.ingest.max_update_bytes, 1_048_576);
+        assert!(!cfg.ingest.allow_destructive_updates);
+        let cfg: Config = toml::from_str(
+            "[ingest]
+allow_destructive_updates = true
+max_update_bytes = 10
+",
+        )
+        .unwrap();
+        assert!(cfg.ingest.allow_destructive_updates);
+        assert_eq!(cfg.ingest.max_update_bytes, 10);
     }
 }

@@ -8,6 +8,8 @@ use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
 use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange, StoreEvent};
+use crate::application::guards::classify_sparql;
+use crate::application::limits::{refuse, take_captured, ToolError};
 use crate::domain::{QueryResult, RdfTerm, SolutionSet, SparqlStore, UpdateOutcome};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -75,23 +77,34 @@ pub fn update_sparql(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Always validate syntax.
-    // For dry_run we still need to parse; the domain trait does it on execute.
-    // We do a lightweight check by attempting to parse, then skipping execution.
     if dry_run {
-        // Validate by calling update on a quick parse — if the store's
-        // update() returns an error on a bad query the caller sees it.
-        // We rely on the adapter to reject bad syntax at parse time.
-        let triples = store
-            .triple_count()
-            .map_err(|e| McpError::internal_error(format!("triple_count: {e}"), None))?;
+        // Parse and classify without running anything. A syntax error is a
+        // `parse_error`; a request this handle would refuse is reported under
+        // `refused` instead of being run.
+        let class = classify_sparql(sparql).map_err(refuse)?;
+        let refused = match store.check_update(sparql) {
+            Ok(()) => None,
+            Err(e) => {
+                // The refusal is reported as data here, not raised.
+                let _ = take_captured();
+                Some(
+                    e.downcast_ref::<ToolError>()
+                        .map(ToolError::to_json)
+                        .unwrap_or_else(|| json!({ "code": "error", "message": e.to_string() })),
+                )
+            }
+        };
+        let graphs: Vec<&str> = class.graphs.iter().map(String::as_str).collect();
         return Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "dry_run": true,
-                "triples_before": triples,
-                "triples_after": triples,
-                "delta": 0,
+                "operations": class.operations,
+                // "" is the default graph.
+                "graphs": graphs,
+                "all_graphs": class.all_graphs,
+                "destructive": class.destructive,
+                "refused": refused,
             }))
             .unwrap(),
         )]));
