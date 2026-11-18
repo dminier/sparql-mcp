@@ -247,7 +247,7 @@ The ledger lives in `urn:sparql-mcp:jobs`, with prefix
 | `ingest_commit` | `job_id` | `require_validation` (false), `allow_empty_replace` (false) | see [Commit](#commit) | `missing_batches`, `validation_required`, `validation_stale`, `empty_replace`, `write_busy` |
 | `ingest_abort` | `job_id` | — | `{state: "aborted", direct_data_kept: bool, kept_seqs?}` | `job_not_found`, `job_not_open` |
 | `ingest_status` | — | `job_id` | one job, or the list of non-finished jobs: `{job_id, state, mode, target, received_seqs (ranges, e.g. "1-30,32"), triples, file?{bytes_read, bytes_total, triples_per_s, eta_s}, validation?}` | `job_not_found` |
-| `ingest_file` | `path` | `target_graph`, `mode` (`direct`), `format` (from the extension), `resume_job`, `force` (false) | `{job_id}` | `file_roots_unset`, `path_outside_roots`, `path_rejected`, `file_too_large`, `source_changed`, `staged_too_large`, `already_loaded` |
+| `ingest_file` | `path` | `target_graph`, `mode` (`direct`), `format` (from the extension), `resume_job`, `force` (false) | `{job_id}` | `file_roots_unset`, `path_outside_roots`, `path_rejected`, `limit_exceeded` (`max_file_bytes`), `source_changed`, `staged_too_large`, `already_loaded` |
 
 *   **Errors.** Every refusal uses the error JSON of the hardening design:
     `{"code", "message", "limit_key"?, "limit"?, "value"?, "line"?,
@@ -293,7 +293,7 @@ The ledger lives in `urn:sparql-mcp:jobs`, with prefix
 4.  **Job total fast path.** The job's triple total plus this batch must stay
     within `max_job_triples_staged` or `max_job_triples_direct`, depending on
     the mode.
-5.  **Write, through `WriteGate::run`.** Inside one Oxigraph transaction:
+5.  **Write, through `PrivilegedStore::exclusive`** (which takes the write gate once, on a blocking thread; the gate is not reentrant, so `WriteGate::run` is never wrapped around a store call). Inside one Oxigraph transaction:
     1.  Re-check steps 1, 2 and 4:
         *   the job is `open` → otherwise `job_not_open`;
         *   there is no record for `(job_id, seq)` → otherwise `duplicate`
