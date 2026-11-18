@@ -19,7 +19,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::application::write_gate::WriteGate;
-use crate::domain::{FileLoadResult, LoadOpts, QueryResult, SparqlStore, UpdateOutcome};
+use crate::domain::{
+    FileLoadResult, LoadOpts, QueryResult, SparqlStore, StoredQuad, UpdateOutcome,
+};
 
 /// Write-gated view of a store, for non-privileged callers.
 pub struct GatedStore {
@@ -85,7 +87,7 @@ macro_rules! gated_impl {
                 &self,
                 content: &[u8],
                 opts: LoadOpts,
-            ) -> Result<(u64, Vec<[String; 3]>)> {
+            ) -> Result<(u64, Vec<StoredQuad>)> {
                 self.gate.run_blocking("load_rdf_with_triples", || {
                     self.inner.load_rdf_with_triples(content, opts)
                 })

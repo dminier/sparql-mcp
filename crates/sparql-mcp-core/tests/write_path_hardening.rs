@@ -61,7 +61,7 @@ impl SparqlStore for SlowStore {
         &self,
         content: &[u8],
         opts: LoadOpts,
-    ) -> Result<(u64, Vec<[String; 3]>)> {
+    ) -> Result<(u64, Vec<sparql_mcp::domain::StoredQuad>)> {
         self.inner.load_rdf_with_triples(content, opts)
     }
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult> {

@@ -10,7 +10,8 @@ pub mod tools;
 pub mod write_gate;
 
 pub use event_sink::{
-    BroadcastEventSink, EventSink, NullEventSink, StoreEvent, SubjectKind, CLASS_TYPE_IRIS,
+    emit_quads, BroadcastEventSink, EventLimits, EventSink, NullEventSink, QuadChange, StoreEvent,
+    SubjectKind, CLASS_TYPE_IRIS,
 };
 pub use gated_store::{build_stores, GatedStore, PrivilegedStore};
 pub use limits::ToolError;

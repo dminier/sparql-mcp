@@ -7,7 +7,7 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::event_sink::{classify_subjects, EventSink, StoreEvent};
+use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange, StoreEvent};
 use crate::domain::{QueryResult, RdfTerm, SolutionSet, SparqlStore, UpdateOutcome};
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -109,24 +109,15 @@ pub fn update_sparql(
     // This is an explicit, documented limitation, not a silent gap:
     // pattern-based updates do not get node-level detail in the viewer in
     // v1 — only ground INSERT DATA / DELETE DATA produce a precise event.
+    // Ground events name the graph each quad actually went to, which is not
+    // necessarily the active one.
     match &outcome {
         UpdateOutcome::Ground {
             inserted, deleted, ..
         } => {
-            if !inserted.is_empty() {
-                event_sink.emit(StoreEvent::Insert {
-                    graph: graph.clone(),
-                    kinds: classify_subjects(inserted),
-                    triples: inserted.clone(),
-                });
-            }
-            if !deleted.is_empty() {
-                event_sink.emit(StoreEvent::Delete {
-                    graph: graph.clone(),
-                    kinds: classify_subjects(deleted),
-                    triples: deleted.clone(),
-                });
-            }
+            let limits = EventLimits::default();
+            emit_quads(event_sink, QuadChange::Inserted, inserted, limits);
+            emit_quads(event_sink, QuadChange::Deleted, deleted, limits);
         }
         UpdateOutcome::Pattern {
             triples_before,
@@ -140,16 +131,26 @@ pub fn update_sparql(
         }
     }
 
-    let before = outcome.triples_before();
-    let after = outcome.triples_after();
+    // `triples_before` / `triples_after` are whole-store sizes: only a
+    // pattern update has them (it already scanned), and they are `null` for a
+    // ground update, which no longer scans. `delta` is exact in both cases.
+    let mut payload = json!({
+        "status": "ok",
+        "triples_before": outcome.triples_before(),
+        "triples_after": outcome.triples_after(),
+        "delta": outcome.delta(),
+    });
+    if let UpdateOutcome::Ground {
+        inserted_new,
+        removed_existing,
+        ..
+    } = &outcome
+    {
+        payload["inserted_new"] = json!(inserted_new);
+        payload["removed_existing"] = json!(removed_existing);
+    }
     Ok(CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(&json!({
-            "status": "ok",
-            "triples_before": before,
-            "triples_after": after,
-            "delta": after as i64 - before as i64,
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&payload).unwrap(),
     )]))
 }
 

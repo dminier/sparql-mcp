@@ -1,12 +1,12 @@
 //! OxigraphAdapter — implements SparqlStore using Oxigraph's embedded store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::model::{GraphName, GraphNameRef, NamedNode};
+use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, Quad, Term};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use sha2::{Digest, Sha256};
@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::domain::{
     FileLoadResult, InputFormat, LoadOpts, QueryResult, RdfTerm, SolutionSet, SparqlStore,
-    UpdateOutcome,
+    StoredQuad, UpdateOutcome,
 };
 
 // Named graph holding SHA-256 records for idempotent file loading.
@@ -22,11 +22,18 @@ const META_GRAPH: &str = "urn:hkb:meta:loaded-files";
 const META_SHA256: &str = "urn:hkb:meta:sha256";
 const META_PATH: &str = "urn:hkb:meta:path";
 const META_FILE: &str = "urn:hkb:meta:LoadedFile";
+/// The graph a loaded file went into (empty string for the default graph).
+const META_TARGET: &str = "urn:hkb:meta:graph";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 pub struct OxigraphAdapter {
     store: Store,
+    /// Test-only count of whole-store scans (`Store::len`), so a test can
+    /// assert that ground writes cost no scan.
+    #[cfg(test)]
+    len_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl OxigraphAdapter {
@@ -45,14 +52,29 @@ impl OxigraphAdapter {
                 path.display()
             )
         })?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     /// Create a non-persistent in-memory store (for tests).
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self {
-            store: Store::new()?,
-        })
+        Ok(Self::from_store(Store::new()?))
+    }
+
+    fn from_store(store: Store) -> Self {
+        Self {
+            store,
+            #[cfg(test)]
+            len_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The only place that calls `Store::len`, which Oxigraph documents as
+    /// "executes a full scan". Ground writes and loads never call it.
+    fn store_len(&self) -> Result<u64> {
+        #[cfg(test)]
+        self.len_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.store.len()? as u64)
     }
 }
 
@@ -83,37 +105,62 @@ impl SparqlStore for OxigraphAdapter {
             .ok()
             .and_then(|parsed| ground_quads(&parsed));
 
-        let before = self.store.len()? as u64;
-        SparqlEvaluator::new()
-            .parse_update(sparql)?
-            .on_store(&self.store)
-            .execute()?;
-        let after = self.store.len()? as u64;
-
         match ground {
-            Some((inserted, deleted)) => Ok(UpdateOutcome::Ground {
-                inserted,
-                deleted,
-                triples_before: before,
-                triples_after: after,
-            }),
-            None => Ok(UpdateOutcome::Pattern {
-                triples_before: before,
-                triples_after: after,
-            }),
+            Some(ground) => {
+                // A ground update names every quad it touches, so its effect
+                // is counted with `contains` and never needs a whole-store
+                // scan. Duplicate quads in the request count once.
+                let mut inserted_new = 0u64;
+                for q in ground.inserted.iter().collect::<HashSet<_>>() {
+                    if !self.store.contains(q)? {
+                        inserted_new += 1;
+                    }
+                }
+                let mut removed_existing = 0u64;
+                for q in ground.deleted.iter().collect::<HashSet<_>>() {
+                    if self.store.contains(q)? {
+                        removed_existing += 1;
+                    }
+                }
+                SparqlEvaluator::new()
+                    .parse_update(sparql)?
+                    .on_store(&self.store)
+                    .execute()?;
+                Ok(UpdateOutcome::Ground {
+                    inserted: ground.inserted.iter().map(to_stored).collect(),
+                    deleted: ground.deleted.iter().map(to_stored).collect(),
+                    inserted_new,
+                    removed_existing,
+                })
+            }
+            None => {
+                // A pattern update only reports aggregate sizes, which is a
+                // full scan before and after. It is rare and small.
+                let before = self.store_len()?;
+                SparqlEvaluator::new()
+                    .parse_update(sparql)?
+                    .on_store(&self.store)
+                    .execute()?;
+                let after = self.store_len()?;
+                Ok(UpdateOutcome::Pattern {
+                    triples_before: before,
+                    triples_after: after,
+                })
+            }
         }
     }
 
     fn load_rdf(&self, content: &[u8], opts: LoadOpts) -> Result<u64> {
-        self.load_rdf_impl(content, opts).map(|(delta, _)| delta)
+        self.load_rdf_impl(content, opts, &[])
+            .map(|(inserted_new, _)| inserted_new)
     }
 
     fn load_rdf_with_triples(
         &self,
         content: &[u8],
         opts: LoadOpts,
-    ) -> Result<(u64, Vec<[String; 3]>)> {
-        self.load_rdf_impl(content, opts)
+    ) -> Result<(u64, Vec<StoredQuad>)> {
+        self.load_rdf_impl(content, opts, &[])
     }
 
     fn load_rdf_file(&self, path: &Path, opts: LoadOpts, force: bool) -> Result<FileLoadResult> {
@@ -125,24 +172,26 @@ impl SparqlStore for OxigraphAdapter {
         let bytes_read = bytes.len();
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
-        let triples_before = self.store.len()? as u64;
+        // The ledger entry is keyed by (file hash, target graph): the same
+        // file loaded into two graphs is two loads.
+        let target = opts.graph_iri.clone().unwrap_or_default();
 
-        if !force && self.file_already_loaded(&sha256)? {
+        if !force && self.file_already_loaded(&sha256, &target)? {
             return Ok(FileLoadResult {
                 path: path_str,
                 format: effective_format,
                 bytes_read,
                 sha256,
                 skipped: true,
-                triples_before,
-                triples_after: triples_before,
+                inserted_new: 0,
                 triples: Vec::new(),
             });
         }
 
-        let (_delta, triples) = self.load_rdf_impl(&bytes, opts)?;
-        self.record_loaded_file(&sha256, &path_str)?;
-        let triples_after = self.store.len()? as u64;
+        // The ledger entry is written in the same transaction as the data,
+        // so a load is never recorded without having landed, or vice versa.
+        let ledger = loaded_file_quads(&sha256, &target, &path_str)?;
+        let (inserted_new, triples) = self.load_rdf_impl(&bytes, opts, &ledger)?;
 
         Ok(FileLoadResult {
             path: path_str,
@@ -150,8 +199,7 @@ impl SparqlStore for OxigraphAdapter {
             bytes_read,
             sha256,
             skipped: false,
-            triples_before,
-            triples_after,
+            inserted_new,
             triples,
         })
     }
@@ -203,7 +251,7 @@ impl SparqlStore for OxigraphAdapter {
     }
 
     fn triple_count(&self) -> Result<u64> {
-        Ok(self.store.len()? as u64)
+        self.store_len()
     }
 
     fn load_ontology_dir(&self, dir: &Path) -> Result<usize> {
@@ -237,14 +285,25 @@ impl SparqlStore for OxigraphAdapter {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 impl OxigraphAdapter {
-    /// Parse `content` and insert it, returning both the delta and every
-    /// triple parsed (N-Triples-encoded) — `load_rdf` and
-    /// `load_rdf_with_triples` are thin wrappers around this so both stay
-    /// in sync.
-    fn load_rdf_impl(&self, content: &[u8], opts: LoadOpts) -> Result<(u64, Vec<[String; 3]>)> {
-        let before = self.store.len()? as u64;
+    /// Parse `content` completely, then write it, plus the `extra` quads (a
+    /// ledger entry), in **one** transaction. A syntax error therefore leaves
+    /// nothing behind.
+    ///
+    /// Returns how many parsed quads were not in the store before, and every
+    /// parsed quad. `Transaction::contains` sees the transaction's own
+    /// writes, so a quad repeated in the payload counts once, and the count
+    /// costs no whole-store scan.
+    ///
+    /// Blank nodes are renamed per call: two separate calls that both use
+    /// `_:b0` are two different nodes, never silently merged.
+    fn load_rdf_impl(
+        &self,
+        content: &[u8],
+        opts: LoadOpts,
+        extra: &[Quad],
+    ) -> Result<(u64, Vec<StoredQuad>)> {
         let format = to_oxigraph_format(opts.format);
-        let mut parser = RdfParser::from_format(format);
+        let mut parser = RdfParser::from_format(format).rename_blank_nodes();
         if let Some(base) = &opts.base_iri {
             parser = parser.with_base_iri(base)?;
         }
@@ -253,19 +312,35 @@ impl OxigraphAdapter {
             parser = parser.with_default_graph(GraphName::NamedNode(node));
         }
 
-        let mut triples = Vec::new();
-        for quad in parser.for_reader(content) {
-            let quad = quad?;
-            triples.push(quad_to_triple(&quad));
-            self.store.insert(quad.as_ref())?;
-        }
+        let quads: Vec<Quad> = parser
+            .for_reader(content)
+            .collect::<std::result::Result<_, _>>()?;
 
-        let after = self.store.len()? as u64;
-        Ok((after.saturating_sub(before), triples))
+        let mut tx = self.store.start_transaction()?;
+        let mut inserted_new = 0u64;
+        for q in &quads {
+            if !tx.contains(q)? {
+                inserted_new += 1;
+            }
+            tx.insert(q);
+        }
+        for q in extra {
+            tx.insert(q);
+        }
+        tx.commit()?;
+
+        Ok((inserted_new, quads.iter().map(to_stored).collect()))
     }
 
-    fn file_already_loaded(&self, hash: &str) -> Result<bool> {
-        let q = format!("ASK {{ GRAPH <{META_GRAPH}> {{ ?f <{META_SHA256}> \"{hash}\" }} }}");
+    /// Whether `hash` was already loaded into `target` (`""` = default graph).
+    /// Entries written before the ledger was keyed by graph have no
+    /// `meta:graph` and never match, so such a file is reloaded once, which is
+    /// idempotent.
+    fn file_already_loaded(&self, hash: &str, target: &str) -> Result<bool> {
+        let target = target.replace('\\', "\\\\").replace('"', "\\\"");
+        let q = format!(
+            "ASK {{ GRAPH <{META_GRAPH}> {{ ?f <{META_SHA256}> \"{hash}\" ; <{META_TARGET}> \"{target}\" }} }}"
+        );
         match SparqlEvaluator::new()
             .parse_query(&q)?
             .on_store(&self.store)
@@ -275,81 +350,103 @@ impl OxigraphAdapter {
             _ => Ok(false),
         }
     }
+}
 
-    fn record_loaded_file(&self, hash: &str, path: &str) -> Result<()> {
-        // `path` is a filesystem path, not a pre-escaped Turtle literal —
-        // on native Windows it always contains `\`, which Turtle's string
-        // grammar treats as the start of an escape sequence (breaking the
-        // parse on anything but `\\`, `\"`, `\uXXXX`, …). Escape `\` and
-        // `"` before embedding it.
-        let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
-        let turtle = format!(
-            "@prefix meta: <urn:hkb:meta:> .\n\
-             <urn:hkb:meta:file:{hash}> a <{META_FILE}> ;\n\
-                 <{META_SHA256}> \"{hash}\" ;\n\
-                 <{META_PATH}> \"{escaped_path}\" .\n"
-        );
-        let graph_node = NamedNode::new(META_GRAPH)?;
-        let parser = RdfParser::from_format(RdfFormat::Turtle)
-            .with_default_graph(GraphName::NamedNode(graph_node));
-        self.store.load_from_reader(parser, turtle.as_bytes())?;
-        Ok(())
-    }
+/// The ledger entry for one loaded file, as quads in the ledger graph. Built
+/// directly as terms, not as Turtle text, so a Windows path with `\` needs no
+/// escaping.
+fn loaded_file_quads(hash: &str, target: &str, path: &str) -> Result<Vec<Quad>> {
+    let target_hash = format!("{:x}", Sha256::digest(target.as_bytes()));
+    let subject = NamedNode::new(format!("urn:hkb:meta:file:{hash}:{target_hash}"))?;
+    let graph = GraphName::NamedNode(NamedNode::new(META_GRAPH)?);
+    let entry = |predicate: &str, object: Term| -> Result<Quad> {
+        Ok(Quad::new(
+            subject.clone(),
+            NamedNode::new(predicate)?,
+            object,
+            graph.clone(),
+        ))
+    };
+    Ok(vec![
+        entry(RDF_TYPE, Term::NamedNode(NamedNode::new(META_FILE)?))?,
+        entry(META_SHA256, Literal::new_simple_literal(hash).into())?,
+        entry(META_PATH, Literal::new_simple_literal(path).into())?,
+        entry(META_TARGET, Literal::new_simple_literal(target).into())?,
+    ])
 }
 
 // ── Update classification ─────────────────────────────────────────────────────
 
-/// If `update` consists solely of ground `INSERT DATA` / `DELETE DATA`
-/// operations (no `WHERE` pattern), return the literal quads inserted and
-/// deleted, each encoded as an N-Triples term string. Any other operation
-/// (`INSERT/DELETE … WHERE`, `LOAD`, `CLEAR`, `CREATE`, `DROP`, `ADD`,
-/// `MOVE`, `COPY`) makes the whole update non-ground: `None`.
-/// (inserted triples, deleted triples), each N-Triples-encoded.
-type GroundTriples = (Vec<[String; 3]>, Vec<[String; 3]>);
+/// The quads of a ground update, as Oxigraph quads.
+struct GroundQuads {
+    inserted: Vec<Quad>,
+    deleted: Vec<Quad>,
+}
 
-fn ground_quads(update: &spargebra::Update) -> Option<GroundTriples> {
+/// If `update` consists solely of ground `INSERT DATA` / `DELETE DATA`
+/// operations (no `WHERE` pattern), return the quads inserted and deleted,
+/// each with its own graph. Any other operation (`INSERT/DELETE … WHERE`,
+/// `LOAD`, `CLEAR`, `CREATE`, `DROP`, `ADD`, `MOVE`, `COPY`) makes the whole
+/// update non-ground: `None`.
+fn ground_quads(update: &spargebra::Update) -> Option<GroundQuads> {
+    use spargebra::term::{GraphName as SparqlGraph, GroundTerm};
+
+    let graph = |g: &SparqlGraph| match g {
+        SparqlGraph::NamedNode(n) => GraphName::NamedNode(n.clone()),
+        SparqlGraph::DefaultGraph => GraphName::DefaultGraph,
+    };
     let mut inserted = Vec::new();
     let mut deleted = Vec::new();
     for op in &update.operations {
         match op {
             // `INSERT DATA` allows blank nodes (`spargebra::term::Quad`);
             // `DELETE DATA` forbids them per the SPARQL 1.1 grammar, so
-            // spargebra gives it the narrower `GroundQuad` type instead —
-            // both have the same `subject`/`predicate`/`object` shape.
+            // spargebra gives it the narrower `GroundQuad` type instead.
             spargebra::GraphUpdateOperation::InsertData { data } => {
-                inserted.extend(data.iter().map(|q| {
-                    [
-                        q.subject.to_string(),
-                        q.predicate.to_string(),
-                        q.object.to_string(),
-                    ]
-                }));
+                for q in data {
+                    inserted.push(Quad::new(
+                        q.subject.clone(),
+                        q.predicate.clone(),
+                        q.object.clone(),
+                        graph(&q.graph_name),
+                    ));
+                }
             }
             spargebra::GraphUpdateOperation::DeleteData { data } => {
-                deleted.extend(data.iter().map(|q| {
-                    [
-                        q.subject.to_string(),
-                        q.predicate.to_string(),
-                        q.object.to_string(),
-                    ]
-                }));
+                for q in data {
+                    let object = match &q.object {
+                        GroundTerm::NamedNode(n) => Term::NamedNode(n.clone()),
+                        GroundTerm::Literal(l) => Term::Literal(l.clone()),
+                        #[allow(unreachable_patterns)]
+                        _ => return None,
+                    };
+                    deleted.push(Quad::new(
+                        q.subject.clone(),
+                        q.predicate.clone(),
+                        object,
+                        graph(&q.graph_name),
+                    ));
+                }
             }
             _ => return None,
         }
     }
-    Some((inserted, deleted))
+    Some(GroundQuads { inserted, deleted })
 }
 
-/// Render an RDF-parser quad's subject/predicate/object as N-Triples term
-/// strings (`Display` on Oxigraph's term types already produces this
-/// syntax — see `convert_query_results`'s `Graph` branch above for the
-/// same pattern).
-fn quad_to_triple(q: &oxigraph::model::Quad) -> [String; 3] {
-    [
-        q.subject.to_string(),
-        q.predicate.to_string(),
-        q.object.to_string(),
-    ]
+/// A quad with each term in its N-Triples encoding (`Display` on Oxigraph's
+/// term types already produces that syntax) and its graph name.
+fn to_stored(q: &Quad) -> StoredQuad {
+    StoredQuad {
+        s: q.subject.to_string(),
+        p: q.predicate.to_string(),
+        o: q.object.to_string(),
+        g: match &q.graph_name {
+            GraphName::NamedNode(n) => Some(n.as_str().to_string()),
+            GraphName::BlankNode(b) => Some(b.to_string()),
+            GraphName::DefaultGraph => None,
+        },
+    }
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -402,5 +499,148 @@ fn convert_term(term: &oxigraph::model::Term) -> RdfTerm {
             datatype: Some(l.datatype().as_str().to_string()),
             lang: l.language().map(str::to_string),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn adapter() -> OxigraphAdapter {
+        OxigraphAdapter::open_in_memory().unwrap()
+    }
+
+    fn scans(a: &OxigraphAdapter) -> usize {
+        a.len_calls.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn ground_writes_and_loads_never_scan_the_store() {
+        let a = adapter();
+        a.load_rdf(
+            b"<urn:s> <urn:p> <urn:o> .",
+            LoadOpts {
+                format: InputFormat::NTriples,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        a.update_with_outcome("INSERT DATA { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        a.update_with_outcome("DELETE DATA { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        assert_eq!(scans(&a), 0, "a ground write called Store::len");
+
+        // A pattern update still needs the aggregate sizes: two scans.
+        a.update_with_outcome("DELETE WHERE { ?s ?p ?o }").unwrap();
+        assert_eq!(scans(&a), 2);
+    }
+
+    #[test]
+    fn ground_update_counts_are_exact_and_name_the_graph() {
+        let a = adapter();
+        let out = a
+            .update_with_outcome(
+                "INSERT DATA { GRAPH <urn:g> { <urn:s> <urn:p> <urn:o> . <urn:s> <urn:p> <urn:o> } \
+                 <urn:d> <urn:p> <urn:o> }",
+            )
+            .unwrap();
+        match out {
+            UpdateOutcome::Ground {
+                inserted,
+                inserted_new,
+                ..
+            } => {
+                // The repeated quad counts once, and the default-graph quad is
+                // a separate quad.
+                assert_eq!(inserted_new, 2);
+                assert!(inserted.iter().any(|q| q.g.as_deref() == Some("urn:g")));
+                assert!(inserted.iter().any(|q| q.g.is_none()));
+            }
+            other => panic!("expected ground, got {other:?}"),
+        }
+        // Inserting the same data again adds nothing.
+        match a
+            .update_with_outcome("INSERT DATA { <urn:d> <urn:p> <urn:o> }")
+            .unwrap()
+        {
+            UpdateOutcome::Ground { inserted_new, .. } => assert_eq!(inserted_new, 0),
+            other => panic!("expected ground, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_syntax_error_leaves_nothing_behind() {
+        let a = adapter();
+        let mut doc = String::new();
+        for n in 0..100 {
+            doc.push_str(&format!("<urn:s:{n}> <urn:p> <urn:o> .\n"));
+        }
+        doc.push_str("<urn:broken> <urn:p> .\n"); // missing object
+        let err = a.load_rdf(
+            doc.as_bytes(),
+            LoadOpts {
+                format: InputFormat::NTriples,
+                ..Default::default()
+            },
+        );
+        assert!(err.is_err());
+        assert_eq!(a.store.len().unwrap(), 0, "a partial load was written");
+    }
+
+    #[test]
+    fn blank_node_labels_are_not_merged_across_calls() {
+        let a = adapter();
+        let load = |ttl: &str| {
+            a.load_rdf(
+                ttl.as_bytes(),
+                LoadOpts {
+                    format: InputFormat::NTriples,
+                    graph_iri: Some("urn:g".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        load("_:b0 <urn:name> \"first\" .");
+        load("_:b0 <urn:name> \"second\" .");
+        let rows = match a
+            .query("SELECT DISTINCT ?s WHERE { GRAPH <urn:g> { ?s <urn:name> ?n } }")
+            .unwrap()
+        {
+            QueryResult::Solutions(s) => s.rows.len(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(rows, 2, "_:b0 from two calls was merged into one node");
+    }
+
+    #[test]
+    fn the_same_file_is_a_separate_load_per_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.nt");
+        fs::write(&path, "<urn:s> <urn:p> <urn:o> .\n").unwrap();
+        let a = adapter();
+        let load = |graph: &str| {
+            a.load_rdf_file(
+                &path,
+                LoadOpts {
+                    format: InputFormat::NTriples,
+                    graph_iri: Some(graph.into()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        };
+        assert!(!load("urn:g1").skipped);
+        assert!(load("urn:g1").skipped, "same file, same graph");
+        let second = load("urn:g2");
+        assert!(
+            !second.skipped,
+            "same file into another graph is a new load"
+        );
+        assert_eq!(second.inserted_new, 1);
+        assert_eq!(scans(&a), 0);
     }
 }
