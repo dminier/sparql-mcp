@@ -3,6 +3,7 @@
 //! No infrastructure imports here.  Each function receives `Arc<dyn SparqlStore>`
 //! or `Arc<dyn DocStore>` and returns `CallToolResult`.
 
+pub mod clock;
 pub mod event_sink;
 pub mod gated_store;
 pub mod guards;

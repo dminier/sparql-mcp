@@ -52,3 +52,4 @@ bind    = "127.0.0.1:7878"
 # max_literal_bytes        = 65536
 # event_max_triples        = 5000       # triples per viewer event
 # event_changed_threshold  = 50000      # above this, one `changed` event instead
+# sweep_interval_secs      = 300        # how often idle jobs expire and old ones are purged

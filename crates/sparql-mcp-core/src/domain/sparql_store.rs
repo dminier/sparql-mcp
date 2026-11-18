@@ -237,6 +237,20 @@ pub struct BatchWrite {
     pub counters: Vec<Counter>,
     /// Record, inside the transaction, how many of `quads` were new.
     pub record_counts: Option<RecordCounts>,
+    /// Single-valued properties to set, replacing any previous value.
+    pub replace: Vec<Replace>,
+}
+
+/// Set `(subject, predicate)` in `graph` to `object`: every quad with that
+/// subject and predicate in that graph is removed, then `object` is added.
+/// `object` is an N-Triples term. Used for a timestamp that is updated in the
+/// same transaction as the write it stamps.
+#[derive(Debug, Clone)]
+pub struct Replace {
+    pub subject: String,
+    pub predicate: String,
+    pub graph: String,
+    pub object: String,
 }
 
 /// A write is *the same* when `identity` is already in the store, and a

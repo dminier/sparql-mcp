@@ -126,6 +126,9 @@ pub struct IngestConfig {
     pub event_max_triples: usize,
     /// More triples than this to one graph are reported as one `Changed`.
     pub event_changed_threshold: usize,
+    /// How often the ingestion maintenance expires idle jobs and purges old
+    /// ones, in seconds.
+    pub sweep_interval_secs: u64,
 }
 
 impl Default for IngestConfig {
@@ -151,6 +154,7 @@ impl Default for IngestConfig {
             max_literal_bytes: 65_536,
             event_max_triples: 5_000,
             event_changed_threshold: 50_000,
+            sweep_interval_secs: 300,
         }
     }
 }

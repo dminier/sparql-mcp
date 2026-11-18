@@ -399,6 +399,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
 
+            // Expires idle ingestion jobs while the server runs; dropped (and
+            // stopped) when it returns.
+            let _ingest_maintenance = srv.start_ingest_maintenance();
             srv.serve_stdio().await?;
         }
         Cmd::Install { .. } => unreachable!("handled above"),

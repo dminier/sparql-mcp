@@ -16,6 +16,9 @@
 //! All text that comes from outside is put in SPARQL through
 //! [`string_literal`] and [`iri`].
 
+mod maintenance;
+pub use maintenance::{Maintenance, Recovery, SweepReport};
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -25,16 +28,16 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+use crate::application::clock::{iso, iso_now, now_secs, parse_iso};
 use crate::application::event_sink::{emit_quads, EventLimits, EventSink, QuadChange, StoreEvent};
 use crate::application::gated_store::PrivilegedStore;
 use crate::application::guards::is_protected;
 use crate::application::limits::ToolError;
 use crate::application::sparql_text::{iri, string_literal};
-use crate::application::tools::project::iso_now;
 use crate::config::IngestConfig;
 use crate::domain::{
     BatchRefusal, BatchWrite, Counter, Idempotency, InputFormat, QueryResult, RdfTerm,
-    RecordCounts, SparqlStore, StoredQuad,
+    RecordCounts, Replace, SparqlStore, StoredQuad,
 };
 
 /// The protected graph holding every job's manifest and batch records.
@@ -606,6 +609,15 @@ impl IngestService {
                 out[key] = json!(v);
             }
         }
+        // How long an unfinished job has been idle, and how long it has left.
+        let job_state = m.get("state").and_then(|s| JobState::from_iri(s));
+        if matches!(job_state, Some(JobState::Open | JobState::Interrupted)) {
+            if let Some(last) = m.get("lastActivity").and_then(|t| parse_iso(t)) {
+                let idle = now_secs().saturating_sub(last);
+                out["idle_secs"] = json!(idle);
+                out["expires_in_secs"] = json!(self.cfg.job_idle_ttl_secs.saturating_sub(idle));
+            }
+        }
         if let Some(n) = m.get("expectedBatches").and_then(|n| n.parse::<u32>().ok()) {
             out["expected_batches"] = json!(n);
         }
@@ -753,7 +765,13 @@ impl IngestService {
         // Fast path: this batch was already accepted.
         if let Some(rec) = self.read_record(store, id, req.seq)? {
             return if rec.sha256 == sha {
-                let (batches, triples) = self.totals(&m);
+                self.touch(id);
+                // `m` was read before this record was seen. The record and the
+                // job's counters are written in one transaction, so a manifest
+                // read *after* the record includes it; the earlier one may not
+                // (a retry that overlaps the original would report no triples).
+                let fresh = self.manifest(store, id)?.unwrap_or_else(|| m.clone());
+                let (batches, triples) = self.totals(&fresh);
                 Ok(self.batch_reply(id, req.seq, mode, &rec, true, (batches, triples)))
             } else {
                 Err(seq_conflict(id, req.seq))
@@ -827,6 +845,12 @@ impl IngestService {
                     max: Some(u64::from(self.cfg.max_job_batches)),
                 },
             ],
+            replace: vec![Replace {
+                subject: job.clone(),
+                predicate: format!("{SMJ}lastActivity"),
+                graph: JOBS_GRAPH.to_string(),
+                object: typed(&iso_now(), "dateTime"),
+            }],
             record_counts: Some(RecordCounts {
                 subject: rec_iri,
                 graph: JOBS_GRAPH.to_string(),
@@ -874,6 +898,7 @@ impl IngestService {
                 let (batches, triples) = self.totals(&m);
                 match self.read_record(store, id, seq)? {
                     Some(rec) if rec.sha256 == sha => {
+                        self.touch(id);
                         Ok(self.batch_reply(id, seq, mode, &rec, true, (batches, triples)))
                     }
                     _ => Err(seq_conflict(id, seq)),

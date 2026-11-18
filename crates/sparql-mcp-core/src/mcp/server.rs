@@ -88,6 +88,20 @@ impl SparqlMcpServer {
         }
     }
 
+    /// The ingestion service, for tests and tools that need to run its
+    /// maintenance with a chosen clock.
+    #[doc(hidden)]
+    pub fn ingest_service(&self) -> &Arc<IngestService> {
+        &self.ingest
+    }
+
+    /// Start expiring idle ingestion jobs and purging old ones. Call once the
+    /// server is fully configured; keep the handle for as long as the server
+    /// runs, because dropping it stops the maintenance.
+    pub fn start_ingest_maintenance(&self) -> crate::application::ingest::Maintenance {
+        self.ingest.start_maintenance()
+    }
+
     /// Use the `[ingest]` settings for the ingestion jobs' limits.
     pub fn with_ingest_config(mut self, cfg: IngestConfig) -> Self {
         self.ingest_cfg = cfg;

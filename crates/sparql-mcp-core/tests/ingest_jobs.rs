@@ -1564,3 +1564,389 @@ async fn a_batch_racing_a_commit_is_in_the_commit_or_refused_never_lost() {
         assert_eq!(body["triples"].as_u64().unwrap(), landed * 5);
     }
 }
+
+// ── expiry, retention, heartbeat and recovery ────────────────────────────────
+//
+// The sweep and recovery functions take the current time as a parameter, so
+// these tests move the clock instead of sleeping: "now" is a number of seconds
+// after the real now, and a job created by the test is idle for exactly that long.
+
+use sparql_mcp::application::clock::now_secs;
+
+fn svc(server: &SparqlMcpServer) -> Arc<sparql_mcp::application::ingest::IngestService> {
+    server.ingest_service().clone()
+}
+
+/// Set a job's `lastActivity` to a fixed old instant, directly in the ledger.
+fn backdate(raw: &Arc<dyn SparqlStore>, id: &str) {
+    raw.update(&format!(
+        "DELETE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#lastActivity> ?t }} }} \
+         INSERT {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#lastActivity> \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> }} }} \
+         WHERE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#lastActivity> ?t }} }}"
+    ))
+    .unwrap();
+}
+
+async fn status(server: &SparqlMcpServer, id: &str) -> Value {
+    ok(server, "ingest_status", json!({ "job_id": id })).await
+}
+
+#[tokio::test]
+async fn an_accepted_batch_and_a_retry_refresh_the_idle_clock_but_a_refused_one_does_not() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+
+    backdate(&raw, &id);
+    assert!(status(&server, &id).await["idle_secs"].as_u64().unwrap() > 1_000_000);
+    send(&server, &id, 1, nt(1, 2)).await;
+    assert!(
+        status(&server, &id).await["idle_secs"].as_u64().unwrap() < 5,
+        "an accepted batch must refresh lastActivity"
+    );
+
+    // A retry of the same batch shows the agent is still there.
+    backdate(&raw, &id);
+    let again = send(&server, &id, 1, nt(1, 2)).await;
+    assert_eq!(again["duplicate"], true);
+    assert!(
+        status(&server, &id).await["idle_secs"].as_u64().unwrap() < 5,
+        "a duplicate must refresh lastActivity"
+    );
+
+    // A refused batch (a conflict) does not.
+    backdate(&raw, &id);
+    refused(
+        &server,
+        "ingest_batch",
+        json!({ "job_id": id, "seq": 1, "data": nt(2, 2) }),
+    )
+    .await;
+    assert!(status(&server, &id).await["idle_secs"].as_u64().unwrap() > 1_000_000);
+}
+
+#[tokio::test]
+async fn status_says_how_long_an_unfinished_job_has_left() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 3_600,
+        ..IngestConfig::default()
+    };
+    let (server, _raw) = server_with(cfg);
+    let (id, _) = begin(&server, json!({})).await;
+    let s = status(&server, &id).await;
+    assert!(s["idle_secs"].as_u64().unwrap() < 5);
+    let left = s["expires_in_secs"].as_u64().unwrap();
+    assert!((3_590..=3_600).contains(&left), "{left}");
+
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    let s = status(&server, &id).await;
+    assert!(
+        s.get("idle_secs").is_none() && s.get("expires_in_secs").is_none(),
+        "a finished job does not expire: {s}"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_job_expires_and_its_staging_graph_goes_with_it() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 3_600,
+        ..IngestConfig::default()
+    };
+    let (server, raw) = server_with(cfg);
+    let (idle, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+    send(&server, &idle, 1, nt(1, 4)).await;
+    let (_fresh, _) = begin(&server, json!({})).await;
+
+    let base = now_secs();
+    // Just inside the ttl: nothing expires. (The test jobs were last active "now".)
+    let r = svc(&server).sweep(base + 3_590).unwrap();
+    assert!(r.expired.is_empty(), "{r:?}");
+    assert!(graph_has(&raw, &staging, "<urn:s:1:0>"));
+
+    // Past it: both are idle for more than an hour (the clock moved, not the jobs).
+    let r = svc(&server).sweep(base + 3_700).unwrap();
+    assert_eq!(r.expired.len(), 2, "{r:?}");
+    let s = status(&server, &idle).await;
+    assert_eq!(s["state"], "expired");
+    assert!(s["ended"].as_str().is_some());
+    assert_eq!(
+        count_in(&raw, &staging),
+        0,
+        "an expired job's staging graph was not dropped"
+    );
+    assert_eq!(count_in(&raw, ACTIVE), 0);
+
+    // Expired jobs are closed.
+    let b = refused(
+        &server,
+        "ingest_batch",
+        json!({ "job_id": idle, "seq": 2, "data": nt(2, 1) }),
+    )
+    .await;
+    assert_eq!(b["code"], "job_not_open");
+    assert!(b["message"].as_str().unwrap().contains("expired"));
+    let b = refused(&server, "ingest_commit", json!({ "job_id": idle })).await;
+    assert_eq!(b["code"], "job_not_open");
+    // And they no longer count against max_open_jobs or show as unfinished.
+    let list = ok(&server, "ingest_status", json!({})).await;
+    assert!(list["jobs"].as_array().unwrap().is_empty(), "{list}");
+}
+
+#[tokio::test]
+async fn a_direct_job_that_expires_keeps_the_data_it_already_wrote() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 60,
+        ..IngestConfig::default()
+    };
+    let (server, raw) = server_with(cfg);
+    let (id, _) = begin(&server, json!({ "mode": "direct" })).await;
+    send(&server, &id, 1, nt(1, 3)).await;
+    let r = svc(&server).sweep(now_secs() + 120).unwrap();
+    assert_eq!(r.expired, vec![id.clone()]);
+    assert_eq!(status(&server, &id).await["state"], "expired");
+    assert_eq!(
+        count_in(&raw, ACTIVE),
+        3,
+        "a direct job's accepted batches must stay"
+    );
+}
+
+#[tokio::test]
+async fn running_jobs_are_never_expired_and_interrupted_ones_are() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 60,
+        ..IngestConfig::default()
+    };
+    let (server, raw) = server_with(cfg);
+    let (running, _) = begin(&server, json!({})).await;
+    let (interrupted, _) = begin(&server, json!({})).await;
+    for (id, state) in [(&running, "running"), (&interrupted, "interrupted")] {
+        raw.update(&format!(
+            "DELETE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> ?s }} }} \
+             INSERT {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> <urn:sparql-mcp:jobs#{state}> }} }} \
+             WHERE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> ?s }} }}"
+        ))
+        .unwrap();
+    }
+    let r = svc(&server).sweep(now_secs() + 3_600).unwrap();
+    assert_eq!(r.expired, vec![interrupted.clone()]);
+    assert_eq!(status(&server, &running).await["state"], "running");
+    assert_eq!(status(&server, &interrupted).await["state"], "expired");
+}
+
+#[tokio::test]
+async fn finished_jobs_are_purged_after_the_retention_period_and_not_before() {
+    let cfg = IngestConfig {
+        job_retention_secs: 1_000,
+        job_idle_ttl_secs: 1_000_000,
+        ..IngestConfig::default()
+    };
+    let (server, raw) = server_with(cfg);
+    let (done, _) = begin(&server, json!({})).await;
+    send(&server, &done, 1, nt(1, 3)).await;
+    send(&server, &done, 2, nt(2, 3)).await;
+    ok(&server, "ingest_commit", json!({ "job_id": done })).await;
+    let (open, _) = begin(&server, json!({})).await;
+    let base = now_secs();
+
+    // Inside the retention period: everything is kept.
+    let r = svc(&server).sweep(base + 900).unwrap();
+    assert!(r.purged.is_empty(), "{r:?}");
+    assert_eq!(status(&server, &done).await["state"], "committed");
+
+    // After it: the finished job's manifest and batch records are gone.
+    let r = svc(&server).sweep(base + 1_100).unwrap();
+    assert_eq!(r.purged, vec![done.clone()]);
+    let e = refused(&server, "ingest_status", json!({ "job_id": done })).await;
+    assert_eq!(e["code"], "job_not_found");
+    assert!(
+        !ask(&raw, &format!(
+            "ASK {{ GRAPH <urn:sparql-mcp:jobs> {{ ?s ?p ?o FILTER(STRSTARTS(STR(?s), \"urn:sparql-mcp:job:{done}\")) }} }}"
+        )),
+        "a purged job left quads behind"
+    );
+    // The data the job committed is not part of the ledger: it stays.
+    assert_eq!(count_in(&raw, ACTIVE), 6);
+    // An unfinished job is never purged.
+    assert_eq!(status(&server, &open).await["state"], "open");
+}
+
+#[tokio::test]
+async fn idle_time_does_not_count_while_the_core_was_off() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 3_600,
+        ..IngestConfig::default()
+    };
+    let (server, _raw) = server_with(cfg);
+    let (id, _) = begin(&server, json!({})).await;
+    let base = now_secs();
+
+    // The core stops 100 s after the job's last activity (a heartbeat is its
+    // last sign of life) and the next session starts 10,000 s later.
+    svc(&server).heartbeat(base + 100).unwrap();
+    let restart = base + 100 + 10_000;
+
+    // Without recovery the job looks idle for 10,100 s and would be expired.
+    let without = {
+        let (s2, _r2) = server_with(IngestConfig {
+            job_idle_ttl_secs: 3_600,
+            ..IngestConfig::default()
+        });
+        let (id2, _) = begin(&s2, json!({})).await;
+        let r = svc(&s2).sweep(restart).unwrap();
+        r.expired.contains(&id2)
+    };
+    assert!(
+        without,
+        "the control case must expire, or this test proves nothing"
+    );
+
+    // With recovery, the downtime is not counted: the job was idle 100 s.
+    let r = svc(&server).recover(restart).unwrap();
+    assert_eq!(r.downtime_secs, 10_000);
+    assert_eq!(r.shifted, vec![id.clone()]);
+    let swept = svc(&server).sweep(restart).unwrap();
+    assert!(
+        swept.expired.is_empty(),
+        "recovered job was expired: {swept:?}"
+    );
+    let s = status(&server, &id).await;
+    assert_eq!(s["state"], "open");
+
+    // It still expires once it has been idle for the ttl while running.
+    let swept = svc(&server).sweep(restart + 3_700).unwrap();
+    assert_eq!(swept.expired, vec![id]);
+}
+
+#[tokio::test]
+async fn a_first_start_shifts_nothing_and_leaves_a_heartbeat() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    let r = svc(&server).recover(now_secs() + 50_000).unwrap();
+    assert_eq!(r.downtime_secs, 0, "no heartbeat yet, so no downtime");
+    assert!(r.shifted.is_empty() && r.interrupted.is_empty());
+    assert_eq!(status(&server, &id).await["state"], "open");
+    assert!(ask(&raw, "ASK { GRAPH <urn:sparql-mcp:jobs> { <urn:sparql-mcp:jobs:service> <urn:sparql-mcp:jobs#heartbeat> ?t } }"));
+}
+
+#[tokio::test]
+async fn a_job_that_was_running_when_the_core_stopped_is_interrupted_and_can_be_aborted() {
+    let (server, raw) = server();
+    let (id, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+    send(&server, &id, 1, nt(1, 2)).await;
+    raw.update(&format!(
+        "DELETE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> ?s }} }} \
+         INSERT {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> <urn:sparql-mcp:jobs#running> }} }} \
+         WHERE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#state> ?s }} }}"
+    ))
+    .unwrap();
+
+    let r = svc(&server).recover(now_secs()).unwrap();
+    assert_eq!(r.interrupted, vec![id.clone()]);
+    assert_eq!(status(&server, &id).await["state"], "interrupted");
+    // An interrupted job does not accept batches, but it can be aborted.
+    let b = refused(
+        &server,
+        "ingest_batch",
+        json!({ "job_id": id, "seq": 2, "data": nt(2, 1) }),
+    )
+    .await;
+    assert_eq!(b["code"], "job_not_open");
+    ok(&server, "ingest_abort", json!({ "job_id": id })).await;
+    assert_eq!(count_in(&raw, &staging), 0);
+}
+
+#[tokio::test]
+async fn the_background_maintenance_expires_an_idle_job_by_itself() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 0,
+        sweep_interval_secs: 1,
+        ..IngestConfig::default()
+    };
+    let (server, _raw) = server_with(cfg);
+    let (id, _) = begin(&server, json!({})).await;
+
+    let started = std::time::Instant::now();
+    let maintenance = server.start_ingest_maintenance();
+    let mut expired = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if status(&server, &id).await["state"] == "expired" {
+            expired = true;
+            break;
+        }
+    }
+    assert!(
+        expired,
+        "the maintenance thread did not expire the job within 6 s"
+    );
+    assert!(started.elapsed() < Duration::from_secs(6));
+
+    // Dropping the handle stops the thread promptly.
+    let stop = std::time::Instant::now();
+    drop(maintenance);
+    assert!(
+        stop.elapsed() < Duration::from_secs(2),
+        "stopping took {:?}",
+        stop.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn an_agent_cannot_forge_the_heartbeat_or_a_job_timestamp() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    for update in [
+        "INSERT DATA { GRAPH <urn:sparql-mcp:jobs> { <urn:sparql-mcp:jobs:service> <urn:sparql-mcp:jobs#heartbeat> \"2999-01-01T00:00:00Z\" } }".to_string(),
+        format!("DELETE WHERE {{ GRAPH <urn:sparql-mcp:jobs> {{ <urn:sparql-mcp:job:{id}> <urn:sparql-mcp:jobs#lastActivity> ?t }} }}"),
+    ] {
+        let r = refused(&server, "update_sparql", json!({ "update": update })).await;
+        assert_eq!(r["code"], "graph_protected", "{update}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_racing_batches_never_leaves_data_in_an_expired_jobs_staging_graph() {
+    let cfg = IngestConfig {
+        job_idle_ttl_secs: 60,
+        ..IngestConfig::default()
+    };
+    let (server, raw, _dir) = rocks_server(cfg);
+    let (id, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+
+    let batches: Vec<_> = (1..=8)
+        .map(|seq| {
+            let (server, id) = (server.clone(), id.clone());
+            tokio::spawn(async move {
+                call(
+                    &server,
+                    "ingest_batch",
+                    json!({ "job_id": id, "seq": seq, "data": nt(seq, 5) }),
+                )
+                .await
+            })
+        })
+        .collect();
+    let sweep = {
+        let s = svc(&server);
+        tokio::task::spawn_blocking(move || s.sweep(now_secs() + 3_600))
+    };
+    for c in batches {
+        match c.await.unwrap().unwrap() {
+            (false, _) => {}
+            (true, body) => assert_eq!(body["code"], "job_not_open", "{body}"),
+        }
+    }
+    let report = sweep.await.unwrap().unwrap();
+    assert_eq!(report.expired, vec![id.clone()]);
+    assert_eq!(status(&server, &id).await["state"], "expired");
+    // Whichever order they ran in: the staging graph is gone, so no batch
+    // that was accepted after the expiry could have left data behind.
+    assert_eq!(
+        count_in(&raw, &staging),
+        0,
+        "data survived in an expired job's staging graph"
+    );
+}

@@ -54,7 +54,10 @@ of domain-specific content.
   The ceilings come from a benchmark (`docs/benchmarks/ingest.md`): a staged job holds
   at most 100,000 triples (its commit is one in-memory transaction that holds the write
   gate), a replace 200,000; larger loads use several jobs or `mode: "direct"`.
-  Not yet available: `ingest_validate`, `ingest_file`, and the expiry of idle jobs.
+  Idle jobs expire (`job_idle_ttl_secs`, staging graph dropped), finished ones are purged
+  after `job_retention_secs`, and time with the core off does not count as idle
+  (`[ingest] sweep_interval_secs`); `ingest_status` shows `idle_secs` and `expires_in_secs`.
+  Not yet available: `ingest_validate`, `ingest_file`.
 - Store port: `write_batch` (conditional write in one transaction) and
   `parse_rdf_raw`.
 

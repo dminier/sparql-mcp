@@ -682,8 +682,9 @@ Deviations from the text above, with the reason:
 *   **The port has `write_batch` and `parse_rdf_raw`**, not `parse_batch` and
     `commit_job`: parsing stays outside the transaction, and the checks are data
     (`BatchWrite`), not code.
-*   `smj:lastActivity` is not yet updated by batches (it matters for expiry, which is
-    not built).
+*   `smj:lastActivity` is set by `write_batch` itself (`BatchWrite.replace`, a
+    single-valued property replaced in the batch's transaction), and refreshed by a
+    duplicate retry (best effort). A refused batch does not refresh it.
 
 Tests: 30 end-to-end tests, including three on a RocksDB store with concurrent
 calls (eight overlapping retries of one batch: stored once, counted once; six
@@ -726,11 +727,20 @@ write gate for 48 s (longer than `write_wait_timeout_secs`, 30) and took 1.6 GiB
 directly instead of `ADD` + `DROP`) is a possible optimisation, after which the ceiling
 would be raised only after rerunning the bench.
 
-**Not yet done:** the expiry sweeper and heartbeat; chunked staging drops for large
-graphs (a staged job above `max_job_triples_staged` is refused earlier, so abort and
-commit drop a bounded graph in one request); `ingest_validate`; `ingest_file`; the
-bench that confirms or lowers the 500,000-triple staged ceiling and the replace
-ceiling (they are provisional); and `smj:lastActivity` updates on batches.
+**Expiry and maintenance (`ingest/maintenance.rs`).** A thread started by the server
+sweeps every `sweep_interval_secs` (300): `open`/`interrupted` jobs idle longer than
+`job_idle_ttl_secs` become `expired` and their staging graph is dropped in the same
+transaction (re-checked under the write gate, so a batch that arrives during the sweep
+wins or is refused, never lost into a dropped graph); finished jobs are purged
+`job_retention_secs` after `smj:ended`. A heartbeat is written on every sweep. At start,
+`recover` reads it: the downtime is added to every active job's `lastActivity` so that
+time with the core off is not idle time, and jobs that were `running` become
+`interrupted`. `ingest_status` reports `idle_secs` and `expires_in_secs` for unfinished jobs.
+All of it takes the time as a parameter, so tests move the clock instead of sleeping.
+
+**Not yet done:** chunked staging drops for large graphs (a staged job above
+`max_job_triples_staged` is refused earlier, so abort and commit drop a bounded graph in
+one request); `ingest_validate`; `ingest_file`.
 
 ### Target Files to Create/Modify
 

@@ -276,6 +276,28 @@ impl SparqlStore for OxigraphAdapter {
             tx.remove(old);
             tx.insert(new);
         }
+        for r in &write.replace {
+            let subject = NamedNode::new(&r.subject)?;
+            let predicate = NamedNode::new(&r.predicate)?;
+            let graph = GraphName::NamedNode(NamedNode::new(&r.graph)?);
+            let old: Vec<Quad> = tx
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    Some(predicate.as_ref()),
+                    None,
+                    Some(graph.as_ref()),
+                )
+                .collect::<std::result::Result<_, _>>()?;
+            for q in &old {
+                tx.remove(q);
+            }
+            tx.insert(&from_stored(&StoredQuad {
+                s: format!("<{}>", r.subject),
+                p: format!("<{}>", r.predicate),
+                o: r.object.clone(),
+                g: Some(r.graph.clone()),
+            })?);
+        }
         if let Some(rc) = &write.record_counts {
             let subject = NamedNode::new(&rc.subject)?;
             let graph = GraphName::NamedNode(NamedNode::new(&rc.graph)?);
@@ -864,6 +886,7 @@ mod tests {
                 inserted_new_predicate: "urn:new".into(),
                 already_present_predicate: "urn:dup".into(),
             }),
+            replace: vec![],
         }
     }
 
