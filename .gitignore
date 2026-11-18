@@ -19,6 +19,8 @@ __pycache__/
 /imports/
 /ontology/snapshots/
 
-# Local agent config / personal skills
-/.claude/
+# Local agent config (project skills in .claude/skills/ are committed)
+/.claude/settings.local.json
+/.claude/worktrees/
+CLAUDE.local.md
 .worktrees/
