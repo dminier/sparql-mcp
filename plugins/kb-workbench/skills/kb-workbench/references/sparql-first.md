@@ -27,6 +27,25 @@ TTL snapshots, capture dumps); it lags and can be partial.
    *capture artefacts*, *vault markdown* that the graph **points to** —
    never for entity metadata that belongs in the graph.
 
+## Bulk loads: use an ingestion job
+
+When a load needs more than a handful of calls (an analysis of a codebase, a
+document set, an export), do not loop over `update_sparql` / `load_ontology`:
+
+1. `mcp__sparql-mcp__ingest_begin` (default `mode: "staged"`); read the returned
+   `limits`.
+2. `mcp__sparql-mcp__ingest_batch` with `seq` 1, 2, 3, …, N-Triples data, about
+   2,000–5,000 triples per batch. After **any** timeout or error, re-send the
+   **same `seq`** with the same data: it is always safe, a batch that already landed
+   answers `duplicate: true`. On `parse_error` or `limit_exceeded` nothing was
+   recorded: fix or shrink the batch and re-send it under the same `seq` (the
+   remainder of a split batch goes in new `seq`s at the end).
+3. `mcp__sparql-mcp__ingest_commit`, then pass the reply's `new_subjects` to the
+   viewer if one is connected. `ingest_abort` discards the job.
+4. After a restart, `ingest_status` lists the received `seq`s: re-send the missing ones.
+
+Use `update_sparql` only for small, targeted edits.
+
 ## Order of operations for any write
 
 1. Construct the triples in Turtle (`PREFIX ... INSERT DATA { ... }`).

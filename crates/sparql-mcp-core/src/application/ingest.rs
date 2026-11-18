@@ -48,6 +48,8 @@ const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const SMC_NAMED_GRAPH: &str = "https://sparql-mcp.dev/ns#namedGraph";
 const META_GRAPH: &str = "urn:meta";
 const MAX_LABEL_CHARS: usize = 200;
+/// The most IRIs `ingest_commit` lists in `new_subjects`.
+pub const MAX_NEW_SUBJECTS: usize = 5_000;
 /// Once a direct job is above the event threshold, at most one `Changed`
 /// event this often.
 const CHANGED_EVERY: Duration = Duration::from_secs(5);
@@ -367,6 +369,27 @@ impl IngestService {
                         None,
                     ));
                 }
+                // A replace rewrites the whole target in one transaction: refuse
+                // it up front if the target and the job could not fit.
+                let target_size = if req.replace {
+                    let size = self.count_graph(store.as_ref(), &target)?;
+                    if size.saturating_add(self.cfg.max_job_triples_staged)
+                        > self.cfg.max_replace_triples
+                    {
+                        return Err(coded(
+                            "replace_too_large",
+                            format!(
+                                "replacing {target} ({size} triples, plus up to {} staged) \
+                                 would exceed max_replace_triples = {}",
+                                self.cfg.max_job_triples_staged, self.cfg.max_replace_triples
+                            ),
+                            None,
+                        ));
+                    }
+                    Some(size)
+                } else {
+                    None
+                };
                 let active = self.count_active(store.as_ref())?;
                 if active >= self.cfg.max_open_jobs {
                     return Err(coded(
@@ -414,6 +437,13 @@ impl IngestService {
                     format!("<{job}> {} {}", smj("triplesTotal"), typed("0", "long")),
                     format!("<{job}> {} {}", smj("batchCount"), typed("0", "long")),
                 ];
+                if let Some(size) = target_size {
+                    triples.push(format!(
+                        "<{job}> {} {}",
+                        smj("targetSizeAtBegin"),
+                        typed(&size.to_string(), "long")
+                    ));
+                }
                 if let Some(s) = &staging {
                     triples.push(format!("<{job}> {} <{s}>", smj("staging")));
                 }
@@ -910,6 +940,293 @@ impl IngestService {
         }
     }
 
+    /// The number of triples in `graph`.
+    fn count_graph(&self, store: &dyn SparqlStore, graph: &str) -> Result<u64> {
+        let Some(g) = iri(graph) else {
+            return Ok(0);
+        };
+        let q = format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH {g} {{ ?s ?p ?o }} }}");
+        Ok(rows(store, &q)?
+            .first()
+            .and_then(|r| value(r, "n"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// A first number from a `SELECT (COUNT(..) AS ?n)` query.
+    fn count_query(&self, store: &dyn SparqlStore, query: &str) -> Result<u64> {
+        Ok(rows(store, query)?
+            .first()
+            .and_then(|r| value(r, "n"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Close a job: staged data moves into the target, and the job becomes
+    /// `committed`, in **one transaction**.
+    ///
+    /// The whole commit holds the write gate, so no batch can land between the
+    /// checks and the move. A batch that arrives meanwhile waits, then finds
+    /// the job no longer open and is refused: it is either in the commit or
+    /// not accepted, never lost in the staging graph.
+    ///
+    /// *   `staged`: `ADD SILENT <staging> TO <target> ; DROP SILENT GRAPH <staging>`.
+    /// *   `staged` with `replace`: `MOVE SILENT <staging> TO <target>`, which
+    ///     empties the target first. An empty staging graph is refused
+    ///     (`empty_replace`) unless `allow_empty_replace`, so a retried commit
+    ///     cannot wipe the target.
+    /// *   `direct`: the data is already in the target; the commit only closes
+    ///     the job.
+    pub fn commit(&self, req: &CommitRequest) -> Result<Value> {
+        let id = req.job_id.as_str();
+        if !is_job_id(id) {
+            return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
+        }
+        self.privileged
+            .exclusive("ingest_commit", |store| -> Result<Value> {
+                self.commit_locked(store.as_ref(), req)
+            })?
+    }
+
+    fn commit_locked(&self, store: &dyn SparqlStore, req: &CommitRequest) -> Result<Value> {
+        let id = req.job_id.as_str();
+        let Some(m) = self.manifest(store, id)? else {
+            return Err(coded("job_not_found", format!("no job {id}"), Some(id)));
+        };
+        let state = m.get("state").and_then(|s| JobState::from_iri(s));
+        if state != Some(JobState::Open) {
+            return Err(job_not_open(id, state));
+        }
+        let mode = m
+            .get("mode")
+            .and_then(|s| Mode::parse(s))
+            .unwrap_or(Mode::Staged);
+        let replace = m.get("replace").is_some_and(|r| r == "true");
+        let target = m.get("target").cloned().unwrap_or_default();
+        let Some(target_iri) = iri(&target) else {
+            return Err(coded(
+                "invalid_target",
+                format!("job {id} has no valid target"),
+                Some(id),
+            ));
+        };
+
+        // Every batch the agent said to expect, and every batch it sent, must be there.
+        let (seqs, _) = self.batches(store, id)?;
+        let expected = m
+            .get("expectedBatches")
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        let need = expected.max(seqs.iter().copied().max().unwrap_or(0));
+        let have: BTreeSet<u32> = seqs.iter().copied().collect();
+        let missing: Vec<u32> = (1..=need).filter(|n| !have.contains(n)).collect();
+        if !missing.is_empty() {
+            return Err(coded(
+                "missing_batches",
+                format!(
+                    "batches {} of 1-{need} have not been received; send them, or abort the job",
+                    seq_ranges(&missing)
+                ),
+                Some(id),
+            ));
+        }
+        if req.require_validation {
+            self.check_validated(&m, id)?;
+        }
+
+        let (batches, total) = self.totals(&m);
+        let before = self.count_graph(store, &target)?;
+        let mut reply = json!({
+            "job_id": id,
+            "state": JobState::Committed.name(),
+            "mode": mode.name(),
+            "target_graph": target,
+            "replace": replace,
+            "batches": batches,
+            "triples": total,
+        });
+        let mut staged_events: Option<Vec<StoredQuad>> = None;
+
+        let update = match (mode, m.get("staging")) {
+            (Mode::Staged, Some(staging)) => {
+                let Some(staging_iri) = iri(staging) else {
+                    return Err(coded(
+                        "invalid_target",
+                        format!("job {id} has no valid staging graph"),
+                        Some(id),
+                    ));
+                };
+                let staged = self.count_graph(store, staging)?;
+                if replace && staged == 0 && !req.allow_empty_replace {
+                    return Err(coded(
+                        "empty_replace",
+                        "the staging graph is empty, and a replace would empty the target. \
+                         If that is what you want, commit with allow_empty_replace: true",
+                        Some(id),
+                    ));
+                }
+
+                // What this commit adds, measured before it runs.
+                let new_triples = self.count_query(
+                    store,
+                    &format!(
+                        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH {staging_iri} {{ ?s ?p ?o }} \
+                     FILTER NOT EXISTS {{ GRAPH {target_iri} {{ ?s ?p ?o }} }} }}"
+                    ),
+                )?;
+                let new_subjects_where = format!(
+                    "WHERE {{ GRAPH {staging_iri} {{ ?s ?p ?o }} FILTER(isIRI(?s)) \
+                     FILTER NOT EXISTS {{ GRAPH {target_iri} {{ ?s ?x ?y }} }} }}"
+                );
+                let subject_count = self.count_query(
+                    store,
+                    &format!("SELECT (COUNT(DISTINCT ?s) AS ?n) {new_subjects_where}"),
+                )?;
+                let listed = rows(
+                    store,
+                    &format!(
+                        "SELECT DISTINCT ?s {new_subjects_where} ORDER BY ?s LIMIT {}",
+                        MAX_NEW_SUBJECTS + 1
+                    ),
+                )?;
+                let mut subjects: Vec<String> = listed
+                    .iter()
+                    .filter_map(|r| value(r, "s").map(str::to_string))
+                    .collect();
+                let truncated = subjects.len() > MAX_NEW_SUBJECTS;
+                subjects.truncate(MAX_NEW_SUBJECTS);
+                reply["new_to_target"] = json!(new_triples);
+                reply["new_subject_count"] = json!(subject_count);
+                reply["new_subjects"] = json!(subjects);
+                reply["new_subjects_truncated"] = json!(truncated);
+
+                // A small append is reported triple by triple, read before the move.
+                if !replace && (total as usize) <= self.cfg.event_changed_threshold {
+                    let quads = rows(
+                        store,
+                        &format!("SELECT ?s ?p ?o WHERE {{ GRAPH {staging_iri} {{ ?s ?p ?o }} }}"),
+                    )?
+                    .iter()
+                    .filter_map(|r| {
+                        Some(StoredQuad {
+                            s: r.get("s")?.to_ntriples(),
+                            p: r.get("p")?.to_ntriples(),
+                            o: r.get("o")?.to_ntriples(),
+                            g: Some(target.clone()),
+                        })
+                    })
+                    .collect();
+                    staged_events = Some(quads);
+                }
+
+                let mv = if replace {
+                    format!("MOVE SILENT {staging_iri} TO {target_iri}")
+                } else {
+                    format!("ADD SILENT {staging_iri} TO {target_iri} ; DROP SILENT GRAPH {staging_iri}")
+                };
+                format!("{mv} ; {}", self.transition_update(id, JobState::Committed))
+            }
+            _ => self.transition_update(id, JobState::Committed),
+        };
+        store.update(&update)?;
+
+        let after = self.count_graph(store, &target)?;
+        reply["target_triples"] = json!(after);
+        if replace {
+            let began = m
+                .get("targetSizeAtBegin")
+                .and_then(|n| n.parse::<u64>().ok());
+            reply["target_writes_discarded"] = json!(began.is_some_and(|b| b != before));
+        }
+        self.commit_events(mode, &target, staged_events, total, before, after, id);
+        Ok(reply)
+    }
+
+    /// `require_validation` is satisfied by a passing validation that covers
+    /// every batch received so far.
+    fn check_validated(&self, m: &HashMap<String, String>, id: &str) -> Result<()> {
+        let passed = m.get("validationPassed").is_some_and(|p| p == "true");
+        let at = m
+            .get("validatedAtBatches")
+            .and_then(|n| n.parse::<u64>().ok());
+        let (batches, _) = self.totals(m);
+        match (passed, at) {
+            (true, Some(n)) if n == batches => Ok(()),
+            (true, Some(_)) => Err(coded(
+                "validation_stale",
+                "batches arrived after the last validation; run ingest_validate again",
+                Some(id),
+            )),
+            _ => Err(coded(
+                "validation_required",
+                "no passing validation is recorded for this job (ingest_validate is not \
+                 available in this build)",
+                Some(id),
+            )),
+        }
+    }
+
+    /// Tell the viewer what the commit did.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_events(
+        &self,
+        mode: Mode,
+        target: &str,
+        staged: Option<Vec<StoredQuad>>,
+        total: u64,
+        before: u64,
+        after: u64,
+        id: &str,
+    ) {
+        match (mode, staged) {
+            // A small staged append: the triples, in bounded events.
+            (Mode::Staged, Some(quads)) => emit_quads(
+                self.events.as_ref(),
+                QuadChange::Inserted,
+                &quads,
+                EventLimits {
+                    max_triples: self.cfg.event_max_triples,
+                    changed_threshold: self.cfg.event_changed_threshold,
+                },
+            ),
+            // A large staged append, or any replace: one `Changed`, with the
+            // target's real sizes, and the viewer resyncs.
+            (Mode::Staged, None) => self.events.emit(StoreEvent::Changed {
+                graph: target.to_string(),
+                triples_before: before,
+                triples_after: after,
+            }),
+            // A direct job already sent its batches; if it was big, the
+            // throttled `Changed` events may have skipped the end.
+            (Mode::Direct, _) if total as usize > self.cfg.event_changed_threshold => {
+                self.events.emit(StoreEvent::Changed {
+                    graph: target.to_string(),
+                    triples_before: after.saturating_sub(total),
+                    triples_after: after,
+                })
+            }
+            (Mode::Direct, _) => {}
+        }
+        self.last_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// The update that moves a job to `state` and stamps it, as one request
+    /// fragment: it matches only the job's current state quads.
+    fn transition_update(&self, id: &str, state: JobState) -> String {
+        let job = job_iri(id);
+        let now = typed(&iso_now(), "dateTime");
+        let (state_p, active_p, ended_p) = (smj("state"), smj("lastActivity"), smj("ended"));
+        format!(
+            "DELETE {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} ?s ; {active_p} ?t }} }} \
+             INSERT {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} <{}> ; {active_p} {now} ; {ended_p} {now} }} }} \
+             WHERE {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} ?s ; {active_p} ?t }} }}",
+            state.iri()
+        )
+    }
+
     /// Abort a job that is open, interrupted or failed. A staged job's staging
     /// graph is dropped in the same transaction as the state change. A direct
     /// job's accepted batches stay in the target graph: the reply lists them.
@@ -937,16 +1254,7 @@ impl IngestService {
                 let (seqs, _) = self.batches(store.as_ref(), &id)?;
                 let direct = m.get("mode").is_some_and(|mode| mode == "direct");
 
-                let job = job_iri(&id);
-                let now = typed(&iso_now(), "dateTime");
-                let (state_p, active_p, ended_p) =
-                    (smj("state"), smj("lastActivity"), smj("ended"));
-                let mut update = format!(
-                    "DELETE {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} ?s ; {active_p} ?t }} }} \
-                     INSERT {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} <{}> ; {active_p} {now} ; {ended_p} {now} }} }} \
-                     WHERE {{ GRAPH <{JOBS_GRAPH}> {{ <{job}> {state_p} ?s ; {active_p} ?t }} }}",
-                    JobState::Aborted.iri()
-                );
+                let mut update = self.transition_update(&id, JobState::Aborted);
                 if let Some(staging) = m.get("staging") {
                     // The staging graph goes with the state change, in one
                     // transaction. (Large staging graphs are dropped in
@@ -966,6 +1274,14 @@ impl IngestService {
                 Ok(reply)
             })?
     }
+}
+
+/// What `ingest_commit` is given.
+#[derive(Debug, Clone)]
+pub struct CommitRequest {
+    pub job_id: String,
+    pub require_validation: bool,
+    pub allow_empty_replace: bool,
 }
 
 /// What `ingest_batch` is given.

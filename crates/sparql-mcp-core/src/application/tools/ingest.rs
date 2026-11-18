@@ -10,7 +10,7 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::application::ingest::{BatchRequest, BeginRequest, IngestService, Mode};
+use crate::application::ingest::{BatchRequest, BeginRequest, CommitRequest, IngestService, Mode};
 use crate::application::limits::ToolError;
 
 use super::sparql::{make_tool, require_str};
@@ -61,6 +61,29 @@ pub fn tool_ingest_batch_def() -> Tool {
                 "format": { "type": "string", "enum": ["ntriples", "turtle"], "description": "Overrides the job's format for this batch." }
             },
             "required": ["job_id", "seq", "data"]
+        }),
+    )
+}
+
+pub fn tool_ingest_commit_def() -> Tool {
+    make_tool(
+        "ingest_commit",
+        "Close an ingestion job. For a staged job, the staged triples are moved into the target \
+         graph in one transaction (with replace, the target's previous contents are replaced); \
+         before this call nothing of the job is visible. A direct job's data is already in the \
+         target, so the commit only closes it. The commit refuses a job with missing batches \
+         (every seq from 1 to expected_batches, or to the highest seq sent, must be present). \
+         Returns the totals, the target graph's size, and for a staged job new_subjects: the IRIs \
+         of subjects that were not in the target before (up to 5,000), which can be passed to \
+         viewer_show. A committed job cannot receive more batches.",
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "require_validation": { "type": "boolean", "default": false, "description": "Refuse unless the last ingest_validate passed and no batch arrived since." },
+                "allow_empty_replace": { "type": "boolean", "default": false, "description": "A replace with an empty staging graph empties the target; this must be set to allow it." }
+            },
+            "required": ["job_id"]
         }),
     )
 }
@@ -178,6 +201,15 @@ pub fn ingest_batch(svc: &IngestService, args: &JsonObject) -> Result<CallToolRe
         format: opt_str(args, "format")?.map(str::to_string),
     };
     reply(svc.batch(&request))
+}
+
+pub fn ingest_commit(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {
+    let request = CommitRequest {
+        job_id: require_str(args, "job_id")?.to_string(),
+        require_validation: opt_bool(args, "require_validation")?.unwrap_or(false),
+        allow_empty_replace: opt_bool(args, "allow_empty_replace")?.unwrap_or(false),
+    };
+    reply(svc.commit(&request))
 }
 
 pub fn ingest_status(svc: &IngestService, args: &JsonObject) -> Result<CallToolResult, McpError> {

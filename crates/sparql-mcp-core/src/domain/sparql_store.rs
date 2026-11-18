@@ -66,6 +66,28 @@ pub enum RdfTerm {
 }
 
 impl RdfTerm {
+    /// The N-Triples encoding of the term: `<iri>`, `_:id`, or
+    /// `"lex"["@lang" | "^^<datatype>"]`. This is the form viewer events and
+    /// [`StoredQuad`] carry.
+    pub fn to_ntriples(&self) -> String {
+        match self {
+            Self::Iri(iri) => format!("<{iri}>"),
+            Self::BlankNode(id) => format!("_:{id}"),
+            Self::Literal {
+                value,
+                datatype,
+                lang,
+            } => {
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                match (lang, datatype) {
+                    (Some(l), _) => format!("\"{escaped}\"@{l}"),
+                    (None, Some(dt)) => format!("\"{escaped}\"^^<{dt}>"),
+                    (None, None) => format!("\"{escaped}\""),
+                }
+            }
+        }
+    }
+
     pub fn as_value_str(&self) -> &str {
         match self {
             Self::Iri(s) | Self::BlankNode(s) => s,

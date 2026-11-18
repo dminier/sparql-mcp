@@ -691,10 +691,38 @@ different payloads for one seq: exactly one lands; ten batches against a
 ceiling of four: exactly four fit). With the in-transaction checks disabled, five
 of them fail.
 
-**Not yet done:** `ingest_commit` (staged, replace, direct), so a job cannot be
-closed yet and a staged job's data stays in its staging graph; the expiry sweeper and
-heartbeat; chunked staging drops; `ingest_validate`; `ingest_file`; the bench; and the
-skill guidance.
+**Phase 1, slice 3 (2026-11-18): `ingest_commit`.** Done:
+
+*   `ingest_commit` for the three modes, under one hold of the write gate:
+    staged append (`ADD SILENT` + `DROP SILENT GRAPH` + the state change), staged
+    `replace` (`MOVE SILENT` + the state change) and direct (state change only).
+    The data move and the state change are one update request, so one
+    transaction. A batch that arrives meanwhile waits, then is refused
+    (`job_not_open`): it is in the commit or not accepted, never lost in staging;
+*   `missing_batches` (every seq from 1 to `expected_batches`, or to the highest
+    seq sent), `empty_replace` (refused unless `allow_empty_replace`),
+    `replace_too_large` (checked at `ingest_begin` from the target's size),
+    `target_writes_discarded` (the target's size changed since the job began);
+*   the reply carries `new_to_target`, `new_subject_count` and `new_subjects`
+    (sorted, bare IRIs, at most 5,000) for staged jobs, for `viewer_show`;
+*   events: a small staged append is reported triple by triple, read before the
+    move and named after the **target** graph; a large one, and every replace, is one
+    `Changed` with the target's real before/after sizes; a large direct job gets a
+    final `Changed`;
+*   `require_validation` is accepted and checked against the ledger
+    (`validation_required` / `validation_stale`), but with no `ingest_validate` yet
+    it can never be satisfied.
+
+Tests: 45 end-to-end, five on a RocksDB store with concurrent callers (five
+simultaneous commits close the job once; eight batches racing a commit are each in
+the commit or refused). With the open-state check or the empty-replace check
+disabled, three tests fail.
+
+**Not yet done:** the expiry sweeper and heartbeat; chunked staging drops for large
+graphs (a staged job above `max_job_triples_staged` is refused earlier, so abort and
+commit drop a bounded graph in one request); `ingest_validate`; `ingest_file`; the
+bench that confirms or lowers the 500,000-triple staged ceiling and the replace
+ceiling (they are provisional); and `smj:lastActivity` updates on batches.
 
 ### Target Files to Create/Modify
 

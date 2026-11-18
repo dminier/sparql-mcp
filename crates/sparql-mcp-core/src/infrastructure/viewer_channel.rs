@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::application::event_sink::{classify_subjects, Snapshot, StoreEvent};
-use crate::domain::{QueryResult, RdfTerm, SparqlStore};
+use crate::domain::{QueryResult, SparqlStore};
 
 /// How often an open connection re-checks the active graph for a change
 /// (e.g. from `project_switch`) and, if it changed, pushes a fresh
@@ -152,9 +152,9 @@ async fn send_snapshot(
         .iter()
         .map(|row| {
             [
-                rdf_term_to_nt(row.get("s").expect("?s is always bound")),
-                rdf_term_to_nt(row.get("p").expect("?p is always bound")),
-                rdf_term_to_nt(row.get("o").expect("?o is always bound")),
+                row.get("s").expect("?s is always bound").to_ntriples(),
+                row.get("p").expect("?p is always bound").to_ntriples(),
+                row.get("o").expect("?o is always bound").to_ntriples(),
             ]
         })
         .collect();
@@ -176,27 +176,4 @@ async fn write_line(
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     Ok(())
-}
-
-/// N-Triples encoding of a domain [`RdfTerm`] (see the Required Changes
-/// note on term encoding: `<iri>`, `_:id`, or `"lex"["@lang" | "^^<dt>"]`).
-fn rdf_term_to_nt(term: &RdfTerm) -> String {
-    match term {
-        RdfTerm::Iri(iri) => format!("<{iri}>"),
-        RdfTerm::BlankNode(id) => format!("_:{id}"),
-        RdfTerm::Literal {
-            value,
-            datatype,
-            lang,
-        } => {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            match lang {
-                Some(l) => format!("\"{escaped}\"@{l}"),
-                None => match datatype {
-                    Some(dt) => format!("\"{escaped}\"^^<{dt}>"),
-                    None => format!("\"{escaped}\""),
-                },
-            }
-        }
-    }
 }

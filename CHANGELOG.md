@@ -36,6 +36,25 @@ of domain-specific content.
   the path was embedded unescaped in a Turtle literal, and `\` is a Turtle
   escape character.
 
+### Added
+- **Batch ingestion jobs** (`ingest_begin`, `ingest_batch`, `ingest_commit`,
+  `ingest_abort`, `ingest_status`). A job groups the numbered batches of one
+  load: a batch is parsed whole and written, with its record, in one
+  transaction that re-checks the job is open and the batch is new, so a retry
+  (even one that overlaps the original) is stored once and answered with the
+  original counts. Staged jobs are invisible until `ingest_commit` moves them into the
+  target in one transaction (`replace` swaps the target's contents; an empty
+  replace needs `allow_empty_replace`); direct jobs write the target as they go.
+  Labelled blank nodes are the same node across a job's batches. Job state lives
+  in the protected graph `urn:sparql-mcp:jobs`, so it survives a restart. New
+  `[ingest]` keys: `max_open_jobs`, `max_job_batches`, `max_job_triples_staged`,
+  `max_job_triples_direct`, `max_replace_triples`, `max_batch_triples`,
+  `max_iri_bytes`, `max_literal_bytes`, `event_max_triples`,
+  `event_changed_threshold`, and others (see `sparql-mcp.toml`).
+  Not yet available: `ingest_validate`, `ingest_file`, and the expiry of idle jobs.
+- Store port: `write_batch` (conditional write in one transaction) and
+  `parse_rdf_raw`.
+
 ### Security
 - All store writes now go through one **write gate** (a FIFO lock): writes
   are serialized, a slow write no longer blocks reads or the MCP transport,

@@ -38,6 +38,7 @@ needed — there is no daemon. See [getting started](docs/getting-started.md).
 | `export_graph`, `list_graphs`, `stats` | Export to Turtle, introspection |
 | `project_create`, `project_list`, `project_switch` | One named graph per project: `<urn:project:<slug>>` |
 | `cbm_load_graph` | Import a codebase-memory-mcp code graph |
+| `ingest_begin`, `ingest_batch`, `ingest_commit`, `ingest_abort`, `ingest_status` | Batch ingestion jobs: numbered, retry-safe batches, staged and committed in one step (see below) |
 | `write_doc` | Write markdown under the configured docs root |
 | `get_gdrive_config` | Expose the `[gdrive]` sync settings to the agent |
 
@@ -62,6 +63,29 @@ blocks reads, and guarded for every caller, plugins included. See the
 - Refusals come back as `isError` results with a JSON `code` (`write_busy`,
   `limit_exceeded`, `graph_protected`, `destructive_update_forbidden`,
   `path_outside_roots`, …) so an agent can react to them.
+
+## Batch ingestion
+
+For loads that need many calls (tens of thousands of triples and up), use an
+ingestion job instead of looping over `load_ontology`:
+
+1. `ingest_begin`: returns a `job_id` and the limits to size batches by. By
+   default the job is *staged*: nothing is visible until the commit. Use
+   `mode: "direct"` for large append-only loads, `replace: true` to replace the
+   target graph's contents.
+2. `ingest_batch` with `seq` 1, 2, 3, … and N-Triples `data` (2,000–5,000 triples,
+   at most 512 KiB). Re-send the **same `seq`** after any timeout or error:
+   a batch that already landed returns `duplicate: true` with its original
+   counts, and is stored once. A batch with a syntax error is refused whole;
+   fix it and re-send it under the same `seq`.
+3. `ingest_commit`: the staged triples move into the target in one transaction.
+   The reply lists `new_subjects`, which can be passed to `viewer_show`.
+   `ingest_abort` discards the job instead.
+
+`ingest_status` shows a job's received batches (as ranges), so a restarted
+session knows which batches to re-send. Blank nodes written `_:x` are the same
+node in every batch of a job. The job ledger is in the protected graph
+`urn:sparql-mcp:jobs`. Limits are in the `[ingest]` section.
 
 ## CLI
 

@@ -40,3 +40,15 @@ bind    = "127.0.0.1:7878"
 # literal (single-quoted) strings so Windows backslashes are kept. A root that
 # does not exist stops the server at startup.
 # file_roots = ['C:\data\rdf', 'D:/dumps']
+#
+# Ingestion jobs (ingest_begin / ingest_batch / ingest_commit). Defaults shown.
+# max_open_jobs            = 4          # unfinished jobs at once
+# max_job_batches          = 10000
+# max_batch_triples        = 10000      # triples in one ingest_batch
+# max_job_triples_staged   = 500000     # a staged commit is one in-memory transaction
+# max_job_triples_direct   = 10000000
+# max_replace_triples      = 1000000    # target size + staged size a replace may rewrite
+# max_iri_bytes            = 4096
+# max_literal_bytes        = 65536
+# event_max_triples        = 5000       # triples per viewer event
+# event_changed_threshold  = 50000      # above this, one `changed` event instead

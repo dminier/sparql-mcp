@@ -204,6 +204,7 @@ impl SparqlMcpServer {
             ),
             "ingest_begin" => ingest::ingest_begin(&self.ingest, args),
             "ingest_batch" => ingest::ingest_batch(&self.ingest, args),
+            "ingest_commit" => ingest::ingest_commit(&self.ingest, args),
             "ingest_status" => ingest::ingest_status(&self.ingest, args),
             "ingest_abort" => ingest::ingest_abort(&self.ingest, args),
             "export_graph" => export::export_graph(&self.store, args),
@@ -455,6 +456,7 @@ pub(crate) fn core_tool_defs() -> Vec<rmcp::model::Tool> {
         crate::application::tools::gdrive::tool_get_gdrive_config_def(),
         crate::application::tools::ingest::tool_ingest_begin_def(),
         crate::application::tools::ingest::tool_ingest_batch_def(),
+        crate::application::tools::ingest::tool_ingest_commit_def(),
         crate::application::tools::ingest::tool_ingest_status_def(),
         crate::application::tools::ingest::tool_ingest_abort_def(),
     ];

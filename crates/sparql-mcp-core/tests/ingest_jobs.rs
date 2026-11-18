@@ -1098,3 +1098,469 @@ async fn a_batch_racing_an_abort_either_lands_before_it_or_is_refused() {
         "a batch landed in the staging graph after the abort"
     );
 }
+
+// ── ingest_commit ────────────────────────────────────────────────────────────
+
+fn count_in(raw: &Arc<dyn SparqlStore>, graph: &str) -> u64 {
+    match raw
+        .query(&format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}"
+        ))
+        .unwrap()
+    {
+        QueryResult::Solutions(s) => s.rows[0]["n"].as_value_str().parse().unwrap(),
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn send(server: &SparqlMcpServer, id: &str, seq: u32, data: String) -> Value {
+    ok(
+        server,
+        "ingest_batch",
+        json!({ "job_id": id, "seq": seq, "data": data }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_staged_commit_makes_the_data_visible_in_one_step() {
+    let (server, raw) = server();
+    let (id, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+    send(&server, &id, 1, nt(1, 5)).await;
+    send(&server, &id, 2, nt(2, 5)).await;
+
+    // Before the commit, nothing of the job is in the target.
+    assert_eq!(count_in(&raw, ACTIVE), 0);
+
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(c["state"], "committed");
+    assert_eq!(c["mode"], "staged");
+    assert_eq!(c["target_graph"], ACTIVE);
+    assert_eq!(c["batches"], 2);
+    assert_eq!(c["triples"], 10);
+    assert_eq!(c["target_triples"], 10);
+    assert_eq!(c["new_to_target"], 10);
+    assert_eq!(c["new_subject_count"], 10);
+    // The agent gets the IRIs to pass to viewer_show: sorted, bare.
+    let subjects: Vec<&str> = c["new_subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(subjects.len(), 10);
+    assert_eq!(subjects[0], "urn:s:1:0");
+    assert!(
+        subjects.windows(2).all(|w| w[0] <= w[1]),
+        "not sorted: {subjects:?}"
+    );
+
+    // All of it is in the target, none of it is left in staging.
+    assert_eq!(count_in(&raw, ACTIVE), 10);
+    assert_eq!(count_in(&raw, &staging), 0);
+    let s = ok(&server, "ingest_status", json!({ "job_id": id })).await;
+    assert_eq!(s["state"], "committed");
+    assert!(s["ended"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn a_committed_job_is_closed() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 2)).await;
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+
+    for (tool, args) in [
+        ("ingest_commit", json!({ "job_id": id })),
+        ("ingest_abort", json!({ "job_id": id })),
+        (
+            "ingest_batch",
+            json!({ "job_id": id, "seq": 2, "data": nt(2, 1) }),
+        ),
+    ] {
+        let b = refused(&server, tool, args).await;
+        assert_eq!(b["code"], "job_not_open", "{tool}");
+        assert!(
+            b["message"].as_str().unwrap().contains("committed"),
+            "{tool}: {b}"
+        );
+    }
+    // Retrying a batch the commit already took is refused too, not replayed.
+    let b = refused(
+        &server,
+        "ingest_batch",
+        json!({ "job_id": id, "seq": 1, "data": nt(1, 2) }),
+    )
+    .await;
+    assert_eq!(b["code"], "job_not_open");
+}
+
+#[tokio::test]
+async fn the_commit_lists_only_subjects_that_were_not_in_the_target() {
+    let (server, raw) = server();
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:s:1:0> <urn:old> <urn:x> }} }}"
+    ))
+    .unwrap();
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 3)).await; // urn:s:1:0 .. urn:s:1:2
+
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    // `urn:s:1:0` already had a triple in the target: not new. Its staged
+    // triple is, so three triples are new but only two subjects.
+    assert_eq!(c["new_subject_count"], 2);
+    assert_eq!(c["new_subjects"], json!(["urn:s:1:1", "urn:s:1:2"]));
+    assert_eq!(c["new_to_target"], 3);
+}
+
+#[tokio::test]
+async fn an_incomplete_job_cannot_be_committed() {
+    let (server, raw) = server();
+    let (id, b) = begin(&server, json!({ "expected_batches": 4 })).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+    send(&server, &id, 1, nt(1, 2)).await;
+    send(&server, &id, 4, nt(4, 2)).await;
+
+    let e = refused(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(e["code"], "missing_batches");
+    assert!(e["message"].as_str().unwrap().contains("2-3"), "{e}");
+    assert_eq!(count_in(&raw, ACTIVE), 0, "a refused commit moved data");
+    assert_eq!(count_in(&raw, &staging), 4);
+
+    send(&server, &id, 2, nt(2, 2)).await;
+    send(&server, &id, 3, nt(3, 2)).await;
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(c["triples"], 8);
+
+    // Without expected_batches, a gap below the highest seq is still a gap.
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(10, 1)).await;
+    send(&server, &id, 3, nt(11, 1)).await;
+    let e = refused(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(e["code"], "missing_batches");
+    assert!(
+        e["message"].as_str().unwrap().contains("batches 2 of 1-3"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_job_can_be_committed_and_validation_cannot_be_required_yet() {
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    // ingest_validate does not exist yet, so a validation can never be on record.
+    let e = refused(
+        &server,
+        "ingest_commit",
+        json!({ "job_id": id, "require_validation": true }),
+    )
+    .await;
+    assert_eq!(e["code"], "validation_required");
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(
+        (c["triples"].as_u64(), c["new_to_target"].as_u64()),
+        (Some(0), Some(0))
+    );
+}
+
+#[tokio::test]
+async fn a_replace_commit_swaps_the_targets_contents() {
+    let (server, raw) = server();
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:old:1> <urn:p> <urn:o> . <urn:old:2> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+    let (id, b) = begin(&server, json!({ "replace": true })).await;
+    assert_eq!(b["replace"], true);
+    send(&server, &id, 1, nt(1, 3)).await;
+
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(c["replace"], true);
+    assert_eq!(c["target_triples"], 3);
+    assert_eq!(c["target_writes_discarded"], false);
+    assert!(
+        !graph_has(&raw, ACTIVE, "<urn:old:1>"),
+        "the old contents survived a replace"
+    );
+    assert!(graph_has(&raw, ACTIVE, "<urn:s:1:0>"));
+}
+
+#[tokio::test]
+async fn a_replace_reports_writes_that_it_discards() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({ "replace": true })).await;
+    send(&server, &id, 1, nt(1, 2)).await;
+    // Somebody writes to the target while the job is open.
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:late> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(c["target_writes_discarded"], true);
+    assert!(!graph_has(&raw, ACTIVE, "<urn:late>"));
+}
+
+#[tokio::test]
+async fn an_empty_replace_cannot_wipe_the_target_by_accident() {
+    let (server, raw) = server();
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:keep> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+    let (id, _) = begin(&server, json!({ "replace": true })).await;
+
+    // No batch was sent: the staging graph is empty.
+    let e = refused(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(e["code"], "empty_replace");
+    assert!(
+        graph_has(&raw, ACTIVE, "<urn:keep>"),
+        "a refused replace wiped the target"
+    );
+    // The job is still open and can take a batch.
+    send(&server, &id, 1, nt(1, 1)).await;
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert!(!graph_has(&raw, ACTIVE, "<urn:keep>"));
+
+    // Wiping on purpose is possible, and explicit.
+    let (id, _) = begin(&server, json!({ "replace": true })).await;
+    let c = ok(
+        &server,
+        "ingest_commit",
+        json!({ "job_id": id, "allow_empty_replace": true }),
+    )
+    .await;
+    assert_eq!(c["target_triples"], 0);
+}
+
+#[tokio::test]
+async fn a_replace_that_would_not_fit_is_refused_when_the_job_begins() {
+    let cfg = IngestConfig {
+        max_replace_triples: 100,
+        max_job_triples_staged: 60,
+        ..IngestConfig::default()
+    };
+    let (server, raw) = server_with(cfg);
+    // 50 triples in the target + up to 60 staged > 100.
+    let data: String = (0..50)
+        .map(|i| format!("<urn:t:{i}> <urn:p> <urn:o> . "))
+        .collect();
+    raw.update(&format!("INSERT DATA {{ GRAPH <{ACTIVE}> {{ {data} }} }}"))
+        .unwrap();
+
+    let e = refused(&server, "ingest_begin", json!({ "replace": true })).await;
+    assert_eq!(e["code"], "replace_too_large");
+    // An append of the same size is fine.
+    ok(&server, "ingest_begin", json!({})).await;
+}
+
+#[tokio::test]
+async fn a_direct_commit_only_closes_the_job() {
+    let (server, raw) = server();
+    let (id, _) = begin(&server, json!({ "mode": "direct" })).await;
+    send(&server, &id, 1, nt(1, 4)).await;
+    assert_eq!(
+        count_in(&raw, ACTIVE),
+        4,
+        "a direct batch is already in the target"
+    );
+
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    assert_eq!(c["mode"], "direct");
+    assert_eq!(c["triples"], 4);
+    assert_eq!(c["target_triples"], 4);
+    // There is no staging graph to diff against: no new_subjects for a direct job.
+    assert!(c.get("new_subjects").is_none());
+    let s = ok(&server, "ingest_status", json!({ "job_id": id })).await;
+    assert_eq!(s["state"], "committed");
+}
+
+#[tokio::test]
+async fn a_small_staged_commit_reports_its_triples_to_the_viewer() {
+    let sink = Arc::new(Collect::default());
+    let (server, _raw) = server();
+    let server = server.with_event_sink(sink.clone());
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 6)).await;
+    assert!(
+        sink.0.lock().unwrap().is_empty(),
+        "nothing before the commit"
+    );
+
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    let events = sink.0.lock().unwrap();
+    let triples: usize = events
+        .iter()
+        .map(|e| match e {
+            StoreEvent::Insert { graph, triples, .. } => {
+                assert_eq!(
+                    graph, ACTIVE,
+                    "events must name the target graph, not the staging graph"
+                );
+                triples.len()
+            }
+            other => panic!("expected insert events, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(triples, 6);
+}
+
+#[tokio::test]
+async fn a_large_or_replace_commit_sends_one_changed_event_with_real_sizes() {
+    let cfg = IngestConfig {
+        event_changed_threshold: 5,
+        ..IngestConfig::default()
+    };
+    let sink = Arc::new(Collect::default());
+    let (server, raw) = server_with(cfg);
+    let server = server.with_event_sink(sink.clone());
+    raw.update(&format!(
+        "INSERT DATA {{ GRAPH <{ACTIVE}> {{ <urn:old> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+
+    // 8 triples above a threshold of 5: one Changed.
+    let (id, _) = begin(&server, json!({})).await;
+    send(&server, &id, 1, nt(1, 8)).await;
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    {
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                StoreEvent::Changed { graph, triples_before: 1, triples_after: 9 } if graph == ACTIVE
+            ),
+            "{events:?}"
+        );
+    }
+
+    // A replace is always one Changed, even when small.
+    sink.0.lock().unwrap().clear();
+    let (id, _) = begin(&server, json!({ "replace": true })).await;
+    send(&server, &id, 1, nt(2, 2)).await;
+    ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    let events = sink.0.lock().unwrap();
+    assert!(
+        matches!(
+            &events[..],
+            [StoreEvent::Changed {
+                triples_before: 9,
+                triples_after: 2,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_commit_reply_can_feed_viewer_show() {
+    // The names an agent passes on: bare IRIs, not <...> and not blank nodes.
+    let (server, _raw) = server();
+    let (id, _) = begin(&server, json!({})).await;
+    send(
+        &server,
+        &id,
+        1,
+        "_:a <urn:name> \"x\" .\n<urn:b> <urn:p> _:a .\n".to_string(),
+    )
+    .await;
+    let c = ok(&server, "ingest_commit", json!({ "job_id": id })).await;
+    let subjects = c["new_subjects"].as_array().unwrap();
+    assert_eq!(subjects.len(), 2);
+    for s in subjects {
+        let s = s.as_str().unwrap();
+        assert!(!s.starts_with('<') && !s.starts_with("_:"), "{s}");
+    }
+    // The skolemized node is an IRI under the job's namespace.
+    assert!(subjects
+        .iter()
+        .any(|s| s.as_str().unwrap() == format!("urn:sparql-mcp:genid:{id}:a")));
+}
+
+// ── commit on a real RocksDB store, with concurrent callers ──────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_commits_close_the_job_once() {
+    let (server, raw, _dir) = rocks_server(IngestConfig::default());
+    let (id, staging) = {
+        let (id, b) = begin(&server, json!({})).await;
+        (id, b["staging_graph"].as_str().unwrap().to_string())
+    };
+    send(&server, &id, 1, nt(1, 20)).await;
+
+    let calls: Vec<_> = (0..5)
+        .map(|_| {
+            let (server, id) = (server.clone(), id.clone());
+            tokio::spawn(
+                async move { call(&server, "ingest_commit", json!({ "job_id": id })).await },
+            )
+        })
+        .collect();
+    let mut committed = 0;
+    for c in calls {
+        match c.await.unwrap().unwrap() {
+            (false, _) => committed += 1,
+            (true, body) => assert_eq!(body["code"], "job_not_open", "{body}"),
+        }
+    }
+    assert_eq!(committed, 1);
+    assert_eq!(count_in(&raw, ACTIVE), 20);
+    assert_eq!(count_in(&raw, &staging), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_racing_a_commit_is_in_the_commit_or_refused_never_lost() {
+    let (server, raw, _dir) = rocks_server(IngestConfig::default());
+    let (id, b) = begin(&server, json!({})).await;
+    let staging = b["staging_graph"].as_str().unwrap().to_string();
+
+    let batches: Vec<_> = (1..=8)
+        .map(|seq| {
+            let (server, id) = (server.clone(), id.clone());
+            tokio::spawn(async move {
+                call(
+                    &server,
+                    "ingest_batch",
+                    json!({ "job_id": id, "seq": seq, "data": nt(seq, 5) }),
+                )
+                .await
+            })
+        })
+        .collect();
+    // The commit comes while the batches are in flight. Without expected_batches
+    // it takes whatever has landed; it needs the batches it saw to be gapless.
+    let commit = {
+        let (server, id) = (server.clone(), id.clone());
+        tokio::spawn(async move { call(&server, "ingest_commit", json!({ "job_id": id })).await })
+    };
+    let mut landed = 0u64;
+    for c in batches {
+        match c.await.unwrap().unwrap() {
+            (false, _) => landed += 1,
+            (true, body) => assert_eq!(body["code"], "job_not_open", "{body}"),
+        }
+    }
+    let (commit_err, body) = commit.await.unwrap().unwrap();
+
+    if commit_err {
+        // The commit may be refused for a gap (batches landed out of order);
+        // then the job is still open and nothing moved.
+        assert_eq!(body["code"], "missing_batches", "{body}");
+        assert_eq!(count_in(&raw, ACTIVE), 0);
+    } else {
+        // Every batch that was accepted is in the target, and nothing is left behind.
+        assert_eq!(
+            count_in(&raw, ACTIVE),
+            landed * 5,
+            "an accepted batch was lost"
+        );
+        assert_eq!(
+            count_in(&raw, &staging),
+            0,
+            "a batch landed in staging after the commit"
+        );
+        assert_eq!(body["triples"].as_u64().unwrap(), landed * 5);
+    }
+}
