@@ -7,6 +7,7 @@ pub mod event_sink;
 pub mod gated_store;
 pub mod guards;
 pub mod limits;
+pub mod path_guard;
 pub mod tools;
 pub mod write_gate;
 

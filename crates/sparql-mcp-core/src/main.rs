@@ -243,7 +243,8 @@ async fn run(cli: Cli) -> Result<()> {
     let gate = WriteGate::new(std::time::Duration::from_secs(
         cfg.ingest.write_wait_timeout_secs,
     ));
-    let (gated, privileged) = build_stores_with(raw.clone(), gate, GuardConfig::from(&cfg.ingest));
+    let (gated, privileged) =
+        build_stores_with(raw.clone(), gate, GuardConfig::from_config(&cfg.ingest)?);
     let store: Arc<dyn SparqlStore> = gated.clone();
     privileged.load_ontology_dir(&ontology_path)?;
 

@@ -89,6 +89,10 @@ pub struct IngestConfig {
     pub max_batch_bytes: usize,
     /// Largest file `load_ontology_file` loads in one transaction, in bytes.
     pub max_load_file_bytes: u64,
+    /// Directories that file reads (`load_ontology_file`) and writes
+    /// (`export_graph`) are confined to. Unset keeps the old behaviour (any
+    /// path) and logs a warning. Each root must exist.
+    pub file_roots: Option<Vec<PathBuf>>,
 }
 
 impl Default for IngestConfig {
@@ -99,6 +103,7 @@ impl Default for IngestConfig {
             max_update_bytes: 1_048_576,
             max_batch_bytes: 1_048_576,
             max_load_file_bytes: 67_108_864,
+            file_roots: None,
         }
     }
 }
@@ -323,5 +328,16 @@ max_update_bytes = 10
         .unwrap();
         assert!(cfg.ingest.allow_destructive_updates);
         assert_eq!(cfg.ingest.max_update_bytes, 10);
+        assert!(cfg.ingest.file_roots.is_none());
+        // TOML literal strings (single quotes) keep Windows backslashes.
+        let cfg: Config = toml::from_str(
+            r"[ingest]
+file_roots = ['C:\data\rdf', 'D:/dumps']
+",
+        )
+        .unwrap();
+        let roots = cfg.ingest.file_roots.unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[1], PathBuf::from("D:/dumps"));
     }
 }

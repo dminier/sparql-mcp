@@ -498,3 +498,168 @@ async fn dry_run_classifies_and_reports_a_refusal_without_running() {
     assert!(is_err);
     assert_eq!(b["code"], "parse_error");
 }
+
+// ── Phase 0c: file_roots ───────────────────────────────────────────────────────
+
+use sparql_mcp::config::IngestConfig;
+
+/// A server confined to `<tmp>/root`, plus the directory outside it.
+fn confined_server() -> (
+    SparqlMcpServer,
+    Arc<dyn SparqlStore>,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let cfg = IngestConfig {
+        file_roots: Some(vec![root.clone()]),
+        ..IngestConfig::default()
+    };
+    let (server, raw) = guarded_server(GuardConfig::from_config(&cfg).unwrap());
+    (server, raw, dir, root, outside)
+}
+
+const ONE_TRIPLE: &str = "<urn:s> <urn:p> <urn:o> .\n";
+
+#[tokio::test]
+async fn a_file_inside_file_roots_loads_and_one_outside_is_refused() {
+    let (server, raw, _dir, root, outside) = confined_server();
+    let inside = root.join("in.nt");
+    let elsewhere = outside.join("out.nt");
+    std::fs::write(&inside, ONE_TRIPLE).unwrap();
+    std::fs::write(&elsewhere, ONE_TRIPLE).unwrap();
+
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": elsewhere.display().to_string() }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "path_outside_roots");
+    assert_eq!(raw.triple_count().unwrap(), 0, "a refused file was loaded");
+
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": inside.display().to_string() }),
+    )
+    .await;
+    assert!(!is_err, "{b}");
+    assert_eq!(b["inserted_new"], 1);
+
+    // `..` out of the root is refused too.
+    let sneaky = root.join("..").join("outside").join("out.nt");
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": sneaky.display().to_string() }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "path_outside_roots");
+}
+
+#[tokio::test]
+async fn export_graph_cannot_write_outside_file_roots() {
+    let (server, raw, _dir, root, outside) = confined_server();
+    raw.update(PROJECT_P).unwrap();
+
+    let target = outside.join("dump.ttl");
+    let (is_err, b) = run(
+        &server,
+        "export_graph",
+        json!({ "graph_iri": "urn:project:p", "path": target.display().to_string() }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "path_outside_roots");
+    assert!(!target.exists(), "the export wrote outside the root");
+
+    let ok_target = root.join("exports").join("dump.ttl");
+    let (is_err, b) = run(
+        &server,
+        "export_graph",
+        json!({ "graph_iri": "urn:project:p", "path": ok_target.display().to_string() }),
+    )
+    .await;
+    assert!(!is_err, "{b}");
+    assert!(ok_target.exists());
+}
+
+#[tokio::test]
+async fn without_file_roots_any_path_still_loads() {
+    // Compatibility: file_roots unset keeps today's behaviour (with a warning).
+    let (server, raw) = guarded_server(GuardConfig::default());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("any.nt");
+    std::fs::write(&file, ONE_TRIPLE).unwrap();
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": file.display().to_string() }),
+    )
+    .await;
+    assert!(!is_err, "{b}");
+    // The data landed (the ledger entry adds more quads, so do not count them).
+    assert_eq!(b["inserted_new"], 1);
+    assert!(ask(
+        &raw,
+        "ASK { GRAPH <urn:project:default> { <urn:s> <urn:p> <urn:o> } }"
+    ));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_unc_and_stream_paths_are_refused_without_touching_the_network() {
+    let (server, raw, _dir, root, _outside) = confined_server();
+    let started = Instant::now();
+    for path in [
+        r"\\attacker.invalid\share\data.nt".to_string(),
+        r"\\.\pipe\x".to_string(),
+        format!(r"{}:hidden", root.join("in.nt").display()),
+    ] {
+        let (is_err, b) = run(&server, "load_ontology_file", json!({ "path": path })).await;
+        assert!(is_err, "{path}");
+        assert_eq!(b["code"], "path_rejected", "{path}");
+    }
+    // A UNC path that is resolved would block on a DNS/SMB timeout: refusing
+    // it lexically is immediate.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refusing UNC paths took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(raw.triple_count().unwrap(), 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_junction_inside_the_root_cannot_reach_outside_through_the_tool() {
+    let (server, raw, _dir, root, outside) = confined_server();
+    std::fs::write(outside.join("out.nt"), ONE_TRIPLE).unwrap();
+    let link = root.join("link");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+
+    let through = link.join("out.nt");
+    let (is_err, b) = run(
+        &server,
+        "load_ontology_file",
+        json!({ "path": through.display().to_string() }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(b["code"], "path_outside_roots");
+    assert_eq!(raw.triple_count().unwrap(), 0);
+}
